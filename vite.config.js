@@ -3,13 +3,14 @@ import crossOriginStorage from 'vite-plugin-cross-origin-storage';
 
 export default defineConfig({
   assetsInclude: ['**/*.hog', '**/*.pig'],
+  base: '/three-descent/',
   plugins: [
     crossOriginStorage({
       include: [/vendor-three-.*.js/],
     }),
   ],
   build: {
-    outDir: 'docs',
+    outDir: 'docs',    
     target: 'esnext',
     rollupOptions: {
       output: {
