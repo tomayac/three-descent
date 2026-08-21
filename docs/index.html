@@ -56,12 +56,10 @@
         { algorithm: 'SHA-256', value: hash },
         { create: true }
       );
-      if (handles && handles.length > 0) {
-        const writable = await handle.createWritable();
-        await writable.write(blob);
-        await writable.close();
-        console.log('COS Loader: Stored chunk in COS', hash);
-      }
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      console.log('COS Loader: Stored chunk in COS', hash);
     } catch (err) {
       console.error('COS Loader: Failed to store in COS', err);
     }
@@ -171,6 +169,6 @@
   <!-- Entry script disabled by COS Plugin -->
 </head>
 <body>
-	<div id="status"></div>
+	<div id="status"></div>
 </body>
 </html>
