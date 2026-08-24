@@ -9,18 +9,21 @@ import { Weapon_info, Vclips, N_weapon_types,
 	WEAPON_RENDER_NONE, WEAPON_RENDER_LASER, WEAPON_RENDER_BLOB, WEAPON_RENDER_POLYMODEL, WEAPON_RENDER_VCLIP,
 	LASER_ID, CONCUSSION_ID, VULCAN_ID, SPREADFIRE_ID, PLASMA_ID, FUSION_ID,
 	Primary_weapon_to_weapon_info, Secondary_weapon_to_weapon_info } from './bm.js';
-import { Polygon_models, buildModelMesh } from './polyobj.js';
+import { Polygon_models, buildModelMesh, polyobj_clone_model_mesh,
+	polyobj_wrap_model_lod } from './polyobj.js';
 import { phys_apply_force_to_player, phys_apply_rot } from './physics.js';
+import { digi_play_sample, digi_play_sample_once, digi_play_sample_world,
+	SOUND_GOOD_SELECTION_PRIMARY, SOUND_GOOD_SELECTION_SECONDARY,
+	SOUND_ALREADY_SELECTED } from './digi.js';
+import { OBJ_PLAYER } from './object.js';
 
 // Parent type constants
 export const PARENT_PLAYER = 0;
 export const PARENT_ROBOT = 1;
 
-// Difficulty level (0=trainee, 4=insane)
-let Difficulty_level = 1;
-
 // Constants
 const MAX_WEAPONS = 50;
+const NDL = 5;
 const PLAYER_HIT_RADIUS = 3.0;
 
 // Homing missile constants (from LASER.C / LASER.H)
@@ -38,9 +41,8 @@ const WEAPON_MEGA_INDEX = 18;				// Mega missile
 export const PROXIMITY_ID = 16;				// Proximity bomb (weapon_info index)
 export const FLARE_ID = 9;					// Flare (weapon_info index)
 
-// Proximity bomb constants
-const PROXIMITY_ARM_TIME = 2.0;				// seconds before proximity bomb arms
-const PROXIMITY_DETECT_RADIUS = 12.0;		// detection radius for proximity trigger
+// A proximity mine remains related to its owner through exactly two seconds.
+const PROXIMITY_OWNER_IMMUNITY_TIME = 2.0;
 
 // Player weapon state
 export let Primary_weapon = 0;		// 0=laser, 1=vulcan, 2=spreadfire, 3=plasma, 4=fusion
@@ -48,7 +50,6 @@ export let Secondary_weapon = 0;	// 0=concussion, 1=homing, 2=proximity, 3=smart
 let Next_laser_fire_time = 0;
 let Next_missile_fire_time = 0;
 let Last_laser_fire_time = 0;		// Tracks last successful fire (for stale-time reset)
-let _gameTime = 0;
 
 // Ported from: WEAPON.H #define REARM_TIME (F1_0)
 const REARM_TIME = 1.0;	// 1 second delay after switching weapons
@@ -64,24 +65,45 @@ export const WEAPON_SELECT_UNAVAILABLE = - 1;
 
 // Player weapon flags getter (set via laser_set_externals)
 let _getPlayerPrimaryFlags = null;
+let _getPlayerSecondaryFlags = null;
 let _getPlayerSecondaryAmmo = null;
 
 // Ported from: select_weapon() in WEAPON.C lines 306-357
 // Returns: WEAPON_SELECT_CHANGED, WEAPON_SELECT_ALREADY, or WEAPON_SELECT_UNAVAILABLE
 export function set_primary_weapon( w, waitForRearm ) {
 
-	if ( Primary_weapon === w ) return WEAPON_SELECT_ALREADY;
+	// do_weapon_select() validates ownership and ammo before select_weapon(),
+	// including when the requested weapon is already selected.  Internal state
+	// restoration calls omit waitForRearm and intentionally bypass this check.
+	if ( waitForRearm === true ) {
 
-	// Check if player has this weapon
-	if ( _getPlayerPrimaryFlags !== null ) {
+		if ( _getPlayerPrimaryFlags !== null ) {
 
-		const flags = _getPlayerPrimaryFlags();
-		if ( ( flags & ( 1 << w ) ) === 0 ) return WEAPON_SELECT_UNAVAILABLE;
+			const flags = _getPlayerPrimaryFlags();
+			if ( ( flags & ( 1 << w ) ) === 0 ) return WEAPON_SELECT_UNAVAILABLE;
+
+		}
+
+		const weaponInfoIndex = Primary_weapon_to_weapon_info[ w ];
+		if ( weaponInfoIndex === VULCAN_ID && _getVulcanAmmo !== null &&
+			_getVulcanAmmo() < Weapon_info[ weaponInfoIndex ].ammo_usage ) {
+
+			return WEAPON_SELECT_UNAVAILABLE;
+
+		}
+
+	}
+
+	if ( Primary_weapon === w ) {
+
+		if ( waitForRearm === true ) digi_play_sample( SOUND_ALREADY_SELECTED, 1.0 );
+		return WEAPON_SELECT_ALREADY;
 
 	}
 
 	if ( waitForRearm === true ) {
 
+		digi_play_sample_once( SOUND_GOOD_SELECTION_PRIMARY, 1.0 );
 		Next_laser_fire_time = GameTime + REARM_TIME;
 
 	}
@@ -95,18 +117,45 @@ export function set_primary_weapon( w, waitForRearm ) {
 // Returns: WEAPON_SELECT_CHANGED, WEAPON_SELECT_ALREADY, or WEAPON_SELECT_UNAVAILABLE
 export function set_secondary_weapon( w, waitForRearm ) {
 
-	if ( Secondary_weapon === w ) return WEAPON_SELECT_ALREADY;
+	// Secondary selection requires the complete player_has_weapon() result:
+	// ownership, ammunition, and energy.  Check it before the already-selected
+	// cue, just as do_weapon_select() does in WEAPON.C.
+	if ( waitForRearm === true ) {
 
-	// Check if player has ammo for this weapon
-	if ( _getPlayerSecondaryAmmo !== null ) {
+		if ( _getPlayerSecondaryFlags !== null ) {
 
-		const ammo = _getPlayerSecondaryAmmo( w );
-		if ( ammo <= 0 ) return WEAPON_SELECT_UNAVAILABLE;
+			const flags = _getPlayerSecondaryFlags();
+			if ( ( flags & ( 1 << w ) ) === 0 ) return WEAPON_SELECT_UNAVAILABLE;
+
+		}
+
+		const weaponInfoIndex = Secondary_weapon_to_weapon_info[ w ];
+		const weaponInfo = Weapon_info[ weaponInfoIndex ];
+		if ( weaponInfo === undefined ) return WEAPON_SELECT_UNAVAILABLE;
+		if ( _getPlayerSecondaryAmmo !== null &&
+			_getPlayerSecondaryAmmo( w ) < weaponInfo.ammo_usage ) {
+
+			return WEAPON_SELECT_UNAVAILABLE;
+
+		}
+		if ( _getPlayerEnergy !== null && _getPlayerEnergy() < weaponInfo.energy_usage ) {
+
+			return WEAPON_SELECT_UNAVAILABLE;
+
+		}
+
+	}
+
+	if ( Secondary_weapon === w ) {
+
+		if ( waitForRearm === true ) digi_play_sample_once( SOUND_ALREADY_SELECTED, 1.0 );
+		return WEAPON_SELECT_ALREADY;
 
 	}
 
 	if ( waitForRearm === true ) {
 
+		digi_play_sample_once( SOUND_GOOD_SELECTION_SECONDARY, 1.0 );
 		Next_missile_fire_time = GameTime + REARM_TIME;
 
 	}
@@ -118,6 +167,7 @@ export function set_secondary_weapon( w, waitForRearm ) {
 
 // Weapon pool
 const weapons = [];
+let Weapon_next_signature = 0;
 
 
 // PIG file and palette references (set via laser_set_externals)
@@ -130,7 +180,11 @@ const _weaponTextureCache = new Map();
 // External references (set via laser_set_externals)
 let _scene = null;
 let _robots = null;
+let _clutter = null;
+let _debris = null;
 let _onRobotHit = null;
+let _onClutterHit = null;
+let _onDebrisHit = null;
 let _onPlayerHit = null;
 let _onWallHit = null;
 let _getPlayerPos = null;
@@ -140,17 +194,33 @@ let _getVulcanAmmo = null;
 let _setVulcanAmmo = null;
 let _getSecondaryAmmo = null;
 let _setSecondaryAmmo = null;
-let _onBadassExplosion = null;
+let _onBadassExplosion = null;	// ( pos, segnum, damage, distance, visual, parent type/id )
 let _onAutoSelectPrimary = null;
 let _onAutoSelectSecondary = null;
 let _onPlayerFiredLaser = null;	// ( weaponIndex, dir_x, dir_y, dir_z ) => void — notify AI of danger laser
 let _getPlayerLaserLevel = null;
 let _isPlayerCloaked = null;
+let _getDifficultyLevel = null;
+let _getPlayerVelocity = null;
+let _getPlayerObject = null;
 
-// Pre-allocated working vectors (Golden Rule #5)
+// D1 emits the local player's launch sound only after the weapon object has
+// been created.  Keep this separate from the accepted-fire result so an
+// exhausted object pool still consumes ammo/energy and advances weapon state
+// without playing a phantom shot.
+export function play_player_weapon_fire_sound( weaponInfoIndex ) {
+
+	if ( weaponInfoIndex < 0 || weaponInfoIndex >= Weapon_info.length ) return;
+	const wi = Weapon_info[ weaponInfoIndex ];
+	if ( wi === undefined || wi.flash_sound < 0 ) return;
+
+	digi_play_sample( wi.flash_sound, weaponInfoIndex === VULCAN_ID ? 0.5 : 1.0 );
+
+}
+
+// Pre-allocated working values (Golden Rule #5)
 const _dirVec = new THREE.Vector3();
 const _orientMatrix = new THREE.Matrix4();
-const _tempBox = new THREE.Box3();
 
 // Pre-allocated result for ray-sphere intersection
 const _sphereIntResult = { dist: 0, hit_x: 0, hit_y: 0, hit_z: 0 };
@@ -243,9 +313,13 @@ function check_vector_to_sphere( p0_x, p0_y, p0_z, p1_x, p1_y, p1_z, sp_x, sp_y,
 // Cached weapon model meshes (weapon_type → THREE.Group template)
 const _weaponModelCache = new Map();
 
-// Cached weapon half-lengths from bounding box (weapon_type → float)
-// Avoids expensive traverse+computeBoundingBox on every fire
-const _weaponHalfLengthCache = new Map();
+function get_random_laser_offset() {
+
+	// Ported from: LASER.C line 1127
+	// Laser_offset = ((F1_0*2)*(rand()%10))/10 -> 0.0,0.2,...,1.8
+	return 2.0 * ( Math.floor( Math.random() * 10 ) / 10.0 );
+
+}
 
 // Build a DataTexture from a PIG bitmap index (cached)
 // Ported from draw_object_blob() which calls g3_draw_bitmap()
@@ -307,7 +381,7 @@ function buildWeaponModelMesh( weapon_type ) {
 
 	if ( _weaponModelCache.has( weapon_type ) ) {
 
-		return _weaponModelCache.get( weapon_type ).clone();
+		return polyobj_clone_model_mesh( _weaponModelCache.get( weapon_type ) );
 
 	}
 
@@ -319,13 +393,8 @@ function buildWeaponModelMesh( weapon_type ) {
 	const model = Polygon_models[ wi.model_num ];
 	if ( model === null || model === undefined ) return null;
 
-	const group = buildModelMesh( model, _pigFile, _palette );
+	let group = buildModelMesh( model, _pigFile, _palette );
 	if ( group === null ) return null;
-
-	// Scale up weapon model for visibility at modern resolutions.
-	// Original Descent rendered at 320x200 — at HD resolution the 0.36-unit-wide
-	// bolt models are too thin to see. Scale 3x to compensate.
-	group.scale.set( 3, 3, 3 );
 
 	// Outer model: render opaque with original POF model colors
 	// Ported from original Descent which rendered weapon polymodels as opaque flat-shaded polys.
@@ -341,9 +410,11 @@ function buildWeaponModelMesh( weapon_type ) {
 		}
 
 	} );
+	group = polyobj_wrap_model_lod( group, model, _pigFile, _palette );
 
-	// Inner model: additive blending for glowing core effect
-	if ( wi.model_num_inner > 0 ) {
+	// Inner model: D1 draws this through the same opaque polygon-model path as
+	// the outer model.  It is a second geometric shell, not an additive sprite.
+	if ( wi.model_num_inner >= 0 ) {
 
 		const innerModel = Polygon_models[ wi.model_num_inner ];
 		if ( innerModel !== null && innerModel !== undefined ) {
@@ -351,19 +422,7 @@ function buildWeaponModelMesh( weapon_type ) {
 			const innerGroup = buildModelMesh( innerModel, _pigFile, _palette );
 			if ( innerGroup !== null ) {
 
-				innerGroup.traverse( ( child ) => {
-
-					if ( child.isMesh === true ) {
-
-						child.material = child.material.clone();
-						child.material.blending = THREE.AdditiveBlending;
-						child.material.transparent = true;
-						child.material.depthWrite = false;
-						child.material.side = THREE.DoubleSide;
-
-					}
-
-				} );
+				innerGroup.userData.isWeaponInnerModel = true;
 
 				group.add( innerGroup );
 
@@ -374,68 +433,191 @@ function buildWeaponModelMesh( weapon_type ) {
 	}
 
 	_weaponModelCache.set( weapon_type, group );
-	return group.clone();
+	return polyobj_clone_model_mesh( group );
 
 }
 
-// Orient a weapon model mesh to face along a velocity vector
-// Ported from: object orientation setup in PHYSICS.C
-function orientWeaponModel( mesh, vel_x, vel_y, vel_z ) {
+// Construct the zero-bank fallback used by vm_vector_to_matrix().
+// Ported from: VECMAT.C vm_vector_2_matrix() / vm_vector_to_matrix_f().
+function setWeaponOrientationFromForward( w, fwd_x, fwd_y, fwd_z ) {
 
-	const speed = Math.sqrt( vel_x * vel_x + vel_y * vel_y + vel_z * vel_z );
-	if ( speed < 0.001 ) return;
+	const fmag = Math.sqrt( fwd_x * fwd_x + fwd_y * fwd_y + fwd_z * fwd_z );
+	if ( fmag <= 0.000001 ) return false;
+	fwd_x /= fmag;
+	fwd_y /= fmag;
+	fwd_z /= fmag;
 
-	// Forward vector (Descent coords)
-	const fwd_x = vel_x / speed;
-	const fwd_y = vel_y / speed;
-	const fwd_z = vel_z / speed;
+	let right_x;
+	let right_y;
+	let right_z;
+	let up_x;
+	let up_y;
+	let up_z;
+	const horizontal = Math.sqrt( fwd_x * fwd_x + fwd_z * fwd_z );
 
-	// Build right vector via cross product with world up (0,1,0)
-	// right = up × forward
-	let rx = - fwd_z;		// 1 * fwd_z - 0 * fwd_y → but cross(up, fwd) = (0*fz - 1*fz, ...) → no
-	let ry = 0;
-	let rz = fwd_x;		// cross(0,1,0 × fx,fy,fz) = (1*fz - 0*fy, 0*fx - 0*fz, 0*fy - 1*fx)
-	// Actually: cross(Y, F) = (Yy*Fz - Yz*Fy, Yz*Fx - Yx*Fz, Yx*Fy - Yy*Fx)
-	// = (1*fz - 0*fy, 0*fx - 0*fz, 0*fy - 1*fx) = (fz, 0, -fx)
-	rx = fwd_z;
-	ry = 0;
-	rz = - fwd_x;
+	if ( horizontal <= 0.000001 ) {
 
-	let rmag = Math.sqrt( rx * rx + ry * ry + rz * rz );
+		right_x = 1;
+		right_y = 0;
+		right_z = 0;
+		up_x = 0;
+		up_y = 0;
+		up_z = fwd_y < 0 ? 1 : - 1;
 
-	if ( rmag < 0.001 ) {
+	} else {
 
-		// Forward is parallel to up — use X as alternate up
-		rx = 0;
-		ry = - fwd_z;
-		rz = fwd_y;
-		rmag = Math.sqrt( rx * rx + ry * ry + rz * rz );
-
-	}
-
-	if ( rmag > 0.001 ) {
-
-		rx /= rmag;
-		ry /= rmag;
-		rz /= rmag;
+		right_x = fwd_z / horizontal;
+		right_y = 0;
+		right_z = - fwd_x / horizontal;
+		up_x = fwd_y * right_z - fwd_z * right_y;
+		up_y = fwd_z * right_x - fwd_x * right_z;
+		up_z = fwd_x * right_y - fwd_y * right_x;
 
 	}
 
-	// Up = forward × right
-	const ux = fwd_y * rz - fwd_z * ry;
-	const uy = fwd_z * rx - fwd_x * rz;
-	const uz = fwd_x * ry - fwd_y * rx;
+	w.orient_rvec_x = right_x;
+	w.orient_rvec_y = right_y;
+	w.orient_rvec_z = right_z;
+	w.orient_uvec_x = up_x;
+	w.orient_uvec_y = up_y;
+	w.orient_uvec_z = up_z;
+	w.orient_fvec_x = fwd_x;
+	w.orient_fvec_y = fwd_y;
+	w.orient_fvec_z = fwd_z;
+	return true;
 
-	// Build orientation matrix (Descent → Three.js coordinate conversion)
-	// Columns: rvec, uvec, -fvec (negate fvec Z for Descent→Three.js)
+}
+
+// Construct a weapon orientation from its firing direction and its parent's
+// up vector.  D1 preserves the parent's bank at weapon creation.
+// Ported from: VECMAT.C vm_vector_2_matrix() with uvec supplied.
+function setWeaponOrientationFromForwardUp( w, fwd_x, fwd_y, fwd_z, up_x, up_y, up_z ) {
+
+	const fmag = Math.sqrt( fwd_x * fwd_x + fwd_y * fwd_y + fwd_z * fwd_z );
+	const umag = Math.sqrt( up_x * up_x + up_y * up_y + up_z * up_z );
+	if ( fmag <= 0.000001 || umag <= 0.000001 ) {
+
+		return setWeaponOrientationFromForward( w, fwd_x, fwd_y, fwd_z );
+
+	}
+
+	fwd_x /= fmag;
+	fwd_y /= fmag;
+	fwd_z /= fmag;
+	up_x /= umag;
+	up_y /= umag;
+	up_z /= umag;
+
+	let right_x = up_y * fwd_z - up_z * fwd_y;
+	let right_y = up_z * fwd_x - up_x * fwd_z;
+	let right_z = up_x * fwd_y - up_y * fwd_x;
+	const rmag = Math.sqrt( right_x * right_x + right_y * right_y + right_z * right_z );
+	if ( rmag <= 0.000001 ) {
+
+		return setWeaponOrientationFromForward( w, fwd_x, fwd_y, fwd_z );
+
+	}
+	right_x /= rmag;
+	right_y /= rmag;
+	right_z /= rmag;
+
+	// Recompute up so the result is orthogonal even when the supplied parent
+	// vector contains fixed-point drift.
+	up_x = fwd_y * right_z - fwd_z * right_y;
+	up_y = fwd_z * right_x - fwd_x * right_z;
+	up_z = fwd_x * right_y - fwd_y * right_x;
+
+	w.orient_rvec_x = right_x;
+	w.orient_rvec_y = right_y;
+	w.orient_rvec_z = right_z;
+	w.orient_uvec_x = up_x;
+	w.orient_uvec_y = up_y;
+	w.orient_uvec_z = up_z;
+	w.orient_fvec_x = fwd_x;
+	w.orient_fvec_y = fwd_y;
+	w.orient_fvec_z = fwd_z;
+	return true;
+
+}
+
+function findWeaponParentObject( parent_type, parent_num, parent_signature ) {
+
+	if ( parent_type === PARENT_PLAYER ) {
+
+		return _getPlayerObject !== null ? _getPlayerObject() : null;
+
+	}
+	if ( parent_type !== PARENT_ROBOT || _robots === null ) return null;
+	for ( let i = 0; i < _robots.length; i ++ ) {
+
+		const entry = _robots[ i ];
+		if ( entry === null || entry === undefined || entry.obj === null || entry.obj === undefined ) continue;
+		if ( entry.objnum !== parent_num ) continue;
+		if ( Number.isInteger( parent_signature ) === true && entry.obj.signature !== parent_signature ) continue;
+		return entry.obj;
+
+	}
+	return null;
+
+}
+
+function initializeWeaponOrientation( w, dir_x, dir_y, dir_z, parentUpOverride ) {
+
+	let parent = null;
+	if ( parentUpOverride !== null && parentUpOverride !== undefined ) {
+
+		parent = parentUpOverride;
+
+	} else {
+
+		parent = findWeaponParentObject( w.parent_type, w.parent_num, w.parent_signature );
+
+	}
+
+	if ( parent !== null && parent !== undefined &&
+		Number.isFinite( parent.orient_uvec_x ) === true &&
+		Number.isFinite( parent.orient_uvec_y ) === true &&
+		Number.isFinite( parent.orient_uvec_z ) === true ) {
+
+		setWeaponOrientationFromForwardUp(
+			w, dir_x, dir_y, dir_z,
+			parent.orient_uvec_x, parent.orient_uvec_y, parent.orient_uvec_z
+		);
+
+	} else {
+
+		setWeaponOrientationFromForward( w, dir_x, dir_y, dir_z );
+
+	}
+
+}
+
+function applyWeaponOrientation( mesh, w ) {
+
 	_orientMatrix.set(
-		rx, ux, - fwd_x, 0,
-		ry, uy, - fwd_y, 0,
-		- rz, - uz, fwd_z, 0,
+		w.orient_rvec_x, w.orient_uvec_x, - w.orient_fvec_x, 0,
+		w.orient_rvec_y, w.orient_uvec_y, - w.orient_fvec_y, 0,
+		- w.orient_rvec_z, - w.orient_uvec_z, w.orient_fvec_z, 0,
 		0, 0, 0, 1
 	);
-
 	mesh.quaternion.setFromRotationMatrix( _orientMatrix );
+
+}
+
+// Visible homing missiles turn their model toward the new velocity rather
+// than snapping to it.  vm_vector_to_matrix() intentionally resets bank.
+// Ported from: LASER.C homing_missile_turn_towards_velocity().
+function turnWeaponOrientationTowardsVelocity( w, dt ) {
+
+	const speed = Math.sqrt( w.vel_x * w.vel_x + w.vel_y * w.vel_y + w.vel_z * w.vel_z );
+	if ( speed <= 0.000001 ) return;
+	const scale = dt * 8.0;
+	setWeaponOrientationFromForward(
+		w,
+		w.orient_fvec_x + w.vel_x / speed * scale,
+		w.orient_fvec_y + w.vel_y / speed * scale,
+		w.orient_fvec_z + w.vel_z / speed * scale
+	);
 
 }
 
@@ -460,7 +642,12 @@ class WeaponObj {
 
 		this.active = false;
 		this.parent_type = PARENT_PLAYER;
+		this.parent_num = - 1;
+		this.parent_signature = - 1;
+		this.parent_object_type = OBJ_PLAYER;
+		this.parent_object_id = 0;
 		this.weapon_type = 0;	// weapon_info index
+		this.silent = false;		// OF_SILENT — suppress wall-hit sound/awareness
 
 		// Position in Descent coordinates
 		this.pos_x = 0;
@@ -475,6 +662,22 @@ class WeaponObj {
 		this.segnum = 0;
 		this.lifeleft = 0;
 		this.damage = 5.0;
+		this.shields = 5.0;
+		this.signature = 0;
+		this.size = 0.5;			// collision radius
+
+		// Full D1 orientation basis.  Polygon weapons preserve their parent's
+		// bank at creation and homing missiles turn this basis independently of
+		// their physics velocity.
+		this.orient_rvec_x = 1;
+		this.orient_rvec_y = 0;
+		this.orient_rvec_z = 0;
+		this.orient_uvec_x = 0;
+		this.orient_uvec_y = 1;
+		this.orient_uvec_z = 0;
+		this.orient_fvec_x = 0;
+		this.orient_fvec_y = 0;
+		this.orient_fvec_z = 1;
 
 		// Thrust vector (Descent coordinates) — for thrust-based weapons
 		this.thrust_x = 0;
@@ -493,8 +696,7 @@ class WeaponObj {
 		// Ported from: LASER.C obj->ctype.laser_info.last_hitobj
 		this.last_hitobj = - 1;
 
-		// Proximity bomb state (stuck to wall after first wall hit)
-		// Ported from: LASER.C / PHYSICS.C proximity bomb handling
+		// PF_STICK state (used by flares only in Descent 1)
 		this.stuck = false;
 		this.stuck_wallnum = - 1;	// wall_num this weapon is stuck to (for kill_stuck_objects)
 
@@ -508,17 +710,25 @@ class WeaponObj {
 
 		// Three.js model mesh (Group for polymodel weapons)
 		this.modelMesh = null;
+		this.innerModelMesh = null;
 
 	}
 
 }
 
 // Get weapon properties with fallback defaults
+function getDifficultyLevel() {
+
+	const difficulty = _getDifficultyLevel !== null ? _getDifficultyLevel() : 1;
+	return Number.isInteger( difficulty ) && difficulty >= 0 && difficulty < NDL ? difficulty : 1;
+
+}
+
 function getWeaponSpeed( weapon_type ) {
 
 	if ( weapon_type < N_weapon_types ) {
 
-		return Weapon_info[ weapon_type ].speed[ Difficulty_level ];
+		return Weapon_info[ weapon_type ].speed[ getDifficultyLevel() ];
 
 	}
 
@@ -530,7 +740,7 @@ function getWeaponDamage( weapon_type ) {
 
 	if ( weapon_type < N_weapon_types ) {
 
-		return Weapon_info[ weapon_type ].strength[ Difficulty_level ];
+		return Weapon_info[ weapon_type ].strength[ getDifficultyLevel() ];
 
 	}
 
@@ -569,7 +779,11 @@ export function laser_set_externals( ext ) {
 	if ( ext.palette !== undefined ) _palette = ext.palette;
 	if ( ext.scene !== undefined ) _scene = ext.scene;
 	if ( ext.robots !== undefined ) _robots = ext.robots;
+	if ( ext.clutter !== undefined ) _clutter = ext.clutter;
+	if ( ext.debris !== undefined ) _debris = ext.debris;
 	if ( ext.onRobotHit !== undefined ) _onRobotHit = ext.onRobotHit;
+	if ( ext.onClutterHit !== undefined ) _onClutterHit = ext.onClutterHit;
+	if ( ext.onDebrisHit !== undefined ) _onDebrisHit = ext.onDebrisHit;
 	if ( ext.onPlayerHit !== undefined ) _onPlayerHit = ext.onPlayerHit;
 	if ( ext.onWallHit !== undefined ) _onWallHit = ext.onWallHit;
 	if ( ext.getPlayerPos !== undefined ) _getPlayerPos = ext.getPlayerPos;
@@ -584,9 +798,13 @@ export function laser_set_externals( ext ) {
 	if ( ext.onAutoSelectSecondary !== undefined ) _onAutoSelectSecondary = ext.onAutoSelectSecondary;
 	if ( ext.onPlayerFiredLaser !== undefined ) _onPlayerFiredLaser = ext.onPlayerFiredLaser;
 	if ( ext.getPlayerPrimaryFlags !== undefined ) _getPlayerPrimaryFlags = ext.getPlayerPrimaryFlags;
+	if ( ext.getPlayerSecondaryFlags !== undefined ) _getPlayerSecondaryFlags = ext.getPlayerSecondaryFlags;
 	if ( ext.getPlayerSecondaryAmmo !== undefined ) _getPlayerSecondaryAmmo = ext.getPlayerSecondaryAmmo;
 	if ( ext.getPlayerLaserLevel !== undefined ) _getPlayerLaserLevel = ext.getPlayerLaserLevel;
 	if ( ext.isPlayerCloaked !== undefined ) _isPlayerCloaked = ext.isPlayerCloaked;
+	if ( ext.getDifficultyLevel !== undefined ) _getDifficultyLevel = ext.getDifficultyLevel;
+	if ( ext.getPlayerVelocity !== undefined ) _getPlayerVelocity = ext.getPlayerVelocity;
+	if ( ext.getPlayerObject !== undefined ) _getPlayerObject = ext.getPlayerObject;
 
 }
 
@@ -604,6 +822,8 @@ export function laser_get_weapon( idx ) {
 
 // Initialize weapon pool with pre-built sprites
 export function laser_init() {
+
+	Weapon_next_signature = 0;
 
 	for ( let i = 0; i < MAX_WEAPONS; i ++ ) {
 
@@ -641,6 +861,12 @@ function configureWeaponVisual( w, weapon_type, parent_type ) {
 			if ( modelMesh !== null ) {
 
 				w.modelMesh = modelMesh;
+				w.innerModelMesh = null;
+				modelMesh.traverse( ( child ) => {
+
+					if ( child.userData.isWeaponInnerModel === true ) w.innerModelMesh = child;
+
+				} );
 				w.mesh.visible = false;	// hide sprite
 				return;
 
@@ -659,6 +885,7 @@ function configureWeaponVisual( w, weapon_type, parent_type ) {
 // Ported from: draw_object_blob() and draw_weapon_vclip() in OBJECT.C / VCLIP.C
 function configureWeaponSprite( w, weapon_type, parent_type ) {
 
+	w.innerModelMesh = null;
 	const mat = w.mesh.material;
 	let texture = null;
 	let blobSize = 2.0; // default diameter in world units
@@ -739,34 +966,12 @@ function find_homing_object( w ) {
 	// In C: if (parent_num != player) { if (!cloaked) best_objnum = ConsoleObject - Objects; }
 	if ( w.parent_type !== PARENT_PLAYER ) {
 
-		// Don't track cloaked player
+		// Robot-fired homing weapons acquire the player unconditionally (as long as the
+		// player is not cloaked) — C applies NO tracking-cone or distance gate here.
+		// Ported from: find_homing_object() in LASER.C:559-563:
+		//   if (parent_num != player) { if (!cloaked) best_objnum = ConsoleObject - Objects; }
 		if ( _isPlayerCloaked !== null && _isPlayerCloaked() === true ) return - 1;
-
-		// Verify player is within tracking cone and distance
-		if ( _getPlayerPos === null ) return - 1;
-		const pp = _getPlayerPos();
-
-		const speed = Math.sqrt( w.vel_x * w.vel_x + w.vel_y * w.vel_y + w.vel_z * w.vel_z );
-		if ( speed < 0.001 ) return - 1;
-
-		const fwd_x = w.vel_x / speed;
-		const fwd_y = w.vel_y / speed;
-		const fwd_z = w.vel_z / speed;
-
-		const dx = pp.x - w.pos_x;
-		const dy = pp.y - w.pos_y;
-		const dz = pp.z - w.pos_z;
-		const dist = Math.sqrt( dx * dx + dy * dy + dz * dz );
-
-		if ( dist > MAX_TRACKABLE_DIST || dist < 0.001 ) return - 1;
-
-		const nx = dx / dist;
-		const ny = dy / dist;
-		const nz = dz / dist;
-		const dot = fwd_x * nx + fwd_y * ny + fwd_z * nz;
-
-		if ( dot > MIN_TRACKABLE_DOT ) return TRACK_PLAYER;
-		return - 1;
+		return TRACK_PLAYER;
 
 	}
 
@@ -923,8 +1128,33 @@ function create_smart_children( w ) {
 		const childIdx = Laser_create_new(
 			dir_x, dir_y, dir_z,
 			w.pos_x, w.pos_y, w.pos_z,
-			w.segnum, w.parent_type, homingType
+			w.segnum, w.parent_type, homingType,
+			1.0, undefined, i !== 0, undefined, w.parent_num, w.parent_signature, w
 		);
+		if ( childIdx !== - 1 ) {
+
+			weapons[ childIdx ].parent_object_type = w.parent_object_type;
+			weapons[ childIdx ].parent_object_id = w.parent_object_id;
+
+		}
+
+		// Laser_create_new() receives make_sound=1 for only the first smart
+		// child in D1.  Player/robot launch sounds are owned by their callers in
+		// this port, so reproduce this weapon-parent cue here at the child.
+		if ( i === 0 && childIdx !== - 1 && homingType < N_weapon_types ) {
+
+			const childInfo = Weapon_info[ homingType ];
+			if ( childInfo.flash_sound >= 0 ) {
+
+				const child = weapons[ childIdx ];
+				digi_play_sample_world(
+					childInfo.flash_sound, 1.0, child.segnum,
+					child.pos_x, child.pos_y, child.pos_z
+				);
+
+			}
+
+		}
 
 		// Set initial tracking target
 		if ( childIdx !== - 1 && targets.length > 0 ) {
@@ -940,22 +1170,187 @@ function create_smart_children( w ) {
 // Handle special weapon effects on impact (smart children, area damage)
 function handleWeaponExplosion( w ) {
 
-	// Smart missile: spawn 6 homing children
-	if ( w.weapon_type === WEAPON_SMART_INDEX ) {
-
-		create_smart_children( w );
-
-	}
-
 	// Badass (area) damage for weapons with damage_radius
 	if ( w.weapon_type < N_weapon_types ) {
 
 		const wi = Weapon_info[ w.weapon_type ];
 		if ( wi.damage_radius > 0 && _onBadassExplosion !== null ) {
 
-			_onBadassExplosion( w.pos_x, w.pos_y, w.pos_z, w.damage, wi.damage_radius );
+			_onBadassExplosion(
+				w.pos_x, w.pos_y, w.pos_z, w.segnum,
+				w.damage, wi.damage_radius, w.damage,
+				wi.impact_size, wi.robot_hit_vclip,
+				w.parent_object_type, w.parent_object_id
+			);
 
 		}
+
+	}
+
+	// Smart missile: spawn 6 homing children after the parent blast.
+	if ( w.weapon_type === WEAPON_SMART_INDEX ) {
+
+		create_smart_children( w );
+
+	}
+
+}
+
+// Fixed-point Descent's vm_vec_dist_quick approximation in world units.
+function quickWeaponDistance( weapon1, weapon2 ) {
+
+	return quickVectorMagnitude(
+		weapon1.pos_x - weapon2.pos_x,
+		weapon1.pos_y - weapon2.pos_y,
+		weapon1.pos_z - weapon2.pos_z
+	);
+
+}
+
+function quickVectorMagnitude( x, y, z ) {
+
+	let largest = Math.abs( x );
+	let middle = Math.abs( y );
+	let smallest = Math.abs( z );
+	let swap;
+
+	if ( largest < middle ) {
+
+		swap = largest;
+		largest = middle;
+		middle = swap;
+
+	}
+	if ( middle < smallest ) {
+
+		swap = middle;
+		middle = smallest;
+		smallest = swap;
+
+	}
+	if ( largest < middle ) {
+
+		swap = largest;
+		largest = middle;
+		middle = swap;
+
+	}
+	return largest + middle * 3 / 8 + smallest * 3 / 16;
+
+}
+
+function updateWeaponInnerModelVisibility( weapon ) {
+
+	if ( weapon.innerModelMesh === null ) return;
+	if ( _getPlayerPos === null ) {
+
+		weapon.innerModelMesh.visible = true;
+		return;
+
+	}
+
+	const viewer = _getPlayerPos();
+	const distance = quickVectorMagnitude(
+		viewer.x - weapon.pos_x,
+		viewer.y - weapon.pos_y,
+		viewer.z - weapon.pos_z
+	);
+	weapon.innerModelMesh.visible = distance < 10.0;
+
+}
+
+// LASER.C laser_are_related(): sibling weapons ignore each other unless either
+// one is a proximity mine.  Children inherit the original shooter's identity.
+function weaponsAreRelated( weapon1, weapon2 ) {
+
+	if ( weapon1.parent_type !== weapon2.parent_type ||
+		weapon1.parent_signature !== weapon2.parent_signature ) return false;
+	return weapon1.weapon_type !== PROXIMITY_ID && weapon2.weapon_type !== PROXIMITY_ID;
+
+}
+
+// COLLIDE.C maybe_kill_weapon(), specialized for the weapon/weapon pair.
+function maybeKillWeaponWithWeapon( weapon, otherWeapon ) {
+
+	if ( weapon.weapon_type === PROXIMITY_ID ) {
+
+		kill_weapon( weapon );
+		return;
+
+	}
+
+	const wi = weapon.weapon_type >= 0 && weapon.weapon_type < N_weapon_types
+		? Weapon_info[ weapon.weapon_type ] : null;
+	if ( wi !== null && wi.persistent !== 0 ) return;
+
+	weapon.shields -= otherWeapon.shields / 2;
+	if ( weapon.shields <= 0 ) {
+
+		weapon.shields = 0;
+		kill_weapon( weapon );
+
+	}
+
+}
+
+// COLLIDE.C maybe_detonate_weapon().  A destroyable radius weapon either
+// explodes at close range or has its remaining life shortened at long range.
+function maybeDetonateWeapon( weapon, otherWeapon, collision_x, collision_y, collision_z ) {
+
+	if ( weapon.weapon_type < 0 || weapon.weapon_type >= N_weapon_types ) return false;
+	const wi = Weapon_info[ weapon.weapon_type ];
+	if ( wi.damage_radius <= 0 ) return false;
+
+	const distance = quickWeaponDistance( weapon, otherWeapon );
+	if ( distance < 5 ) {
+
+		maybeKillWeaponWithWeapon( weapon, otherWeapon );
+		if ( weapon.active !== true ) {
+
+			handleWeaponExplosion( weapon );
+			digi_play_sample_world(
+				wi.robot_hit_sound, 1.0, weapon.segnum,
+				collision_x, collision_y, collision_z
+			);
+
+		}
+
+	} else {
+
+		weapon.lifeleft = Math.min( distance / 64, 1.0 );
+
+	}
+	return true;
+
+}
+
+// COLLIDE.C collide_weapon_and_weapon().
+function collideWeaponAndWeapon( weapon1, weapon2, collision_x, collision_y, collision_z ) {
+
+	if ( weapon1.weapon_type < 0 || weapon1.weapon_type >= N_weapon_types ||
+		weapon2.weapon_type < 0 || weapon2.weapon_type >= N_weapon_types ) return;
+
+	const wi1 = Weapon_info[ weapon1.weapon_type ];
+	const wi2 = Weapon_info[ weapon2.weapon_type ];
+	if ( wi1.destroyable === 0 && wi2.destroyable === 0 ) return;
+
+	// Extra source safeguard for same-kind children from one shooter.  The
+	// general sibling filter above normally catches this except for proximity.
+	if ( weapon1.weapon_type === weapon2.weapon_type &&
+		weapon1.parent_type === weapon2.parent_type &&
+		weapon1.parent_num === weapon2.parent_num ) return;
+
+	if ( wi1.destroyable !== 0 &&
+		maybeDetonateWeapon( weapon1, weapon2, collision_x, collision_y, collision_z ) ) {
+
+		maybeKillWeaponWithWeapon( weapon2, weapon1 );
+
+	}
+
+	if ( wi2.destroyable !== 0 &&
+		maybeDetonateWeapon( weapon2, weapon1, collision_x, collision_y, collision_z ) ) {
+
+		maybeKillWeaponWithWeapon( weapon1, weapon2 );
 
 	}
 
@@ -964,7 +1359,7 @@ function handleWeaponExplosion( w ) {
 // Create a new weapon bolt
 // weapon_type: index into Weapon_info[] array
 // damage_multiplier: optional multiplier for damage (fusion charge)
-export function Laser_create_new( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, segnum, parent_type, weapon_type, damage_multiplier ) {
+export function Laser_create_new( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, segnum, parent_type, weapon_type, damage_multiplier, laser_offset_override, silent, parent_speed_override, parent_num_override, parent_signature_override, parent_orientation_override ) {
 
 	if ( _scene === null ) return - 1;
 
@@ -973,7 +1368,8 @@ export function Laser_create_new( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, segn
 	if ( damage_multiplier === undefined ) damage_multiplier = 1.0;
 
 	let speed = getWeaponSpeed( weapon_type );
-	const damage = getWeaponDamage( weapon_type ) * damage_multiplier;
+	const baseDamage = getWeaponDamage( weapon_type );
+	const damage = baseDamage * damage_multiplier;
 	const lifetime = getWeaponLifetime( weapon_type );
 
 	// Get thrust/drag/mass from Weapon_info
@@ -1008,24 +1404,97 @@ export function Laser_create_new( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, segn
 
 	}
 
+	// Proximity mines inherit the parent's full speed, using the parent's
+	// forward velocity only to choose its sign. This is intentionally not a
+	// projection: LASER.C adds |parent velocity| to the mine's launch speed.
+	if ( weapon_type === PROXIMITY_ID ) {
+
+		let parentSpeed = 0;
+		if ( Number.isFinite( parent_speed_override ) ) {
+
+			parentSpeed = parent_speed_override;
+
+		} else if ( parent_type === PARENT_PLAYER && _getPlayerVelocity !== null ) {
+
+			const parentVelocity = _getPlayerVelocity();
+			parentSpeed = Math.sqrt(
+				parentVelocity.x * parentVelocity.x +
+				parentVelocity.y * parentVelocity.y +
+				parentVelocity.z * parentVelocity.z
+			);
+			if ( parentVelocity.x * dir_x + parentVelocity.y * dir_y + parentVelocity.z * dir_z < 0 ) {
+
+				parentSpeed = - parentSpeed;
+
+			}
+
+		}
+		speed += parentSpeed;
+
+	}
+
 	for ( let i = 0; i < MAX_WEAPONS; i ++ ) {
 
 		const w = weapons[ i ];
 		if ( w.active === true ) continue;
 
+		const signature = Weapon_next_signature ++;
 		w.active = true;
 		w.parent_type = parent_type;
+		w.parent_num = Number.isInteger( parent_num_override )
+			? parent_num_override : ( parent_type === PARENT_PLAYER ? 0 : - signature - 1 );
+		w.parent_signature = Number.isInteger( parent_signature_override )
+			? parent_signature_override : ( parent_type === PARENT_PLAYER ? 0 : - signature - 1 );
+		const parentObject = findWeaponParentObject(
+			w.parent_type, w.parent_num, w.parent_signature
+		);
+		w.parent_object_type = parentObject !== null && Number.isInteger( parentObject.type )
+			? parentObject.type : ( parent_type === PARENT_PLAYER ? OBJ_PLAYER : - 1 );
+		w.parent_object_id = parentObject !== null && Number.isInteger( parentObject.id )
+			? parentObject.id : ( parent_type === PARENT_PLAYER ? 0 : - 1 );
 		w.weapon_type = weapon_type;
+		w.silent = silent === true;
 		w.pos_x = pos_x;
 		w.pos_y = pos_y;
 		w.pos_z = pos_z;
 		w.vel_x = dir_x * speed;
 		w.vel_y = dir_y * speed;
 		w.vel_z = dir_z * speed;
+		initializeWeaponOrientation( w, dir_x, dir_y, dir_z, parent_orientation_override );
 		w.segnum = segnum;
 		w.lifeleft = lifetime;
 		w.damage = damage;
-		w.creation_time = _gameTime;
+		w.shields = baseDamage;
+		w.signature = signature;
+
+		// Laser_create_new() chooses the collision radius from render data.
+		// Invisible weapons use radius 1; blobs/vclips use blob_size; polygon
+		// weapons use model radius divided by their length/width ratio.
+		w.size = 1.0;
+		if ( weapon_type >= 0 && weapon_type < N_weapon_types ) {
+
+			const wi = Weapon_info[ weapon_type ];
+			if ( wi.render_type === WEAPON_RENDER_BLOB ||
+				wi.render_type === WEAPON_RENDER_LASER ||
+				wi.render_type === WEAPON_RENDER_VCLIP ) {
+
+				if ( wi.blob_size > 0 ) w.size = wi.blob_size;
+
+			} else if ( wi.render_type === WEAPON_RENDER_POLYMODEL &&
+				wi.model_num >= 0 && wi.model_num < Polygon_models.length &&
+				wi.po_len_to_width_ratio > 0 ) {
+
+				const model = Polygon_models[ wi.model_num ];
+				if ( model !== null && model !== undefined && model.rad > 0 ) {
+
+					w.size = model.rad / wi.po_len_to_width_ratio;
+
+				}
+
+			}
+
+		}
+		w.creation_time = GameTime;
 		w.track_goal = - 1;
 		w.last_hitobj = - 1;
 		w.stuck = false;
@@ -1073,39 +1542,31 @@ export function Laser_create_new( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, segn
 		// offset = Laser_offset (random jitter) + laser_length / 2
 		if ( w.modelMesh !== null ) {
 
-			// Get laser model half-length (cached per weapon type to avoid expensive recomputation)
-			let laserHalfLength = 1.77;	// Default (laser bolt model half-length)
+			// Ported from LASER.C lines 286 and 360:
+			// laser_length = Polygon_models[model_num].rad * 2, then add laser_length/2.
+			let laserHalfLength = 0;
+			if ( weapon_type < N_weapon_types ) {
 
-			if ( _weaponHalfLengthCache.has( weapon_type ) ) {
+				const wi = Weapon_info[ weapon_type ];
+				if ( wi !== undefined && wi.model_num >= 0 && wi.model_num < Polygon_models.length ) {
 
-				laserHalfLength = _weaponHalfLengthCache.get( weapon_type );
+					const model = Polygon_models[ wi.model_num ];
+					if ( model !== null && model !== undefined && model.rad > 0 ) {
 
-			} else {
-
-				w.modelMesh.traverse( ( child ) => {
-
-					if ( child.isMesh === true && child.geometry !== undefined ) {
-
-						child.geometry.computeBoundingBox();
-						const bb = child.geometry.boundingBox;
-						if ( bb !== null ) {
-
-							const halfZ = ( bb.max.z - bb.min.z ) / 2;
-							if ( halfZ > laserHalfLength ) laserHalfLength = halfZ;
-
-						}
+						laserHalfLength = model.rad;
 
 					}
 
-				} );
-
-				_weaponHalfLengthCache.set( weapon_type, laserHalfLength );
+				}
 
 			}
 
-			// Laser_offset: random jitter 0..2.0 so dual bolts don't alias
-			// Ported from LASER.C line 1124: Laser_offset = ((F1_0*2)*(rand()%10))/10
-			const laserOffset = 2.0 * ( Math.random() * 0.9 + 0.05 );
+			let laserOffset = laser_offset_override;
+			if ( laserOffset === undefined ) {
+
+				laserOffset = get_random_laser_offset();
+
+			}
 
 			const totalOffset = laserHalfLength + laserOffset;
 
@@ -1127,7 +1588,8 @@ export function Laser_create_new( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, segn
 
 			// Polymodel weapon: position and orient the 3D model
 			w.modelMesh.position.set( w.pos_x, w.pos_y, - w.pos_z );
-			orientWeaponModel( w.modelMesh, w.vel_x, w.vel_y, w.vel_z );
+			applyWeaponOrientation( w.modelMesh, w );
+			updateWeaponInnerModelVisibility( w );
 			w.modelMesh.visible = true;
 			_scene.add( w.modelMesh );
 
@@ -1150,9 +1612,7 @@ export function Laser_create_new( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, segn
 
 // Fire player primary weapon
 // Returns true if weapon was fired
-export function Laser_player_fire( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, segnum, gameTime, damage_multiplier ) {
-
-	_gameTime = gameTime;
+export function Laser_player_fire( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, segnum, gameTime, damage_multiplier, laser_offset_override ) {
 
 	// Reset fire timer if stale (e.g., after automap or long pause)
 	// Ported from: LASER.C Laser_player_fire_spread_delay() stale-time check
@@ -1213,10 +1673,11 @@ export function Laser_player_fire( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, seg
 
 			// Lower difficulty = cheaper energy cost
 			// Ported from: do_laser_firing_player() in LASER.C line 1058
-			// Trainee(0): 50%, Hotshot(1): 75%, Ace+(2+): 100%
-			if ( Difficulty_level < 2 ) {
+			// Trainee(0): 50%, Rookie(1): 75%, Hotshot+(2+): 100%
+			const difficulty = getDifficultyLevel();
+			if ( difficulty < 2 ) {
 
-				energyCost = energyCost * ( Difficulty_level + 2 ) / 4;
+				energyCost = energyCost * ( difficulty + 2 ) / 4;
 
 			}
 
@@ -1242,7 +1703,7 @@ export function Laser_player_fire( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, seg
 	if ( Primary_weapon === 2 ) {
 
 		// Center bolt
-		const centerIdx = Laser_create_new( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, segnum, PARENT_PLAYER, weapon_info_index );
+		const centerIdx = Laser_create_new( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, segnum, PARENT_PLAYER, weapon_info_index, 1.0, laser_offset_override );
 
 		// Notify AI of danger laser for robot evasion
 		// Ported from: Player_fired_laser_this_frame in LASER.C line 822
@@ -1251,6 +1712,7 @@ export function Laser_player_fire( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, seg
 			_onPlayerFiredLaser( centerIdx, dir_x, dir_y, dir_z );
 
 		}
+		if ( centerIdx !== - 1 ) play_player_weapon_fire_sound( weapon_info_index );
 
 		// Compute right and up vectors for spread
 		// Ported from: LASER.C Laser_player_fire_spread() — F1_0/16 = 0.0625
@@ -1310,13 +1772,13 @@ export function Laser_player_fire( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, seg
 		// Right/up spread bolt
 		Laser_create_new(
 			dir_x + sx * spread, dir_y + sy * spread, dir_z + sz * spread,
-			pos_x, pos_y, pos_z, segnum, PARENT_PLAYER, weapon_info_index
+			pos_x, pos_y, pos_z, segnum, PARENT_PLAYER, weapon_info_index, 1.0, laser_offset_override, true
 		);
 
 		// Left/down spread bolt
 		Laser_create_new(
 			dir_x - sx * spread, dir_y - sy * spread, dir_z - sz * spread,
-			pos_x, pos_y, pos_z, segnum, PARENT_PLAYER, weapon_info_index
+			pos_x, pos_y, pos_z, segnum, PARENT_PLAYER, weapon_info_index, 1.0, laser_offset_override, true
 		);
 
 		return true;
@@ -1339,7 +1801,7 @@ export function Laser_player_fire( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, seg
 	}
 
 	// Normal single bolt
-	const boltIdx = Laser_create_new( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, segnum, PARENT_PLAYER, weapon_info_index, damage_multiplier );
+	const boltIdx = Laser_create_new( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, segnum, PARENT_PLAYER, weapon_info_index, damage_multiplier, laser_offset_override );
 
 	// Notify AI of danger laser for robot evasion
 	// Ported from: Player_fired_laser_this_frame in LASER.C line 822
@@ -1348,6 +1810,7 @@ export function Laser_player_fire( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, seg
 		_onPlayerFiredLaser( boltIdx, dir_x, dir_y, dir_z );
 
 	}
+	if ( boltIdx !== - 1 ) play_player_weapon_fire_sound( weapon_info_index );
 
 	return true;
 
@@ -1369,8 +1832,6 @@ export function get_player_laser_weapon_info_index() {
 
 // Fire player secondary weapon (missiles)
 export function Laser_player_fire_secondary( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, segnum, gameTime ) {
-
-	_gameTime = gameTime;
 
 	if ( gameTime < Next_missile_fire_time ) return false;
 
@@ -1396,6 +1857,7 @@ export function Laser_player_fire_secondary( dir_x, dir_y, dir_z, pos_x, pos_y, 
 	Next_missile_fire_time = gameTime + fire_wait;
 
 	const missileIdx = Laser_create_new( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, segnum, PARENT_PLAYER, weapon_info_index );
+	if ( missileIdx !== - 1 ) play_player_weapon_fire_sound( weapon_info_index );
 
 	// Mega missile recoil: push player backward with random tumble
 	// Ported from: do_laser_firing_player() in LASER.C lines 1421-1438
@@ -1429,14 +1891,20 @@ export function Flare_create( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, segnum )
 	if ( _getPlayerEnergy === null || _setPlayerEnergy === null ) return false;
 
 	const wi = Weapon_info[ FLARE_ID ];
-	const energyCost = ( wi !== undefined && wi.energy_usage > 0 ) ? wi.energy_usage : 1.0;
+	let energyCost = ( wi !== undefined && wi.energy_usage > 0 ) ? wi.energy_usage : 1.0;
+	const difficulty = getDifficultyLevel();
+	if ( difficulty < 2 ) energyCost = energyCost * ( difficulty + 2 ) / 4;
 
 	const energy = _getPlayerEnergy();
 	if ( energy <= 0 ) return false;
 
 	_setPlayerEnergy( Math.max( 0, energy - energyCost ) );
 
-	Laser_create_new( dir_x, dir_y, dir_z, pos_x, pos_y, pos_z, segnum, PARENT_PLAYER, FLARE_ID );
+	const flareIdx = Laser_create_new(
+		dir_x, dir_y, dir_z, pos_x, pos_y, pos_z,
+		segnum, PARENT_PLAYER, FLARE_ID
+	);
+	if ( flareIdx !== - 1 ) play_player_weapon_fire_sound( FLARE_ID );
 	return true;
 
 }
@@ -1454,6 +1922,7 @@ function kill_weapon( w ) {
 			w.modelMesh.visible = false;
 			_scene.remove( w.modelMesh );
 			w.modelMesh = null;
+			w.innerModelMesh = null;
 
 		} else {
 
@@ -1476,97 +1945,17 @@ export function laser_do_weapon_sequence( dt ) {
 
 		// Lifetime check
 		w.lifeleft -= dt;
-		if ( w.lifeleft <= 0 ) {
+		if ( w.lifeleft < 0 ) {
 
-			// Proximity bombs explode when they expire (flares just disappear)
-			if ( w.stuck === true && w.weapon_type === PROXIMITY_ID ) {
+			// Every weapon with a damage radius explodes when it expires,
+			// whether it is moving or stuck. No wall is hit by an expiry.
+			if ( w.weapon_type < N_weapon_types && Weapon_info[ w.weapon_type ].damage_radius > 0 ) {
 
 				handleWeaponExplosion( w );
-				if ( _onWallHit !== null ) {
-
-					_onWallHit( w.pos_x, w.pos_y, w.pos_z, w.segnum, - 1, w.damage, w.weapon_type );
-
-				}
 
 			}
 
 			kill_weapon( w );
-			continue;
-
-		}
-
-		// --- Proximity bomb detection when stuck to wall ---
-		// Ported from: LASER.C / COLLIDE.C proximity bomb behavior
-		// After arming (2s), detonate when any robot comes within detect radius
-		// Before arming, only direct collision detonates
-		// (Flares stuck to walls are passive — no proximity detection)
-		if ( w.stuck === true && w.weapon_type === PROXIMITY_ID ) {
-
-			const age = _gameTime - w.creation_time;
-
-			if ( age >= PROXIMITY_ARM_TIME ) {
-
-				// Check robots
-				let triggered = false;
-
-				if ( _robots !== null ) {
-
-					for ( let r = 0; r < _robots.length; r ++ ) {
-
-						const robot = _robots[ r ];
-						if ( robot.alive !== true ) continue;
-
-						const dx = robot.obj.pos_x - w.pos_x;
-						const dy = robot.obj.pos_y - w.pos_y;
-						const dz = robot.obj.pos_z - w.pos_z;
-						const distSq = dx * dx + dy * dy + dz * dz;
-
-						if ( distSq < PROXIMITY_DETECT_RADIUS * PROXIMITY_DETECT_RADIUS ) {
-
-							triggered = true;
-							break;
-
-						}
-
-					}
-
-				}
-
-				// Check player (proximity can hurt the player after arming)
-				// Ported from: laser_are_related() — proximity >= 2s old are NOT related to parent
-				if ( triggered !== true && _getPlayerPos !== null ) {
-
-					const pp = _getPlayerPos();
-					const dx = pp.x - w.pos_x;
-					const dy = pp.y - w.pos_y;
-					const dz = pp.z - w.pos_z;
-					const distSq = dx * dx + dy * dy + dz * dz;
-
-					if ( distSq < PROXIMITY_DETECT_RADIUS * PROXIMITY_DETECT_RADIUS ) {
-
-						triggered = true;
-
-					}
-
-				}
-
-				if ( triggered === true ) {
-
-					handleWeaponExplosion( w );
-					if ( _onWallHit !== null ) {
-
-						_onWallHit( w.pos_x, w.pos_y, w.pos_z, w.segnum, - 1, w.damage, w.weapon_type );
-
-					}
-
-					kill_weapon( w );
-					continue;
-
-				}
-
-			}
-
-			// Stuck bombs don't move — skip the rest of the movement/collision logic
 			continue;
 
 		}
@@ -1578,7 +1967,7 @@ export function laser_do_weapon_sequence( dt ) {
 			if ( wi.homing_flag !== 0 ) {
 
 				// Only track after straight flight period
-				if ( _gameTime - w.creation_time > HOMING_MISSILE_STRAIGHT_TIME ) {
+				if ( GameTime - w.creation_time > HOMING_MISSILE_STRAIGHT_TIME ) {
 
 					// Smart homing children: clear bounce grace when tracking starts
 					// Ported from: LASER.C lines 950-953
@@ -1705,6 +2094,11 @@ export function laser_do_weapon_sequence( dt ) {
 									w.vel_x = nx * speed;
 									w.vel_y = ny * speed;
 									w.vel_z = nz * speed;
+									if ( wi.render_type === WEAPON_RENDER_POLYMODEL ) {
+
+										turnWeaponOrientationTowardsVelocity( w, dt );
+
+									}
 
 									// Update thrust direction to match new velocity
 									if ( w.thrust_x !== 0 || w.thrust_y !== 0 || w.thrust_z !== 0 ) {
@@ -1734,7 +2128,8 @@ export function laser_do_weapon_sequence( dt ) {
 		// Ported from: do_physics_sim() in PHYSICS.C lines 641-680
 		if ( w.drag > 0 ) {
 
-			if ( w.thrust_x !== 0 || w.thrust_y !== 0 || w.thrust_z !== 0 ) {
+			const hasThrust = w.thrust_x !== 0 || w.thrust_y !== 0 || w.thrust_z !== 0;
+			if ( hasThrust === true ) {
 
 				// Thrust-based: acceleration = thrust / mass, then apply drag
 				const invMass = 1.0 / w.mass;
@@ -1744,8 +2139,23 @@ export function laser_do_weapon_sequence( dt ) {
 
 			}
 
-			// Apply drag: velocity *= (1.0 - drag) per frame
-			const dragFactor = Math.pow( 1.0 - w.drag, dt );
+			let dragFactor;
+			if ( hasThrust === true ) {
+
+				// Retain the existing thrust integration until weapon thrust is
+				// converted to the fixed 1/64-second physics stepping as a unit.
+				dragFactor = Math.pow( 1.0 - w.drag, dt );
+
+			} else {
+
+				// PHYSICS.C applies drag once per 1/64-second quantum plus a
+				// linearly scaled partial quantum. Proximity mines use this path.
+				const dragSteps = dt * 64.0;
+				const wholeSteps = Math.floor( dragSteps );
+				const partialStep = dragSteps - wholeSteps;
+				dragFactor = Math.pow( 1.0 - w.drag, wholeSteps ) * ( 1.0 - partialStep * w.drag );
+
+			}
 			w.vel_x *= dragFactor;
 			w.vel_y *= dragFactor;
 			w.vel_z *= dragFactor;
@@ -1791,11 +2201,13 @@ export function laser_do_weapon_sequence( dt ) {
 		const new_y = w.pos_y + w.vel_y * dt;
 		const new_z = w.pos_z + w.vel_z * dt;
 
-		// FVI ray cast from old position to new position (radius 0 for projectiles)
+		// Proximity mines are radius-3 physics objects in D1. Keep the existing
+		// point-ray behavior for other projectiles until their radii are ported.
+		const wallCollisionRadius = w.weapon_type === PROXIMITY_ID ? w.size : 0.0;
 		const fvi_result = find_vector_intersection(
 			w.pos_x, w.pos_y, w.pos_z,
 			new_x, new_y, new_z,
-			w.segnum, 0.0,
+			w.segnum, wallCollisionRadius,
 			- 1, 0
 		);
 
@@ -1837,7 +2249,8 @@ export function laser_do_weapon_sequence( dt ) {
 		// Test the full p0→p1 ray segment against each potential target sphere.
 		// Track closest object hit and compare against wall hit distance.
 		let closestObjDist = Infinity;
-		let closestObjIndex = - 1;	// robot index or -2 for player
+		let closestObjKind = 0;		// 1 = robot, 2 = player, 3 = clutter, 4 = debris, 5 = weapon
+		let closestObjIndex = - 1;
 		let closestHit_x = 0, closestHit_y = 0, closestHit_z = 0;
 
 		// Player weapons check against robots
@@ -1852,7 +2265,7 @@ export function laser_do_weapon_sequence( dt ) {
 				// Skip persistent weapon re-hitting same target
 				if ( w.last_hitobj === r ) continue;
 
-				const hitRadius = robot.obj.size + 0.5;
+				const hitRadius = robot.obj.size + w.size;
 				const hitDist = check_vector_to_sphere(
 					w.pos_x, w.pos_y, w.pos_z,
 					new_x, new_y, new_z,
@@ -1863,6 +2276,7 @@ export function laser_do_weapon_sequence( dt ) {
 				if ( hitDist > 0 && hitDist < closestObjDist ) {
 
 					closestObjDist = hitDist;
+					closestObjKind = 1;
 					closestObjIndex = r;
 					closestHit_x = _sphereIntResult.hit_x;
 					closestHit_y = _sphereIntResult.hit_y;
@@ -1874,23 +2288,135 @@ export function laser_do_weapon_sequence( dt ) {
 
 		}
 
-		// Robot weapons check against player
-		// Skip persistent weapon re-hitting player (last_hitobj == -2)
-		// Ported from: LASER.C last_hitobj tracking for persistent weapons
-		if ( w.parent_type === PARENT_ROBOT && _getPlayerPos !== null && w.last_hitobj !== - 2 ) {
+		// All weapons collide with polygon clutter.  D1 dispatches this through
+		// collide_weapon_and_clutter(), independently of the weapon's parent.
+		if ( _clutter !== null ) {
 
-			const pp = _getPlayerPos();
+			for ( let c = 0; c < _clutter.length; c ++ ) {
+
+				const clutter = _clutter[ c ];
+				if ( clutter.alive !== true || clutter.obj === null || clutter.obj === undefined ) continue;
+
+				const obj = clutter.obj;
+				const hitRadius = obj.size + w.size;
+				const hitDist = check_vector_to_sphere(
+					w.pos_x, w.pos_y, w.pos_z,
+					new_x, new_y, new_z,
+					obj.pos_x, obj.pos_y, obj.pos_z,
+					hitRadius
+				);
+
+				if ( hitDist > 0 && hitDist < closestObjDist ) {
+
+					closestObjDist = hitDist;
+					closestObjKind = 3;
+					closestObjIndex = c;
+					closestHit_x = _sphereIntResult.hit_x;
+					closestHit_y = _sphereIntResult.hit_y;
+					closestHit_z = _sphereIntResult.hit_z;
+
+				}
+
+			}
+
+		}
+
+		// Only player weapons destroy debris.  The original collision dispatch
+		// ignores robot weapons for this object pair.
+		if ( w.parent_type === PARENT_PLAYER && _debris !== null ) {
+
+			for ( let d = 0; d < _debris.length; d ++ ) {
+
+				const debris = _debris[ d ];
+				if ( debris.active !== true ) continue;
+
+				const hitRadius = debris.size + w.size;
+				const hitDist = check_vector_to_sphere(
+					w.pos_x, w.pos_y, w.pos_z,
+					new_x, new_y, new_z,
+					debris.pos_x, debris.pos_y, debris.pos_z,
+					hitRadius
+				);
+
+				if ( hitDist > 0 && hitDist < closestObjDist ) {
+
+					closestObjDist = hitDist;
+					closestObjKind = 4;
+					closestObjIndex = d;
+					closestHit_x = _sphereIntResult.hit_x;
+					closestHit_y = _sphereIntResult.hit_y;
+					closestHit_z = _sphereIntResult.hit_z;
+
+				}
+
+			}
+
+		}
+
+		// Destroyable radius weapons can be shot down by other projectiles.
+		// FVI normally filters sibling weapons before dispatching this pair.
+		for ( let otherIndex = 0; otherIndex < weapons.length; otherIndex ++ ) {
+
+			if ( otherIndex === i ) continue;
+			const otherWeapon = weapons[ otherIndex ];
+			if ( otherWeapon.active !== true ||
+				otherWeapon.weapon_type < 0 || otherWeapon.weapon_type >= N_weapon_types ||
+				w.weapon_type < 0 || w.weapon_type >= N_weapon_types ) continue;
+
+			const wi = Weapon_info[ w.weapon_type ];
+			const otherWi = Weapon_info[ otherWeapon.weapon_type ];
+			if ( ( wi.destroyable === 0 || wi.damage_radius <= 0 ) &&
+				( otherWi.destroyable === 0 || otherWi.damage_radius <= 0 ) ) continue;
+			if ( weaponsAreRelated( w, otherWeapon ) ) continue;
+			if ( w.weapon_type === otherWeapon.weapon_type &&
+				w.parent_type === otherWeapon.parent_type &&
+				w.parent_num === otherWeapon.parent_num ) continue;
+
+			const hitRadius = otherWeapon.size + w.size;
 			const hitDist = check_vector_to_sphere(
 				w.pos_x, w.pos_y, w.pos_z,
 				new_x, new_y, new_z,
-				pp.x, pp.y, pp.z,
-				PLAYER_HIT_RADIUS
+				otherWeapon.pos_x, otherWeapon.pos_y, otherWeapon.pos_z,
+				hitRadius
 			);
 
 			if ( hitDist > 0 && hitDist < closestObjDist ) {
 
 				closestObjDist = hitDist;
-				closestObjIndex = - 2;	// special: player hit
+				closestObjKind = 5;
+				closestObjIndex = otherIndex;
+				closestHit_x = _sphereIntResult.hit_x;
+				closestHit_y = _sphereIntResult.hit_y;
+				closestHit_z = _sphereIntResult.hit_z;
+
+			}
+
+		}
+
+		// Robot weapons check against the player immediately. A player's own
+		// proximity mine becomes unrelated to the player only after two seconds.
+		// Skip persistent weapon re-hitting player (last_hitobj == -2)
+		// Ported from: laser_are_related() and last_hitobj tracking in LASER.C
+		const canHitPlayer = w.parent_type === PARENT_ROBOT ||
+			( w.parent_type === PARENT_PLAYER && w.weapon_type === PROXIMITY_ID &&
+				GameTime > w.creation_time + PROXIMITY_OWNER_IMMUNITY_TIME );
+		if ( canHitPlayer === true && _getPlayerPos !== null && w.last_hitobj !== - 2 ) {
+
+			const pp = _getPlayerPos();
+			const playerHitRadius = PLAYER_HIT_RADIUS +
+				( w.weapon_type === PROXIMITY_ID ? w.size : 0.0 );
+			const hitDist = check_vector_to_sphere(
+				w.pos_x, w.pos_y, w.pos_z,
+				new_x, new_y, new_z,
+				pp.x, pp.y, pp.z,
+				playerHitRadius
+			);
+
+			if ( hitDist > 0 && hitDist < closestObjDist ) {
+
+				closestObjDist = hitDist;
+				closestObjKind = 2;
+				closestObjIndex = - 2;	// retained player sentinel for last_hitobj
 				closestHit_x = _sphereIntResult.hit_x;
 				closestHit_y = _sphereIntResult.hit_y;
 				closestHit_z = _sphereIntResult.hit_z;
@@ -1902,23 +2428,35 @@ export function laser_do_weapon_sequence( dt ) {
 		// Determine what was hit first: wall or object
 		let hitSomething = false;
 
-		if ( closestObjDist < wallHitDist && closestObjIndex !== - 1 ) {
+		if ( closestObjDist < wallHitDist && closestObjKind !== 0 ) {
 
 			// Object hit is closer than wall
+			w.pos_x = closestHit_x;
+			w.pos_y = closestHit_y;
+			w.pos_z = closestHit_z;
+			const objectHitSeg = find_point_seg(
+				closestHit_x, closestHit_y, closestHit_z, w.segnum
+			);
+			if ( objectHitSeg !== - 1 ) w.segnum = objectHitSeg;
 
 			// Check if weapon is persistent (e.g., fusion cannon)
 			// Ported from: LASER.C — persistent weapons pass through targets
 			const isPersistent = ( w.weapon_type < N_weapon_types && Weapon_info[ w.weapon_type ].persistent !== 0 );
 
-			if ( closestObjIndex === - 2 ) {
+			if ( closestObjKind === 2 ) {
 
 				// Hit player — track for persistent weapons
 				// Ported from: LASER.C last_hitobj = player object num
 				w.last_hitobj = - 2;
 
+				const hasDamageRadius = w.weapon_type < N_weapon_types &&
+					Weapon_info[ w.weapon_type ].damage_radius > 0;
 				if ( _onPlayerHit !== null ) {
 
-					_onPlayerHit( w.damage, closestHit_x, closestHit_y, closestHit_z );
+					_onPlayerHit(
+						w.damage, closestHit_x, closestHit_y, closestHit_z,
+						hasDamageRadius
+					);
 
 				}
 
@@ -1930,7 +2468,7 @@ export function laser_do_weapon_sequence( dt ) {
 
 				}
 
-			} else {
+			} else if ( closestObjKind === 1 ) {
 
 				// Hit robot
 				w.last_hitobj = closestObjIndex;
@@ -1939,7 +2477,11 @@ export function laser_do_weapon_sequence( dt ) {
 
 				if ( _onRobotHit !== null ) {
 
-					_onRobotHit( closestObjIndex, w.damage, w.weapon_type, w.vel_x, w.vel_y, w.vel_z );
+					_onRobotHit(
+						closestObjIndex, w.damage, w.weapon_type,
+						w.vel_x, w.vel_y, w.vel_z,
+						closestHit_x, closestHit_y, closestHit_z
+					);
 
 				}
 
@@ -1949,6 +2491,73 @@ export function laser_do_weapon_sequence( dt ) {
 					hitSomething = true;
 
 				}
+
+			} else if ( closestObjKind === 3 ) {
+
+				// Clutter owns a small impact explosion and the positional
+				// SOUND_LASER_HIT_CLUTTER cue.  Unlike robot impacts, D1 does not
+				// detonate a damage-radius weapon here.
+				if ( _onClutterHit !== null ) {
+
+					_onClutterHit(
+						_clutter[ closestObjIndex ], w.damage, w.weapon_type,
+						w.segnum, closestHit_x, closestHit_y, closestHit_z
+					);
+
+				}
+
+				if ( isPersistent !== true ) {
+
+					kill_weapon( w );
+					hitSomething = true;
+
+				}
+
+			} else if ( closestObjKind === 4 ) {
+
+				// D1 destroys player-hit debris immediately, then detonates any
+				// radius weapon at the contact point and consumes the weapon.
+				if ( _onDebrisHit !== null ) {
+
+					_onDebrisHit(
+						_debris[ closestObjIndex ], w.segnum,
+						closestHit_x, closestHit_y, closestHit_z
+					);
+
+				}
+
+				if ( w.weapon_type < N_weapon_types &&
+					Weapon_info[ w.weapon_type ].damage_radius > 0 ) {
+
+					handleWeaponExplosion( w );
+
+				}
+
+				kill_weapon( w );
+				hitSomething = true;
+
+			} else {
+
+				const otherWeapon = weapons[ closestObjIndex ];
+				const combinedSize = otherWeapon.size + w.size;
+				let collision_x = closestHit_x;
+				let collision_y = closestHit_y;
+				let collision_z = closestHit_z;
+				if ( combinedSize > 0 ) {
+
+					// PHYSICS.C computes the shared surface point between the two
+					// weapon centers after placing the moving weapon at closestHit.
+					const scale = otherWeapon.size / combinedSize;
+					collision_x = otherWeapon.pos_x + ( closestHit_x - otherWeapon.pos_x ) * scale;
+					collision_y = otherWeapon.pos_y + ( closestHit_y - otherWeapon.pos_y ) * scale;
+					collision_z = otherWeapon.pos_z + ( closestHit_z - otherWeapon.pos_z ) * scale;
+
+				}
+
+				collideWeaponAndWeapon(
+					w, otherWeapon, collision_x, collision_y, collision_z
+				);
+				if ( w.active !== true ) hitSomething = true;
 
 			}
 
@@ -1964,9 +2573,21 @@ export function laser_do_weapon_sequence( dt ) {
 
 			}
 
-			// Proximity bombs and flares stick to walls instead of exploding
+			// Flares stick to walls. Proximity mines use their Weapon_info bounce
+			// flag and therefore continue through the reflection path below.
 			// Ported from: PHYSICS.C line 754 — PF_STICK flag handling
-			if ( w.weapon_type === PROXIMITY_ID || w.weapon_type === FLARE_ID ) {
+			if ( w.weapon_type === FLARE_ID ) {
+
+				// collide_object_with_wall() runs before PF_STICK is applied in the
+				// original, so a player flare can operate a door before it sticks.
+				if ( w.weapon_type === FLARE_ID && fvi_result.hit_type === HIT_WALL && _onWallHit !== null ) {
+
+					const wallSeg = ( fvi_result.hit_side_seg !== - 1 ) ? fvi_result.hit_side_seg : w.segnum;
+					_onWallHit( w.pos_x, w.pos_y, w.pos_z, wallSeg, fvi_result.hit_side, w.damage, w.weapon_type,
+						w.parent_type === PARENT_PLAYER, w.silent,
+						w.parent_object_type, w.parent_object_id );
+
+				}
 
 				w.stuck = true;
 
@@ -2044,15 +2665,19 @@ export function laser_do_weapon_sequence( dt ) {
 
 				} else {
 
-					handleWeaponExplosion( w );
-
+					let wallHandledExplosion = false;
 					if ( _onWallHit !== null ) {
 
 						// Use hit_side_seg/hit_side from FVI for precise blastable wall detection
 						const wallSeg = ( fvi_result.hit_side_seg !== - 1 ) ? fvi_result.hit_side_seg : w.segnum;
-						_onWallHit( w.pos_x, w.pos_y, w.pos_z, wallSeg, fvi_result.hit_side, w.damage, w.weapon_type );
+						wallHandledExplosion = _onWallHit(
+							w.pos_x, w.pos_y, w.pos_z, wallSeg, fvi_result.hit_side,
+							w.damage, w.weapon_type, w.parent_type === PARENT_PLAYER, w.silent,
+							w.parent_object_type, w.parent_object_id
+						) === true;
 
 					}
+					if ( wallHandledExplosion !== true ) handleWeaponExplosion( w );
 
 					kill_weapon( w );
 					hitSomething = true;
@@ -2063,7 +2688,12 @@ export function laser_do_weapon_sequence( dt ) {
 
 		}
 
-		if ( hitSomething === true ) continue;
+		if ( hitSomething === true ) {
+
+			updateWeaponInnerModelVisibility( w );
+			continue;
+
+		}
 
 		// Update position
 		w.pos_x = new_x;
@@ -2075,7 +2705,8 @@ export function laser_do_weapon_sequence( dt ) {
 		if ( w.modelMesh !== null ) {
 
 			w.modelMesh.position.set( new_x, new_y, - new_z );
-			orientWeaponModel( w.modelMesh, w.vel_x, w.vel_y, w.vel_z );
+			applyWeaponOrientation( w.modelMesh, w );
+			updateWeaponInnerModelVisibility( w );
 
 		} else {
 
@@ -2163,6 +2794,22 @@ export function laser_get_homing_object_dist() {
 export function laser_get_active_weapons() {
 
 	return weapons;
+
+}
+
+// Keep homing targets and persistent-weapon hit suppression attached to the
+// same liveRobots entry when that array is compacted after a runtime-spawned
+// robot dies.  Negative player/untracked sentinels are intentionally unaffected.
+export function laser_remap_robot_index( oldIndex, newIndex ) {
+
+	for ( let i = 0; i < weapons.length; i ++ ) {
+
+		const w = weapons[ i ];
+		if ( w.active !== true ) continue;
+		if ( w.track_goal === oldIndex ) w.track_goal = newIndex;
+		if ( w.last_hitobj === oldIndex ) w.last_hitobj = newIndex;
+
+	}
 
 }
 

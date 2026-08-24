@@ -4,23 +4,43 @@
 
 import * as THREE from 'three';
 import { Vclips } from './bm.js';
-import { Robot_info, N_robot_types } from './bm.js';
-import { Polygon_models, buildSubmodelMesh } from './polyobj.js';
+import { Robot_info, N_robot_types, Player_ship, Dying_modelnums } from './bm.js';
+import { Polygon_models, buildModelMesh, buildSubmodelMesh,
+	polyobj_clone_model_mesh, polyobj_apply_texture_override,
+	polyobj_wrap_model_lod } from './polyobj.js';
 import { find_point_seg } from './gameseg.js';
-import { OBJ_ROBOT } from './object.js';
-import { Segments, Vertices, Side_to_verts, Walls } from './mglobal.js';
+import { find_vector_intersection, HIT_NONE, HIT_WALL } from './fvi.js';
+import { OBJ_PLAYER, OBJ_ROBOT, PF_BOUNCE, PF_USES_THRUST } from './object.js';
+import { Segments, Vertices, Side_to_verts, Walls, Textures } from './mglobal.js';
 import { WallAnims, find_connect_side, wall_set_tmap_num } from './wall.js';
-import { digi_play_sample_3d, SOUND_EXPLODING_WALL } from './digi.js';
+import { digi_play_sample_world, SOUND_EXPLODING_WALL } from './digi.js';
 
 // Vclip constants (from VCLIP.H)
 export const VCLIP_SMALL_EXPLOSION = 2;
 export const VCLIP_PLAYER_HIT = 1;
+export const VCLIP_BIG_PLAYER_EXPLOSION = 58;
+export const VCLIP_PLAYER_APPEARANCE = 61;
 export const VCLIP_MORPHING_ROBOT = 10;
 export const VCLIP_VOLATILE_WALL_HIT = 5;
 export const VCLIP_POWERUP_DISAPPEARANCE = 62;
 
-// Explosion scale factor (from FIREBALL.C: #define EXPLOSION_SCALE fl2f(2.5))
-const EXPLOSION_SCALE = 2.5;
+// Polygon-object destruction explosions are 2.5 times the object's radius.
+// Direct object_create_explosion() callers already supply their final size.
+// Ported from: FIREBALL.C EXPLOSION_SCALE and explode_object().
+export const EXPLOSION_SCALE = 2.5;
+
+function applyParentTextureOverride( mesh, parentObj ) {
+
+	if ( mesh === null || mesh === undefined || parentObj === null || parentObj === undefined ||
+		parentObj.rtype === null || parentObj.rtype === undefined ) return false;
+	const tmapOverride = parentObj.rtype.tmap_override;
+	if ( Number.isInteger( tmapOverride ) !== true || tmapOverride < 0 ||
+		tmapOverride >= Textures.length ) return false;
+	return polyobj_apply_texture_override(
+		mesh, Textures[ tmapOverride ], _pigFile, _palette
+	);
+
+}
 
 // What vclip does this object explode with?
 // Ported from: get_explosion_vclip() in FIREBALL.C lines 901-916
@@ -43,6 +63,10 @@ export function get_explosion_vclip( obj_type, obj_id, stage ) {
 
 		}
 
+	} else if ( obj_type === OBJ_PLAYER && Player_ship.loaded === true && Player_ship.expl_vclip_num > - 1 ) {
+
+		return Player_ship.expl_vclip_num;
+
 	}
 
 	return VCLIP_SMALL_EXPLOSION;	// default
@@ -55,10 +79,12 @@ const DEBRIS_LIFE = 2.0;
 // Pool
 const MAX_EXPLOSIONS = 30;
 const explosions = [];
+const EXPLOSION_PHYSICS_STEP = 1.0 / 64.0;
 
 // Debris pool
 const MAX_DEBRIS = 30;
 const debrisList = [];
+let Debris_next_signature = 0;
 
 // External refs
 let _scene = null;
@@ -69,8 +95,29 @@ let _palette = null;
 // Texture cache keyed by PIG bitmap index
 const _textureCache = new Map();
 
-// Reusable vectors for debris updates (Golden Rule #5)
-const _debrisEuler = new THREE.Euler();
+// Reusable orientation state for debris updates (Golden Rule #5)
+const _debrisMatrix = new THREE.Matrix4();
+const _debrisEuler = new THREE.Euler( 0, 0, 0, 'YXZ' );
+const _debrisRotation = new THREE.Quaternion();
+
+// FIREBALL.C installs these fixed-angle rotational velocities on every debris
+// object.  One full fixang revolution is 2*PI radians.
+const FIXANG_TO_RADIANS = 2 * Math.PI / 65536;
+const DEBRIS_ROTVEL_X = Math.trunc( 10 * 0x2000 / 3 ) * FIXANG_TO_RADIANS;
+const DEBRIS_ROTVEL_Y = Math.trunc( 10 * 0x4000 / 3 ) * FIXANG_TO_RADIANS;
+const DEBRIS_ROTVEL_Z = Math.trunc( 10 * 0x7000 / 3 ) * FIXANG_TO_RADIANS;
+
+function debris_quick_magnitude( x, y, z ) {
+
+	let largest = Math.abs( x );
+	let middle = Math.abs( y );
+	let smallest = Math.abs( z );
+	if ( largest < middle ) { const t = largest; largest = middle; middle = t; }
+	if ( middle < smallest ) { const t = middle; middle = smallest; smallest = t; }
+	if ( largest < middle ) { const t = largest; largest = middle; middle = t; }
+	return largest + middle * 3 / 8 + smallest * 3 / 16;
+
+}
 
 class ExplosionObj {
 
@@ -84,6 +131,20 @@ class ExplosionObj {
 		this.baseSize = 0;
 		this.sprite = null;
 		this.lastFrame = - 1;	// track frame to avoid unnecessary texture swaps
+		this.hasPhysics = false;
+		this.segnum = - 1;
+		this.pos_x = 0;
+		this.pos_y = 0;
+		this.pos_z = 0;
+		this.vel_x = 0;
+		this.vel_y = 0;
+		this.vel_z = 0;
+		this.thrust_x = 0;
+		this.thrust_y = 0;
+		this.thrust_z = 0;
+		this.mass = 0;
+		this.drag = 0;
+		this.physicsFlags = 0;
 
 	}
 
@@ -96,7 +157,11 @@ class DebrisObj {
 	constructor() {
 
 		this.active = false;
+		this.signature = 0;
 		this.mesh = null;
+		this.model_num = - 1;
+		this.subobj_num = - 1;
+		this.size = 0;
 		this.vel_x = 0;
 		this.vel_y = 0;
 		this.vel_z = 0;
@@ -144,6 +209,7 @@ export function fireball_init( scene, buildTexture, pigFile, palette ) {
 	_buildTexture = buildTexture;
 	_pigFile = pigFile;
 	_palette = palette;
+	Debris_next_signature = 0;
 
 	for ( let i = 0; i < MAX_EXPLOSIONS; i ++ ) {
 
@@ -175,11 +241,11 @@ export function fireball_init( scene, buildTexture, pigFile, palette ) {
 // vclip_num defaults to VCLIP_SMALL_EXPLOSION if not specified
 export function object_create_explosion( pos_x, pos_y, pos_z, size, vclip_num ) {
 
-	if ( _scene === null ) return;
+	if ( _scene === null ) return null;
 	if ( vclip_num === undefined ) vclip_num = VCLIP_SMALL_EXPLOSION;
 
 	const vc = Vclips[ vclip_num ];
-	if ( vc === undefined || vc.num_frames === 0 || vc.frames.length === 0 ) return;
+	if ( vc === undefined || vc.num_frames === 0 || vc.frames.length === 0 ) return null;
 
 	for ( let i = 0; i < MAX_EXPLOSIONS; i ++ ) {
 
@@ -193,6 +259,20 @@ export function object_create_explosion( pos_x, pos_y, pos_z, size, vclip_num ) 
 		e.lifeleft = e.playTime;
 		e.baseSize = size;
 		e.lastFrame = - 1;
+		e.hasPhysics = false;
+		e.segnum = - 1;
+		e.pos_x = pos_x;
+		e.pos_y = pos_y;
+		e.pos_z = pos_z;
+		e.vel_x = 0;
+		e.vel_y = 0;
+		e.vel_z = 0;
+		e.thrust_x = 0;
+		e.thrust_y = 0;
+		e.thrust_z = 0;
+		e.mass = 0;
+		e.drag = 0;
+		e.physicsFlags = 0;
 
 		// Set first frame texture
 		const tex = getVclipTexture( vclip_num, 0 );
@@ -207,20 +287,188 @@ export function object_create_explosion( pos_x, pos_y, pos_z, size, vclip_num ) 
 		e.sprite.visible = true;
 		e.sprite.position.set( pos_x, pos_y, - pos_z );
 
-		const s = size * EXPLOSION_SCALE;
-		e.sprite.scale.set( s, s, 1 );
+		e.sprite.scale.set( size, size, 1 );
 
 		_scene.add( e.sprite );
 
-		return;
+		return e;
+
+	}
+
+	return null;
+
+}
+
+// FIREBALL.C copies the destroyed object's physics_info into its secondary
+// explosion.  Keep static impact/muzzle fireballs on MT_NONE, while allowing
+// the delayed object-death path to opt into that copied motion explicitly.
+export function explosion_copy_physics(
+	explosion, segnum, physics, velocity_x, velocity_y, velocity_z
+) {
+
+	if ( explosion === null || explosion === undefined || explosion.active !== true ||
+		physics === null || physics === undefined ) return false;
+
+	let resolvedSegnum = Number.isInteger( segnum ) === true ? segnum : - 1;
+	if ( resolvedSegnum < 0 ) {
+
+		resolvedSegnum = find_point_seg(
+			explosion.pos_x, explosion.pos_y, explosion.pos_z, - 1
+		);
+
+	}
+	if ( resolvedSegnum < 0 ) return false;
+
+	explosion.segnum = resolvedSegnum;
+	explosion.vel_x = Number.isFinite( velocity_x ) === true ? velocity_x
+		: ( Number.isFinite( physics.velocity_x ) === true ? physics.velocity_x : 0 );
+	explosion.vel_y = Number.isFinite( velocity_y ) === true ? velocity_y
+		: ( Number.isFinite( physics.velocity_y ) === true ? physics.velocity_y : 0 );
+	explosion.vel_z = Number.isFinite( velocity_z ) === true ? velocity_z
+		: ( Number.isFinite( physics.velocity_z ) === true ? physics.velocity_z : 0 );
+	explosion.thrust_x = Number.isFinite( physics.thrust_x ) === true ? physics.thrust_x : 0;
+	explosion.thrust_y = Number.isFinite( physics.thrust_y ) === true ? physics.thrust_y : 0;
+	explosion.thrust_z = Number.isFinite( physics.thrust_z ) === true ? physics.thrust_z : 0;
+	explosion.mass = Number.isFinite( physics.mass ) === true ? physics.mass : 0;
+	explosion.drag = Number.isFinite( physics.drag ) === true ? physics.drag : 0;
+	explosion.physicsFlags = Number.isInteger( physics.flags ) === true ? physics.flags : 0;
+	explosion.hasPhysics = true;
+	return true;
+
+}
+
+function advance_explosion_velocity( explosion, dt ) {
+
+	if ( explosion.drag <= 0 ) return;
+	let count = Math.floor( dt / EXPLOSION_PHYSICS_STEP );
+	const remainder = dt - count * EXPLOSION_PHYSICS_STEP;
+	const fraction = remainder / EXPLOSION_PHYSICS_STEP;
+	const drag = explosion.drag;
+
+	if ( ( explosion.physicsFlags & PF_USES_THRUST ) !== 0 && explosion.mass > 0 ) {
+
+		const accel_x = explosion.thrust_x / explosion.mass;
+		const accel_y = explosion.thrust_y / explosion.mass;
+		const accel_z = explosion.thrust_z / explosion.mass;
+		while ( count > 0 ) {
+
+			explosion.vel_x = ( explosion.vel_x + accel_x ) * ( 1.0 - drag );
+			explosion.vel_y = ( explosion.vel_y + accel_y ) * ( 1.0 - drag );
+			explosion.vel_z = ( explosion.vel_z + accel_z ) * ( 1.0 - drag );
+			count --;
+
+		}
+		const scale = 1.0 - fraction * drag;
+		explosion.vel_x = ( explosion.vel_x + accel_x * fraction ) * scale;
+		explosion.vel_y = ( explosion.vel_y + accel_y * fraction ) * scale;
+		explosion.vel_z = ( explosion.vel_z + accel_z * fraction ) * scale;
+
+	} else {
+
+		let totalDrag = 1.0;
+		while ( count > 0 ) {
+
+			totalDrag *= 1.0 - drag;
+			count --;
+
+		}
+		totalDrag *= 1.0 - fraction * drag;
+		explosion.vel_x *= totalDrag;
+		explosion.vel_y *= totalDrag;
+		explosion.vel_z *= totalDrag;
 
 	}
 
 }
 
+function advance_explosion_physics( explosion, dt ) {
+
+	if ( explosion.hasPhysics !== true || Number.isFinite( dt ) !== true || dt <= 0 ) return;
+	advance_explosion_velocity( explosion, dt );
+
+	let pos_x = explosion.pos_x;
+	let pos_y = explosion.pos_y;
+	let pos_z = explosion.pos_z;
+	let segnum = explosion.segnum;
+	let remaining = dt;
+
+	for ( let iteration = 0; iteration < 3 && remaining > 0.0001; iteration ++ ) {
+
+		const target_x = pos_x + explosion.vel_x * remaining;
+		const target_y = pos_y + explosion.vel_y * remaining;
+		const target_z = pos_z + explosion.vel_z * remaining;
+		const travel_x = target_x - pos_x;
+		const travel_y = target_y - pos_y;
+		const travel_z = target_z - pos_z;
+		const travelLength = Math.sqrt(
+			travel_x * travel_x + travel_y * travel_y + travel_z * travel_z
+		);
+		const hit = find_vector_intersection(
+			pos_x, pos_y, pos_z,
+			target_x, target_y, target_z,
+			segnum, explosion.baseSize, - 1, 0
+		);
+
+		if ( hit.hit_type === HIT_NONE ) {
+
+			pos_x = hit.hit_pnt_x;
+			pos_y = hit.hit_pnt_y;
+			pos_z = hit.hit_pnt_z;
+			if ( hit.hit_seg >= 0 ) segnum = hit.hit_seg;
+			remaining = 0;
+			break;
+
+		}
+
+		if ( hit.hit_type !== HIT_WALL ) {
+
+			explosion.hasPhysics = false;
+			break;
+
+		}
+
+		const moved_x = hit.hit_pnt_x - pos_x;
+		const moved_y = hit.hit_pnt_y - pos_y;
+		const moved_z = hit.hit_pnt_z - pos_z;
+		const movedLength = Math.sqrt(
+			moved_x * moved_x + moved_y * moved_y + moved_z * moved_z
+		);
+		const movedFraction = travelLength > 1e-12
+			? Math.max( 0, Math.min( 1, movedLength / travelLength ) ) : 1;
+		remaining *= 1.0 - movedFraction;
+		pos_x = hit.hit_pnt_x;
+		pos_y = hit.hit_pnt_y;
+		pos_z = hit.hit_pnt_z;
+		if ( hit.hit_seg >= 0 ) segnum = hit.hit_seg;
+
+		const normalVelocity = explosion.vel_x * hit.hit_wallnorm_x +
+			explosion.vel_y * hit.hit_wallnorm_y +
+			explosion.vel_z * hit.hit_wallnorm_z;
+		if ( normalVelocity < 0 ) {
+
+			const response = ( explosion.physicsFlags & PF_BOUNCE ) !== 0 ? 2 : 1;
+			explosion.vel_x -= hit.hit_wallnorm_x * normalVelocity * response;
+			explosion.vel_y -= hit.hit_wallnorm_y * normalVelocity * response;
+			explosion.vel_z -= hit.hit_wallnorm_z * normalVelocity * response;
+
+		}
+
+	}
+
+	explosion.pos_x = pos_x;
+	explosion.pos_y = pos_y;
+	explosion.pos_z = pos_z;
+	explosion.segnum = segnum;
+	explosion.sprite.position.set( pos_x, pos_y, - pos_z );
+
+}
+
 // Create a single debris piece from a submodel of a destroyed object
 // Ported from: object_create_debris() in FIREBALL.C
-function object_create_debris( model_num, subobj_num, pos_x, pos_y, pos_z ) {
+function object_create_debris(
+	model_num, subobj_num, pos_x, pos_y, pos_z,
+	pvx = 0, pvy = 0, pvz = 0, parentObj = null
+) {
 
 	if ( _scene === null || _pigFile === null || _palette === null ) return;
 
@@ -254,24 +502,38 @@ function object_create_debris( model_num, subobj_num, pos_x, pos_y, pos_z ) {
 
 	}
 
-	// Clone the submodel mesh (shares geometry/material, cheap)
-	d.mesh = sourceMesh.clone();
+	// Geometry remains shared, while light/glow/live-texture material state is
+	// owned by this debris instance.
+	d.mesh = polyobj_clone_model_mesh( sourceMesh );
+	applyParentTextureOverride( d.mesh, parentObj );
 	d.active = true;
+	d.signature = Debris_next_signature ++;
+	d.model_num = model_num;
+	d.subobj_num = subobj_num;
+	d.size = model.submodel_rads[ subobj_num ];
 	d.lifeleft = DEBRIS_LIFE;
 
 	// Position at parent's location (Descent coordinates)
 	d.pos_x = pos_x;
 	d.pos_y = pos_y;
 	d.pos_z = pos_z;
-	d.segnum = find_point_seg( pos_x, pos_y, pos_z, - 1 );
+	// obj_create() links debris to parent->segnum.  A point on a portal belongs
+	// to both adjacent segments, so an exhaustive lookup can silently choose the
+	// lower-numbered neighbor and make the first physics sweep start on the wrong
+	// side of a wall.
+	d.segnum = parentObj !== null && parentObj !== undefined &&
+		Number.isInteger( parentObj.segnum ) === true && parentObj.segnum >= 0 &&
+		parentObj.segnum < Segments.length
+		? parentObj.segnum : find_point_seg( pos_x, pos_y, pos_z, - 1 );
 
-	// Random velocity: normalized random direction * (10 + random * 30)
-	// Ported from FIREBALL.C: vm_vec_normalize + vm_vec_scale(i2f(10) + d_rand()*6)
-	let vx = ( Math.random() - 0.5 );
-	let vy = ( Math.random() - 0.5 );
-	let vz = ( Math.random() - 0.5 );
-	const vmag = Math.sqrt( vx * vx + vy * vy + vz * vz );
-	if ( vmag > 0.001 ) {
+	// FIREBALL.C creates three signed 15-bit components and normalizes them with
+	// vm_vec_normalize_quick(), not Euclidean length.  Its speed expression is
+	// integer arithmetic, so the launch speed is one of the integers 10..40.
+	let vx = 16384 - Math.floor( Math.random() * 32768 );
+	let vy = 16384 - Math.floor( Math.random() * 32768 );
+	let vz = 16384 - Math.floor( Math.random() * 32768 );
+	const vmag = debris_quick_magnitude( vx, vy, vz );
+	if ( vmag > 0 ) {
 
 		vx /= vmag;
 		vy /= vmag;
@@ -279,16 +541,38 @@ function object_create_debris( model_num, subobj_num, pos_x, pos_y, pos_z ) {
 
 	}
 
-	const speed = 10.0 + Math.random() * 30.0;
-	d.vel_x = vx * speed;
-	d.vel_y = vy * speed;
-	d.vel_z = vz * speed;
+	// Quick-normalized direction * integer speed 10-40, plus the destroyed
+	// object's velocity.
+	// Ported from FIREBALL.C:362 — vm_vec_add2(&velocity, &parent->velocity).
+	const speedRandom = Math.floor( Math.random() * 32768 );
+	const speed = 10 + Math.floor( 30 * speedRandom / 32767 );
+	d.vel_x = vx * speed + pvx;
+	d.vel_y = vy * speed + pvy;
+	d.vel_z = vz * speed + pvz;
 
-	// Fixed rotation velocities (from FIREBALL.C)
-	// 10*0x2000/3 = ~0.4167 rev/s, 10*0x4000/3 = ~0.8333, 10*0x7000/3 = ~1.4583
-	d.rotvel_x = 2.62;	// ~150 deg/s
-	d.rotvel_y = 5.24;	// ~300 deg/s
-	d.rotvel_z = 9.16;	// ~525 deg/s
+	// Fixed rotation velocities from FIREBALL.C.  The physics simulation treats
+	// these as local pitch, heading, and bank rates.
+	d.rotvel_x = DEBRIS_ROTVEL_X;
+	d.rotvel_y = DEBRIS_ROTVEL_Y;
+	d.rotvel_z = DEBRIS_ROTVEL_Z;
+
+	// obj_create() copies the parent's orientation into each debris object.
+	// Convert the canonical Descent basis to Three's reflected-Z basis.
+	if ( parentObj !== null && parentObj !== undefined ) {
+
+		_debrisMatrix.set(
+			parentObj.orient_rvec_x, parentObj.orient_uvec_x, - parentObj.orient_fvec_x, 0,
+			parentObj.orient_rvec_y, parentObj.orient_uvec_y, - parentObj.orient_fvec_y, 0,
+			- parentObj.orient_rvec_z, - parentObj.orient_uvec_z, parentObj.orient_fvec_z, 0,
+			0, 0, 0, 1
+		);
+		d.mesh.quaternion.setFromRotationMatrix( _debrisMatrix );
+
+	} else {
+
+		d.mesh.quaternion.identity();
+
+	}
 
 	// Position mesh in Three.js coordinates
 	d.mesh.position.set( pos_x, pos_y, - pos_z );
@@ -298,26 +582,111 @@ function object_create_debris( model_num, subobj_num, pos_x, pos_y, pos_z ) {
 
 // Blow up a polygon model — create debris for each submodel
 // Ported from: explode_model() in FIREBALL.C
-export function explode_model( model_num, pos_x, pos_y, pos_z ) {
+export function explode_model(
+	model_num, pos_x, pos_y, pos_z,
+	pvx = 0, pvy = 0, pvz = 0, parentEntry = null
+) {
 
+	if ( model_num < 0 || model_num >= Polygon_models.length ) return;
+	const originalModelNum = model_num;
+	const parentObj = parentEntry !== null && parentEntry !== undefined &&
+		parentEntry.obj !== null && parentEntry.obj !== undefined
+		? parentEntry.obj : parentEntry;
+	if ( model_num < Dying_modelnums.length && Dying_modelnums[ model_num ] >= 0 ) {
+
+		model_num = Dying_modelnums[ model_num ];
+
+	}
 	if ( model_num < 0 || model_num >= Polygon_models.length ) return;
 
 	const model = Polygon_models[ model_num ];
 	if ( model === null || model === undefined ) return;
+	if ( parentObj !== null && parentObj !== undefined &&
+		parentObj.rtype !== null && parentObj.rtype !== undefined ) {
 
-	if ( model.n_models > 1 ) {
+		parentObj.rtype.model_num = model_num;
 
-		// Create debris for each submodel (skip 0 = center body)
-		for ( let i = 1; i < model.n_models; i ++ ) {
+	}
+	const centerOnly = model.n_models > 1;
+	const parentMesh = parentEntry !== null && parentEntry !== undefined
+		? parentEntry.mesh : null;
+	let replacementMesh = null;
+	if ( parentMesh !== null && parentMesh !== undefined &&
+		( centerOnly === true || model_num !== originalModelNum ) ) {
 
-			object_create_debris( model_num, i, pos_x, pos_y, pos_z );
+		let replacementSource;
+		if ( centerOnly === true ) {
+
+			replacementSource = buildSubmodelMesh( model, 0, _pigFile, _palette );
+
+		} else {
+
+			if ( model.mesh === null ) model.mesh = buildModelMesh( model, _pigFile, _palette );
+			replacementSource = model.mesh;
+
+		}
+		if ( replacementSource !== null ) {
+
+			replacementMesh = polyobj_clone_model_mesh( replacementSource );
+			if ( centerOnly !== true && ( parentObj === null || parentObj === undefined ||
+				parentObj.rtype === null || parentObj.rtype === undefined ||
+				parentObj.rtype.subobj_flags === 0 ) ) {
+
+				replacementMesh = polyobj_wrap_model_lod(
+					replacementMesh, model, _pigFile, _palette
+				);
+
+			}
+			applyParentTextureOverride( replacementMesh, parentObj );
+			replacementMesh.position.copy( parentMesh.position );
+			replacementMesh.quaternion.copy( parentMesh.quaternion );
+			replacementMesh.scale.copy( parentMesh.scale );
+			replacementMesh.visible = parentMesh.visible;
+			replacementMesh.renderOrder = parentMesh.renderOrder;
 
 		}
 
 	}
 
-	// Also create debris for submodel 0 (the center) since we remove the whole mesh
-	object_create_debris( model_num, 0, pos_x, pos_y, pos_z );
+	if ( centerOnly === true ) {
+
+		// Create debris for each submodel (skip 0 = center body)
+		for ( let i = 1; i < model.n_models; i ++ ) {
+
+			object_create_debris( model_num, i, pos_x, pos_y, pos_z, pvx, pvy, pvz, parentObj );
+
+		}
+
+		// D1 leaves the original object alive and renders only submodel 0 until
+		// the secondary explosion reaches its deletion time.  Replace the full
+		// hierarchy with that centered root-only model instead of launching the
+		// root itself as debris.
+		if ( parentObj !== null && parentObj !== undefined &&
+			parentObj.rtype !== null && parentObj.rtype !== undefined ) {
+
+			parentObj.rtype.subobj_flags = 1;
+
+		}
+
+	}
+	if ( replacementMesh !== null ) {
+
+		const meshParent = parentMesh.parent;
+		if ( meshParent !== null ) {
+
+			meshParent.add( replacementMesh );
+			meshParent.remove( parentMesh );
+
+		} else if ( _scene !== null ) {
+
+			_scene.remove( parentMesh );
+			_scene.add( replacementMesh );
+
+		}
+		parentEntry.mesh = replacementMesh;
+		if ( parentEntry.submodelGroups !== undefined ) parentEntry.submodelGroups = null;
+
+	}
 
 }
 
@@ -326,6 +695,36 @@ export function explode_model( model_num, pos_x, pos_y, pos_z ) {
 export function fireball_get_active() {
 
 	return explosions;
+
+}
+
+// Preallocated debris pool, used by the central object-light update.
+export function fireball_get_debris() {
+
+	return debrisList;
+
+}
+
+// Destroy one live debris object after a player weapon collision.
+// Ported from: collide_weapon_and_debris() -> explode_object(debris, 0)
+export function fireball_destroy_debris( debris ) {
+
+	if ( debris === null || debris === undefined || debris.active !== true ) return false;
+
+	object_create_explosion(
+		debris.pos_x, debris.pos_y, debris.pos_z,
+		debris.size * EXPLOSION_SCALE, VCLIP_SMALL_EXPLOSION
+	);
+
+	debris.active = false;
+	if ( debris.mesh !== null ) {
+
+		if ( _scene !== null ) _scene.remove( debris.mesh );
+		debris.mesh = null;
+
+	}
+
+	return true;
 
 }
 
@@ -339,6 +738,7 @@ export function debris_cleanup() {
 		if ( e.active === true ) {
 
 			e.active = false;
+			e.hasPhysics = false;
 			e.sprite.visible = false;
 			if ( _scene !== null ) _scene.remove( e.sprite );
 
@@ -382,12 +782,14 @@ export function fireball_process( dt ) {
 		if ( e.lifeleft <= 0 ) {
 
 			e.active = false;
+			e.hasPhysics = false;
 			e.sprite.visible = false;
 			_scene.remove( e.sprite );
 
 			continue;
 
 		}
+		advance_explosion_physics( e, dt );
 
 		// Calculate current animation frame from lifeleft
 		// From VCLIP.C: bitmapnum = (nf - fixdiv((nf-1)*timeleft, play_time)) - 1
@@ -424,7 +826,10 @@ export function fireball_process( dt ) {
 		if ( d.lifeleft <= 0 ) {
 
 			// Debris expires — create small explosion at its position
-			object_create_explosion( d.pos_x, d.pos_y, d.pos_z, 1.5, VCLIP_SMALL_EXPLOSION );
+			object_create_explosion(
+				d.pos_x, d.pos_y, d.pos_z,
+				d.size * EXPLOSION_SCALE, VCLIP_SMALL_EXPLOSION
+			);
 
 			d.active = false;
 			if ( d.mesh !== null ) {
@@ -443,14 +848,27 @@ export function fireball_process( dt ) {
 		const new_y = d.pos_y + d.vel_y * dt;
 		const new_z = d.pos_z + d.vel_z * dt;
 
-		// Wall collision check: if debris left its segment, it hit a wall
-		// Ported from: collide_debris_and_wall() in COLLIDE.C — explode on impact
-		const newSeg = find_point_seg( new_x, new_y, new_z, d.segnum );
+		// Sweep the debris sphere through the mine.  An endpoint-only segment
+		// lookup can place a fast fragment in the segment beyond a closed door;
+		// D1 moves OBJ_DEBRIS through FVI and collide_debris_and_wall() explodes
+		// it at the first solid contact.
+		const hit = find_vector_intersection(
+			d.pos_x, d.pos_y, d.pos_z,
+			new_x, new_y, new_z,
+			d.segnum, d.size, - 1, 0
+		);
+		const newSeg = hit.hit_seg;
 
-		if ( newSeg === - 1 ) {
+		if ( hit.hit_type !== HIT_NONE || newSeg === - 1 ) {
 
 			// Hit a wall — explode and deactivate
-			object_create_explosion( d.pos_x, d.pos_y, d.pos_z, 1.5, VCLIP_SMALL_EXPLOSION );
+			const impact_x = hit.hit_type === HIT_WALL ? hit.hit_pnt_x : d.pos_x;
+			const impact_y = hit.hit_type === HIT_WALL ? hit.hit_pnt_y : d.pos_y;
+			const impact_z = hit.hit_type === HIT_WALL ? hit.hit_pnt_z : d.pos_z;
+			object_create_explosion(
+				impact_x, impact_y, impact_z,
+				d.size * EXPLOSION_SCALE, VCLIP_SMALL_EXPLOSION
+			);
 
 			d.active = false;
 			if ( d.mesh !== null ) {
@@ -464,18 +882,25 @@ export function fireball_process( dt ) {
 
 		}
 
-		d.pos_x = new_x;
-		d.pos_y = new_y;
-		d.pos_z = new_z;
+		d.pos_x = hit.hit_pnt_x;
+		d.pos_y = hit.hit_pnt_y;
+		d.pos_z = hit.hit_pnt_z;
 		d.segnum = newSeg;
 
 		// Update mesh position (Three.js coordinates: negate Z)
 		d.mesh.position.set( d.pos_x, d.pos_y, - d.pos_z );
 
-		// Apply rotation (accumulate euler angles)
-		d.mesh.rotation.x += d.rotvel_x * dt;
-		d.mesh.rotation.y += d.rotvel_y * dt;
-		d.mesh.rotation.z += d.rotvel_z * dt;
+		// PHYSICS.C post-multiplies the current orientation by a local
+		// pitch/heading/bank rotation.  In Three's reflected-Z basis that is
+		// YXZ Euler (-pitch, -heading, +bank), not independent XYZ increments.
+		_debrisEuler.set(
+			- d.rotvel_x * dt,
+			- d.rotvel_y * dt,
+			d.rotvel_z * dt,
+			'YXZ'
+		);
+		_debrisRotation.setFromEuler( _debrisEuler );
+		d.mesh.quaternion.multiply( _debrisRotation ).normalize();
 
 	}
 
@@ -568,7 +993,7 @@ export function explode_wall( segnum, sidenum ) {
 	cy /= 4;
 	cz /= 4;
 
-	digi_play_sample_3d( SOUND_EXPLODING_WALL, 1.0, cx, cy, cz );
+	digi_play_sample_world( SOUND_EXPLODING_WALL, 1.0, segnum, cx, cy, cz );
 
 }
 
@@ -708,7 +1133,7 @@ function do_exploding_wall_frame( dt ) {
 
 				if ( _onBadassWallExplosion !== null ) {
 
-					_onBadassWallExplosion( px, py, pz, 4.0, 20.0 );
+					_onBadassWallExplosion( px, py, pz, 4.0, 20.0, 50.0 );
 
 				}
 

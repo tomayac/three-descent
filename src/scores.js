@@ -8,18 +8,20 @@ import { SUBTITLE_FONT, GAME_FONT } from './gamefont.js';
 
 const MAX_HIGH_SCORES = 10;
 
-// Default high scores (from SCORES.C lines 327-344)
+// Default high scores. Ported from: scores_read() in SCORES.C:322-345 — the struct is
+// memset to 0, then only name and score = (10 - i) * 1000 are set. diff_level, levels and
+// seconds stay 0, so the table shows "Trainee", blank levels, and 0:00:00.
 const DEFAULT_SCORES = [
-	{ name: 'Parallax', score: 10000, diff_level: 4, starting_level: 1, ending_level: 7, seconds: 7200 },
-	{ name: 'Mike', score: 9000, diff_level: 3, starting_level: 1, ending_level: 7, seconds: 5400 },
-	{ name: 'Matt', score: 8000, diff_level: 3, starting_level: 1, ending_level: 6, seconds: 4800 },
-	{ name: 'John', score: 7000, diff_level: 2, starting_level: 1, ending_level: 5, seconds: 3600 },
-	{ name: 'Yuan', score: 6000, diff_level: 2, starting_level: 1, ending_level: 4, seconds: 3000 },
-	{ name: 'Adam', score: 5000, diff_level: 1, starting_level: 1, ending_level: 3, seconds: 2400 },
-	{ name: 'Mark', score: 4000, diff_level: 1, starting_level: 1, ending_level: 3, seconds: 1800 },
-	{ name: 'Allender', score: 3000, diff_level: 1, starting_level: 1, ending_level: 2, seconds: 1200 },
-	{ name: 'Jasen', score: 2000, diff_level: 0, starting_level: 1, ending_level: 2, seconds: 900 },
-	{ name: 'Rob', score: 1000, diff_level: 0, starting_level: 1, ending_level: 1, seconds: 600 },
+	{ name: 'Parallax', score: 10000, diff_level: 0, starting_level: 0, ending_level: 0, seconds: 0 },
+	{ name: 'Mike', score: 9000, diff_level: 0, starting_level: 0, ending_level: 0, seconds: 0 },
+	{ name: 'Matt', score: 8000, diff_level: 0, starting_level: 0, ending_level: 0, seconds: 0 },
+	{ name: 'John', score: 7000, diff_level: 0, starting_level: 0, ending_level: 0, seconds: 0 },
+	{ name: 'Yuan', score: 6000, diff_level: 0, starting_level: 0, ending_level: 0, seconds: 0 },
+	{ name: 'Adam', score: 5000, diff_level: 0, starting_level: 0, ending_level: 0, seconds: 0 },
+	{ name: 'Mark', score: 4000, diff_level: 0, starting_level: 0, ending_level: 0, seconds: 0 },
+	{ name: 'Allender', score: 3000, diff_level: 0, starting_level: 0, ending_level: 0, seconds: 0 },
+	{ name: 'Jasen', score: 2000, diff_level: 0, starting_level: 0, ending_level: 0, seconds: 0 },
+	{ name: 'Rob', score: 1000, diff_level: 0, starting_level: 0, ending_level: 0, seconds: 0 },
 ];
 
 // Difficulty names (from GAME.H)
@@ -191,8 +193,15 @@ export async function scores_view( hogFile, gamePalette ) {
 		// Skill
 		gr_string( imageData, dataFont, 125 + 33 + XX, y, DIFFICULTY_NAMES[ stats.diff_level ], gamePalette, brightIdx );
 
-		// Levels (right-aligned)
-		gr_string_right( imageData, dataFont, 192 + 33 + XX, y, stats.starting_level + '-' + stats.ending_level, gamePalette, brightIdx );
+		// Levels (right-aligned). Ported from: scores_draw_item() in SCORES.C:535-542 —
+		// blank unless both are nonzero; negative (secret) levels print with an "S" prefix.
+		const sl = stats.starting_level, el = stats.ending_level;
+		let levelStr = '';
+		if ( sl > 0 && el > 0 ) levelStr = sl + '-' + el;
+		else if ( sl < 0 && el > 0 ) levelStr = 'S' + ( - sl ) + '-' + el;
+		else if ( sl < 0 && el < 0 ) levelStr = 'S' + ( - sl ) + '-S' + ( - el );
+		else if ( sl > 0 && el < 0 ) levelStr = sl + '-S' + ( - el );
+		if ( levelStr !== '' ) gr_string_right( imageData, dataFont, 192 + 33 + XX, y, levelStr, gamePalette, brightIdx );
 
 		// Time (right-aligned)
 		gr_string_right( imageData, dataFont, 311 - 42 + XX, y, format_time( stats.seconds ), gamePalette, brightIdx );

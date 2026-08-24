@@ -1,8 +1,6 @@
 // Ported from: descent-master/MAIN/WEAPON.C and WEAPON.H
 // Weapon type definitions, selection, and parsing
 
-import { Polygon_models, N_polygon_models, set_N_polygon_models, load_polygon_model } from './polyobj.js';
-
 // Number of difficulty levels
 const NDL = 5;
 
@@ -164,23 +162,44 @@ export function autoSelectPrimary( playerPrimaryFlags, playerVulcanAmmo, playerE
 
 }
 
-// Auto-select best available secondary weapon
-// Priority: Smart(3) -> Homing(1) -> Concussion(0), skip Proximity(2)
-export function autoSelectSecondary( playerSecondaryAmmo, setSecondaryWeapon, showMessage, updateHUD ) {
+// Secondary weapon indices. Ported from: WEAPON.H:227-231
+const CONCUSSION_INDEX = 0;
+const HOMING_INDEX = 1;
+const PROXIMITY_INDEX = 2;
+const SMART_INDEX = 3;
 
-	const priority = [ 3, 1, 0 ];
+// Auto-select the best available secondary when the current one runs dry.
+// Ported from: auto_select_weapon() in WEAPON.C:438-453 (weapon_type == 1).
+export function autoSelectSecondary( currentSecondary, playerSecondaryAmmo, setSecondaryWeapon, showMessage, updateHUD ) {
 
-	for ( let p = 0; p < priority.length; p ++ ) {
+	// Never auto-switch away from proximity bombs.
+	if ( currentSecondary === PROXIMITY_INDEX ) return;
 
-		const slot = priority[ p ];
-		if ( playerSecondaryAmmo[ slot ] > 0 ) {
+	// Only switch when the current secondary is out of ammo.
+	if ( playerSecondaryAmmo[ currentSecondary ] > 0 ) return;
 
-			setSecondaryWeapon( slot );
-			showMessage( SECONDARY_NAMES[ slot ] );
-			updateHUD();
-			return;
+	// If the current weapon is above Smart (i.e. Mega) and Smart is available, prefer Smart.
+	if ( currentSecondary > SMART_INDEX && playerSecondaryAmmo[ SMART_INDEX ] > 0 ) {
 
-		}
+		setSecondaryWeapon( SMART_INDEX );
+		showMessage( SECONDARY_NAMES[ SMART_INDEX ] );
+		updateHUD();
+		return;
+
+	}
+
+	// Otherwise prefer Homing, then Concussion.
+	if ( playerSecondaryAmmo[ HOMING_INDEX ] > 0 ) {
+
+		setSecondaryWeapon( HOMING_INDEX );
+		showMessage( SECONDARY_NAMES[ HOMING_INDEX ] );
+		updateHUD();
+
+	} else if ( playerSecondaryAmmo[ CONCUSSION_INDEX ] > 0 ) {
+
+		setSecondaryWeapon( CONCUSSION_INDEX );
+		showMessage( SECONDARY_NAMES[ CONCUSSION_INDEX ] );
+		updateHUD();
 
 	}
 
@@ -188,32 +207,20 @@ export function autoSelectSecondary( playerSecondaryAmmo, setSecondaryWeapon, sh
 
 // Parse $WEAPON entries from decoded bitmaps.bin text
 // Ported from: bm_read_weapon() in BMREAD.C
-// Weapon POF models are stored after the shareware model table (28 robot/player models)
-const WEAPON_MODEL_START_INDEX = 28;
-
-export function bm_parse_shareware_weapons( text, pigFile, hogFile ) {
+export function bm_parse_shareware_weapons( text, pigFile, weaponModelNums ) {
 
 	let weaponIndex = 0;
 	let count = 0;
 	let pos = 0;
-	let nextModelIndex = WEAPON_MODEL_START_INDEX;
 
 	while ( true ) {
 
 		const idx = text.indexOf( '$WEAPON', pos );
 		if ( idx === - 1 ) break;
+		const registeredOnly = idx > 0 && text.charAt( idx - 1 ) === '@';
+		const unused = text.substring( idx, idx + 14 ) === '$WEAPON_UNUSED';
 
 		pos = idx + 7;
-
-		// Skip registered-only weapons (@ prefix in name)
-		const preCheck = text.substring( pos, pos + 30 ).trim();
-		if ( preCheck.charAt( 0 ) === '@' ) {
-
-			// Still count the weapon index so IDs stay aligned
-			weaponIndex ++;
-			continue;
-
-		}
 
 		// Find entry boundaries
 		let entryEnd = text.length;
@@ -224,6 +231,24 @@ export function bm_parse_shareware_weapons( text, pigFile, hogFile ) {
 		if ( weaponIndex >= MAX_WEAPON_TYPES ) break;
 
 		const wi = Weapon_info[ weaponIndex ];
+		const modelAssignment = weaponModelNums[ weaponIndex ];
+		wi.model_num = - 1;
+		wi.model_num_inner = - 1;
+
+		// Both @ entries and $WEAPON_UNUSED reserve their numeric ID without
+		// consuming model or bitmap declarations in a shareware build.
+		if ( registeredOnly === true || unused === true ) {
+
+			weaponIndex ++;
+			pos = entryEnd;
+			continue;
+
+		}
+
+		// BMREAD.C initializes every real weapon as destroyable before applying
+		// an optional table override.  Registered-only and unused rows remain at
+		// their zero-filled placeholder value above.
+		wi.destroyable = 1;
 
 		// Parse key=value pairs
 		const strengthMatch = entry.match( /strength[=\s]+([\d.\s,]+)/ );
@@ -344,47 +369,10 @@ export function bm_parse_shareware_weapons( text, pigFile, hogFile ) {
 		} else if ( entry.match( /weapon_pof[=\s]/ ) !== null ) {
 
 			wi.render_type = WEAPON_RENDER_POLYMODEL;
+			if ( modelAssignment !== undefined ) {
 
-			// Load weapon POF model from HOG
-			// Ported from: bm_read_weapon() in BMREAD.C
-			const pofMatch = entry.match( /weapon_pof[=\s]+(\S+)/ );
-			if ( pofMatch !== null ) {
-
-				const pofName = pofMatch[ 1 ].toLowerCase();
-				const pofFile = hogFile.findFile( pofName );
-				if ( pofFile !== null ) {
-
-					const model = load_polygon_model( pofFile );
-					if ( model !== null ) {
-
-						Polygon_models[ nextModelIndex ] = model;
-						wi.model_num = nextModelIndex;
-						nextModelIndex ++;
-
-					}
-
-				}
-
-			}
-
-			// Load inner model if specified
-			const pofInnerMatch = entry.match( /weapon_pof_inner[=\s]+(\S+)/ );
-			if ( pofInnerMatch !== null ) {
-
-				const pofName = pofInnerMatch[ 1 ].toLowerCase();
-				const pofFile = hogFile.findFile( pofName );
-				if ( pofFile !== null ) {
-
-					const model = load_polygon_model( pofFile );
-					if ( model !== null ) {
-
-						Polygon_models[ nextModelIndex ] = model;
-						wi.model_num_inner = nextModelIndex;
-						nextModelIndex ++;
-
-					}
-
-				}
+				wi.model_num = modelAssignment.model_num;
+				wi.model_num_inner = modelAssignment.model_num_inner;
 
 			}
 
@@ -412,14 +400,6 @@ export function bm_parse_shareware_weapons( text, pigFile, hogFile ) {
 	N_weapon_types = weaponIndex;
 	set_N_weapon_types( weaponIndex );
 
-	// Update polygon model count to include weapon POFs
-	if ( nextModelIndex > N_polygon_models ) {
-
-		set_N_polygon_models( nextModelIndex );
-
-	}
-
-	const weaponModels = nextModelIndex - WEAPON_MODEL_START_INDEX;
-	console.log( 'BM: Parsed ' + count + ' weapon types (total weapon indices: ' + weaponIndex + ', ' + weaponModels + ' weapon POFs loaded)' );
+	console.log( 'BM: Parsed ' + count + ' weapon types (total weapon indices: ' + weaponIndex + ')' );
 
 }

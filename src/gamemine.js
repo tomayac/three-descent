@@ -75,7 +75,7 @@ export function load_mine_data_compiled_old( fp ) {
 
 		// Special data always written
 		seg.special = fp.readUByte();
-		seg.matcen_num = fp.readUByte();
+		seg.matcen_num = ( fp.readUByte() << 24 ) >> 24;	// signed byte (SEGMENT.H): 0xFF -> -1 = no matcen
 		seg.value = fp.readShort();
 
 		// Read static_light (ushort shifted left by 4 to make fix)
@@ -223,7 +223,7 @@ export function load_mine_data_compiled_new( fp ) {
 		if ( bit_mask & ( 1 << MAX_SIDES_PER_SEGMENT ) ) {
 
 			seg.special = fp.readUByte();
-			seg.matcen_num = fp.readUByte();
+			seg.matcen_num = ( fp.readUByte() << 24 ) >> 24;	// signed byte (SEGMENT.H): 0xFF -> -1 = no matcen
 			seg.value = fp.readShort();
 
 		} else {

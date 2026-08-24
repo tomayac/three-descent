@@ -17,31 +17,77 @@ const MIDI_CMD_LEN = [ 3, 3, 3, 3, 2, 2, 3 ];
 function readHmiVLQ( data, offset ) {
 
 	let value = 0;
-	let shift = 0;
+	let multiplier = 1;
 	let pos = offset;
 
-	// Read bytes while MSB is clear (more bytes follow)
-	while ( pos < data.length && ( data[ pos ] & 0x80 ) === 0 ) {
+	while ( pos < data.length ) {
 
-		value += data[ pos ] << shift;
-		shift += 7;
+		const byte = data[ pos ];
+		const digit = byte & 0x7F;
+		const bytesRead = pos - offset + 1;
+
+		// HMP deltas are unsigned 32-bit values.  Reject overlong values
+		// instead of letting JavaScript bitwise arithmetic wrap them.
+		if ( bytesRead > 5 || digit * multiplier > 0xFFFFFFFF - value ) {
+
+			return { value: 0, bytesRead: 0 };
+
+		}
+
+		value += digit * multiplier;
 		pos ++;
+
+		// In HMI VLQs, a set MSB marks the final byte.
+		if ( ( byte & 0x80 ) !== 0 ) {
+
+			return { value: value, bytesRead: bytesRead };
+
+		}
+
+		multiplier *= 128;
 
 	}
 
-	if ( pos >= data.length ) return { value: 0, bytesRead: 0 };
+	return { value: 0, bytesRead: 0 };
 
-	// Last byte has MSB set
-	value += ( data[ pos ] & 0x7F ) << shift;
-	pos ++;
+}
 
-	return { value: value, bytesRead: pos - offset };
+// Read a standard MIDI variable length quantity.  MIDI VLQs are limited to
+// four bytes and 28 bits.
+function readMidiVLQ( data, offset ) {
+
+	let value = 0;
+	let pos = offset;
+
+	for ( let bytesRead = 1; bytesRead <= 4; bytesRead ++ ) {
+
+		if ( pos >= data.length ) return { value: 0, bytesRead: 0 };
+
+		const byte = data[ pos ++ ];
+		value = value * 128 + ( byte & 0x7F );
+
+		if ( ( byte & 0x80 ) === 0 ) {
+
+			return { value: value, bytesRead: bytesRead };
+
+		}
+
+	}
+
+	return { value: 0, bytesRead: 0 };
 
 }
 
 // Parse an HMP file and extract MIDI events
-// Returns: { tempo, tracks: [ { events: [ { time, type, channel, data1, data2 } ] } ] }
+// Returns: { tempo, tracks: [ { events: [...], endTime } ] }, in HMP ticks.
 export function hmp_parse( hmpData ) {
+
+	if ( ! ( hmpData instanceof Uint8Array ) || hmpData.length < HMP_OFFSET_TEMPO + 4 ) {
+
+		console.warn( 'HMP: File is missing or too short for its header' );
+		return null;
+
+	}
 
 	const view = new DataView( hmpData.buffer, hmpData.byteOffset, hmpData.byteLength );
 
@@ -71,37 +117,53 @@ export function hmp_parse( hmpData ) {
 
 	}
 
+	if ( tempo === 0 ) {
+
+		console.warn( 'HMP: Invalid tempo: 0' );
+		return null;
+
+	}
+
 	// Read track data starting at offset 0x308
 	const tracks = [];
 	let offset = HMP_OFFSET_TRACK_DATA;
 
 	for ( let t = 0; t < numTracks; t ++ ) {
 
-		if ( offset + 12 > hmpData.length ) break;
+		if ( offset + 12 > hmpData.length ) {
+
+			console.warn( 'HMP: Track ' + t + ' header is truncated' );
+			return null;
+
+		}
 
 		// Each track has a 12-byte header: 3 × int32
 		// tdata[0] = unknown, tdata[1] = data length (including header), tdata[2] = unknown
-		const tdata0 = view.getInt32( offset, true );
 		const tdata1 = view.getInt32( offset + 4, true );
-		const tdata2 = view.getInt32( offset + 8, true );
 		offset += 12;
 
 		const dataLen = tdata1 - 12;
 
-		if ( dataLen <= 0 || offset + dataLen > hmpData.length ) {
+		if ( dataLen < 0 || offset + dataLen > hmpData.length ) {
 
 			console.warn( 'HMP: Track ' + t + ' invalid data length: ' + dataLen );
-			break;
+			return null;
 
 		}
 
 		// Extract track event data
-		const trackData = hmpData.slice( offset, offset + dataLen );
+		const trackData = hmpData.subarray( offset, offset + dataLen );
 		offset += dataLen;
 
 		// Parse MIDI events from track data
-		const events = parseTrackEvents( trackData );
-		tracks.push( { events: events } );
+		const track = parseTrackEvents( trackData );
+		if ( track === null ) {
+
+			console.warn( 'HMP: Track ' + t + ' contains malformed event data' );
+			return null;
+
+		}
+		tracks.push( track );
 
 	}
 
@@ -120,87 +182,77 @@ function parseTrackEvents( data ) {
 	let pos = 0;
 	let currentTime = 0; // cumulative time in ticks
 
-	while ( pos < data.length - 1 ) {
+	while ( pos < data.length ) {
 
 		// Read delta time (HMI VLQ)
 		const vlq = readHmiVLQ( data, pos );
 
-		if ( vlq.bytesRead === 0 ) break;
+		if ( vlq.bytesRead === 0 ) return null;
 
 		pos += vlq.bytesRead;
+		if ( ! Number.isSafeInteger( currentTime + vlq.value ) ) return null;
 		currentTime += vlq.value;
 
-		if ( pos >= data.length ) break;
+		if ( pos >= data.length ) return null;
 
 		const statusByte = data[ pos ];
 
 		// Check for end-of-track meta event (0xFF 0x2F)
 		if ( statusByte === 0xFF ) {
 
-			if ( pos + 1 < data.length && data[ pos + 1 ] === 0x2F ) {
-
-				// End of track
-				break;
-
-			}
-
-			// Other meta event — skip it
 			pos ++; // skip 0xFF
-			if ( pos >= data.length ) break;
-			pos ++; // skip meta type
+			if ( pos >= data.length ) return null;
 
-			// Read meta data length (standard MIDI VLQ)
-			let metaLen = 0;
+			const metaType = data[ pos ++ ];
+			const metaLength = readMidiVLQ( data, pos );
+			if ( metaLength.bytesRead === 0 ) return null;
 
-			while ( pos < data.length && ( data[ pos ] & 0x80 ) !== 0 ) {
+			pos += metaLength.bytesRead;
+			if ( metaLength.value > data.length - pos ) return null;
 
-				metaLen = ( metaLen << 7 ) + ( data[ pos ] & 0x7F );
-				pos ++;
+			if ( metaType === 0x2F ) {
 
-			}
-
-			if ( pos < data.length ) {
-
-				metaLen = ( metaLen << 7 ) + data[ pos ];
-				pos ++;
+				// End-of-track has no payload.  Bytes after a valid marker are
+				// ignored, as they are by the original HMP player.
+				if ( metaLength.value !== 0 ) return null;
+				return { events: events, endTime: currentTime };
 
 			}
 
-			pos += metaLen; // skip meta data
+			pos += metaLength.value;
 			continue;
 
 		}
 
-		// SysEx — skip (not supported in HMP)
+		// D1 HMP tracks do not admit SysEx or other system-common/realtime
+		// events.  Reject the file instead of consuming only the status byte and
+		// accidentally interpreting its payload as later delta times/events.
 		if ( statusByte >= 0xF0 && statusByte < 0xFF ) {
 
-			pos ++;
-			continue;
+			return null;
 
 		}
 
 		// Invalid status byte
 		if ( statusByte < 0x80 ) {
 
-			pos ++;
-			continue;
+			return null;
 
 		}
 
 		// Channel MIDI event
-		const cmd = ( statusByte >> 4 ) & 0x07; // 0-6 for 0x80-0xE0
+		const cmd = ( statusByte >> 4 ) - 8; // 0-6 for 0x80-0xE0
 		const channel = statusByte & 0x0F;
 		const cmdLen = MIDI_CMD_LEN[ cmd ];
 		pos ++; // skip status byte
 
-		if ( pos >= data.length ) break;
+		if ( pos + cmdLen - 1 > data.length ) return null;
 
 		const data1 = data[ pos ++ ];
 		let data2 = 0;
 
 		if ( cmdLen === 3 ) {
 
-			if ( pos >= data.length ) break;
 			data2 = data[ pos ++ ];
 
 		}
@@ -216,7 +268,7 @@ function parseTrackEvents( data ) {
 
 	}
 
-	return events;
+	return { events: events, endTime: currentTime };
 
 }
 
@@ -260,5 +312,29 @@ export function hmp_get_events( hmpFile ) {
 	allEvents.sort( ( a, b ) => a.time - b.time );
 
 	return allEvents;
+
+}
+
+// Return the audible timeline length in seconds.  Track 0 is skipped for
+// playback, just as it is by hmp_get_events(), but each played track's final
+// end-of-track delta still contributes to the song duration.
+export function hmp_get_duration( hmpFile ) {
+
+	if ( hmpFile === null || Number.isFinite( hmpFile.tempo ) !== true ||
+		hmpFile.tempo <= 0 ) return 0;
+
+	let endTime = 0;
+	for ( let t = 1; t < hmpFile.tracks.length; t ++ ) {
+
+		const trackEndTime = hmpFile.tracks[ t ].endTime;
+		if ( Number.isFinite( trackEndTime ) === true && trackEndTime > endTime ) {
+
+			endTime = trackEndTime;
+
+		}
+
+	}
+
+	return endTime / hmpFile.tempo;
 
 }

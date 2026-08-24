@@ -3,7 +3,7 @@
 
 import {
 	SIDE_IS_QUAD, SIDE_IS_TRI_02, SIDE_IS_TRI_13,
-	MAX_SIDES_PER_SEGMENT, IS_CHILD
+	MAX_SIDES_PER_SEGMENT, MAX_SEGMENTS, IS_CHILD
 } from './segment.js';
 import {
 	Vertices, Segments, Num_segments, Side_to_verts
@@ -14,6 +14,65 @@ import { check_trigger } from './switch.js';
 // Tolerance for considering a side as a flat quad vs triangulated
 // From GAMESEG.C: #define PLANE_DIST_TOLERANCE 250
 const PLANE_DIST_TOLERANCE = 250 / 65536.0;
+
+// find_connected_distance() is used by positional sound updates, so all BFS
+// and reconstructed-path storage is shared rather than allocated per call.
+const FCD_MAX_DEPTH = 62;
+const _fcdVisited = new Uint32Array( MAX_SEGMENTS );
+const _fcdParent = new Int16Array( MAX_SEGMENTS );
+const _fcdDepth = new Int16Array( MAX_SEGMENTS );
+const _fcdQueue = new Int16Array( MAX_SEGMENTS );
+const _fcdPath = new Int16Array( MAX_SEGMENTS );
+const _fcdCenterX = new Float64Array( MAX_SEGMENTS );
+const _fcdCenterY = new Float64Array( MAX_SEGMENTS );
+const _fcdCenterZ = new Float64Array( MAX_SEGMENTS );
+let _fcdVisitGeneration = 0;
+let _fcdDoorwayCallback = wall_is_doorway;
+
+// Kept injectable so users that cannot import wall.js without a cycle can
+// still supply the source-equivalent WALL_IS_DOORWAY query.
+export function gameseg_set_connected_distance_doorway( callback ) {
+
+	_fcdDoorwayCallback = callback;
+
+}
+
+// Fixed-point Descent's vm_vec_mag_quick approximation, expressed in world
+// units.  Keep scalar arguments so positional audio never creates vectors.
+function vm_vec_mag_quick_components( x, y, z ) {
+
+	let largest = Math.abs( x );
+	let middle = Math.abs( y );
+	let smallest = Math.abs( z );
+	let swap;
+
+	if ( largest < middle ) {
+
+		swap = largest;
+		largest = middle;
+		middle = swap;
+
+	}
+
+	if ( middle < smallest ) {
+
+		swap = middle;
+		middle = smallest;
+		smallest = swap;
+
+	}
+
+	if ( largest < middle ) {
+
+		swap = largest;
+		largest = middle;
+		middle = swap;
+
+	}
+
+	return largest + middle * 3 / 8 + smallest * 3 / 16;
+
+}
 
 // ---- Vector math helpers (inline, replaces vecmat.asm) ----
 
@@ -428,76 +487,186 @@ export function create_abs_vertex_lists( segnum, sidenum ) {
 // Tolerance for collision plane tests (from original source)
 const COLLISION_PLANE_DIST_TOLERANCE = 250 / 65536.0;
 
-// Get signed distance from a point to a side's plane
-// Positive = inside (on normal side), Negative = outside
-// For triangulated sides, returns the minimum distance of the two face planes
-// point_x/y/z are in Descent coordinates
+// Get signed clearance from a point to a side.
+// Positive = inside, negative = outside.  A non-planar side is the intersection
+// or union of its two face half-spaces, depending on whether it pokes out or in.
+// point_x/y/z are in Descent coordinates.
 export function get_side_dist( point_x, point_y, point_z, seg, sidenum ) {
 
 	const side = seg.sides[ sidenum ];
-	const sv = Side_to_verts[ sidenum ];
+	const vertexCount = create_abs_vertex_lists_arr( seg, sidenum );
 
-	// Get a vertex on the plane (use first vertex of the side)
-	const vi = seg.verts[ sv[ 0 ] ];
-	const vx = Vertices[ vi * 3 + 0 ];
-	const vy = Vertices[ vi * 3 + 1 ];
-	const vz = Vertices[ vi * 3 + 2 ];
+	if ( vertexCount === 4 ) {
 
-	// Vector from vertex to point
-	const dx = point_x - vx;
-	const dy = point_y - vy;
-	const dz = point_z - vz;
+		// Match GAMESEG.C: anchor a planar side at its lowest-numbered vertex.
+		let vertnum = _vertex_list[ 0 ];
+		for ( let i = 1; i < 4; i ++ ) {
 
-	if ( side.type === SIDE_IS_QUAD ) {
-
-		// Single plane
-		const n = side.normals[ 0 ];
-		return dx * n.x + dy * n.y + dz * n.z;
-
-	}
-
-	// Triangulated side: check both face planes
-	const n0 = side.normals[ 0 ];
-	const n1 = side.normals[ 1 ];
-
-	const d0 = dx * n0.x + dy * n0.y + dz * n0.z;
-	const d1 = dx * n1.x + dy * n1.y + dz * n1.z;
-
-	// For triangulated sides that "poke out" (convex), the point is outside
-	// only if it's behind BOTH faces. For "poke in" (concave), it's outside
-	// if behind EITHER face. We use the minimum distance as a conservative check.
-	return Math.min( d0, d1 );
-
-}
-
-// Get centermask for a point in a segment (simple version, no facemask/sidemask)
-// Returns a 6-bit mask: bit i set = point is behind side i
-// centermask === 0 means point is inside segment
-// side_dists is an optional Float64Array(6) to receive distances
-export function get_seg_masks_point( point_x, point_y, point_z, segnum, side_dists ) {
-
-	const seg = Segments[ segnum ];
-	let centermask = 0;
-
-	for ( let s = 0; s < 6; s ++ ) {
-
-		const dist = get_side_dist( point_x, point_y, point_z, seg, s );
-
-		if ( side_dists !== undefined ) {
-
-			side_dists[ s ] = dist;
+			if ( _vertex_list[ i ] < vertnum ) vertnum = _vertex_list[ i ];
 
 		}
 
-		if ( dist < - COLLISION_PLANE_DIST_TOLERANCE ) {
+		const n = side.normals[ 0 ];
+		return ( point_x - Vertices[ vertnum * 3 ] ) * n.x +
+			( point_y - Vertices[ vertnum * 3 + 1 ] ) * n.y +
+			( point_z - Vertices[ vertnum * 3 + 2 ] ) * n.z;
 
-			centermask |= ( 1 << s );
+	}
+
+	// Both triangles share vertex_list[0] and vertex_list[2].  Using the side's
+	// first relative vertex is wrong for TRI_13, where it is not on face 1.
+	const vertnum = Math.min( _vertex_list[ 0 ], _vertex_list[ 2 ] );
+	const ref_x = Vertices[ vertnum * 3 ];
+	const ref_y = Vertices[ vertnum * 3 + 1 ];
+	const ref_z = Vertices[ vertnum * 3 + 2 ];
+	const n0 = side.normals[ 0 ];
+	const n1 = side.normals[ 1 ];
+
+	let poke_dist;
+	if ( _vertex_list[ 4 ] < _vertex_list[ 1 ] ) {
+
+		const testVertex = _vertex_list[ 4 ];
+		poke_dist = ( Vertices[ testVertex * 3 ] - ref_x ) * n0.x +
+			( Vertices[ testVertex * 3 + 1 ] - ref_y ) * n0.y +
+			( Vertices[ testVertex * 3 + 2 ] - ref_z ) * n0.z;
+
+	} else {
+
+		const testVertex = _vertex_list[ 1 ];
+		poke_dist = ( Vertices[ testVertex * 3 ] - ref_x ) * n1.x +
+			( Vertices[ testVertex * 3 + 1 ] - ref_y ) * n1.y +
+			( Vertices[ testVertex * 3 + 2 ] - ref_z ) * n1.z;
+
+	}
+
+	const d0 = ( point_x - ref_x ) * n0.x +
+		( point_y - ref_y ) * n0.y +
+		( point_z - ref_z ) * n0.z;
+	const d1 = ( point_x - ref_x ) * n1.x +
+		( point_y - ref_y ) * n1.y +
+		( point_z - ref_z ) * n1.z;
+
+	// Pokes out: the segment is inside both half-spaces.  Pokes in: being in
+	// either half-space is sufficient.  min/max preserves that signed boundary.
+	return poke_dist > PLANE_DIST_TOLERANCE ? Math.min( d0, d1 ) : Math.max( d0, d1 );
+
+}
+
+// Fill per-side distances behind a segment and return its center mask.
+// Ported from GAMESEG.C get_side_dists() lines 626-762.  As in DXX-Rebirth,
+// non-selected sides stay zero so trace ordering only sees masked boundaries.
+// side_dists is optional.
+export function get_side_dists( point_x, point_y, point_z, segnum, side_dists ) {
+
+	const seg = Segments[ segnum ];
+	let centermask = 0;
+	let sidebit = 1;
+
+	for ( let sidenum = 0; sidenum < MAX_SIDES_PER_SEGMENT; sidenum ++, sidebit <<= 1 ) {
+
+		if ( side_dists !== undefined ) side_dists[ sidenum ] = 0;
+
+		const side = seg.sides[ sidenum ];
+		const vertexCount = create_abs_vertex_lists_arr( seg, sidenum );
+
+		if ( vertexCount === 6 ) {
+
+			const vertnum = Math.min( _vertex_list[ 0 ], _vertex_list[ 2 ] );
+			const ref_x = Vertices[ vertnum * 3 ];
+			const ref_y = Vertices[ vertnum * 3 + 1 ];
+			const ref_z = Vertices[ vertnum * 3 + 2 ];
+			const n0 = side.normals[ 0 ];
+			const n1 = side.normals[ 1 ];
+
+			let poke_dist;
+			if ( _vertex_list[ 4 ] < _vertex_list[ 1 ] ) {
+
+				const testVertex = _vertex_list[ 4 ];
+				poke_dist = ( Vertices[ testVertex * 3 ] - ref_x ) * n0.x +
+					( Vertices[ testVertex * 3 + 1 ] - ref_y ) * n0.y +
+					( Vertices[ testVertex * 3 + 2 ] - ref_z ) * n0.z;
+
+			} else {
+
+				const testVertex = _vertex_list[ 1 ];
+				poke_dist = ( Vertices[ testVertex * 3 ] - ref_x ) * n1.x +
+					( Vertices[ testVertex * 3 + 1 ] - ref_y ) * n1.y +
+					( Vertices[ testVertex * 3 + 2 ] - ref_z ) * n1.z;
+
+			}
+
+			const d0 = ( point_x - ref_x ) * n0.x +
+				( point_y - ref_y ) * n0.y +
+				( point_z - ref_z ) * n0.z;
+			const d1 = ( point_x - ref_x ) * n1.x +
+				( point_y - ref_y ) * n1.y +
+				( point_z - ref_z ) * n1.z;
+
+			let center_count = 0;
+			let dist = 0;
+			if ( d0 < - COLLISION_PLANE_DIST_TOLERANCE ) {
+
+				center_count ++;
+				dist += d0;
+
+			}
+			if ( d1 < - COLLISION_PLANE_DIST_TOLERANCE ) {
+
+				center_count ++;
+				dist += d1;
+
+			}
+
+			const side_pokes_out = poke_dist > PLANE_DIST_TOLERANCE;
+			if ( side_pokes_out !== true ) {
+
+				if ( center_count !== 2 ) continue;
+
+			} else if ( center_count === 0 ) {
+
+				continue;
+
+			}
+
+			centermask |= sidebit;
+			if ( center_count === 2 ) dist /= 2;
+			if ( side_dists !== undefined ) side_dists[ sidenum ] = dist;
+
+		} else {
+
+			let vertnum = _vertex_list[ 0 ];
+			for ( let i = 1; i < 4; i ++ ) {
+
+				if ( _vertex_list[ i ] < vertnum ) vertnum = _vertex_list[ i ];
+
+			}
+
+			const n = side.normals[ 0 ];
+			const dist = ( point_x - Vertices[ vertnum * 3 ] ) * n.x +
+				( point_y - Vertices[ vertnum * 3 + 1 ] ) * n.y +
+				( point_z - Vertices[ vertnum * 3 + 2 ] ) * n.z;
+
+			if ( dist < - COLLISION_PLANE_DIST_TOLERANCE ) {
+
+				centermask |= sidebit;
+				if ( side_dists !== undefined ) side_dists[ sidenum ] = dist;
+
+			}
 
 		}
 
 	}
 
 	return centermask;
+
+}
+
+// Get centermask for a point in a segment (simple version, no facemask/sidemask)
+// Returns a 6-bit mask: bit i set = point is behind side i
+// centermask === 0 means point is inside segment
+export function get_seg_masks_point( point_x, point_y, point_z, segnum, side_dists ) {
+
+	return get_side_dists( point_x, point_y, point_z, segnum, side_dists );
 
 }
 
@@ -717,6 +886,146 @@ export function find_connect_side( base_segnum, con_segnum ) {
 	}
 
 	return - 1;
+
+}
+
+// Determine the route distance between points through render-past portals.
+// Ported from GAMESEG.C find_connected_distance().  Point arguments are kept
+// primitive so sound-object frame updates do not need temporary vectors.
+export function find_connected_distance(
+	p0_x, p0_y, p0_z, seg0,
+	p1_x, p1_y, p1_z, seg1,
+	max_depth, wid_flag
+) {
+
+	if ( Number.isInteger( seg0 ) !== true || Number.isInteger( seg1 ) !== true ||
+		seg0 < 0 || seg0 >= Num_segments || seg1 < 0 || seg1 >= Num_segments ) return - 1;
+	if ( Number.isFinite( p0_x ) !== true || Number.isFinite( p0_y ) !== true ||
+		Number.isFinite( p0_z ) !== true || Number.isFinite( p1_x ) !== true ||
+		Number.isFinite( p1_y ) !== true || Number.isFinite( p1_z ) !== true ) return - 1;
+
+	const direct_x = p1_x - p0_x;
+	const direct_y = p1_y - p0_y;
+	const direct_z = p1_z - p0_z;
+	const direct_distance = vm_vec_mag_quick_components(
+		direct_x, direct_y, direct_z
+	);
+
+	// D1 deliberately takes the direct distance for the same or an immediately
+	// connected segment before consulting WALL_IS_DOORWAY.
+	if ( seg0 === seg1 || find_connect_side( seg0, seg1 ) !== - 1 ) return direct_distance;
+	if ( typeof _fcdDoorwayCallback !== 'function' ) return - 1;
+
+	let depth_limit = Number.isInteger( max_depth ) === true ? max_depth : - 1;
+	if ( depth_limit > FCD_MAX_DEPTH ) depth_limit = FCD_MAX_DEPTH;
+
+	_fcdVisitGeneration = ( _fcdVisitGeneration + 1 ) >>> 0;
+	if ( _fcdVisitGeneration === 0 ) {
+
+		_fcdVisited.fill( 0 );
+		_fcdVisitGeneration = 1;
+
+	}
+
+	let queue_head = 0;
+	let queue_tail = 0;
+	_fcdQueue[ queue_tail ++ ] = seg0;
+	_fcdVisited[ seg0 ] = _fcdVisitGeneration;
+	_fcdParent[ seg0 ] = - 1;
+	_fcdDepth[ seg0 ] = 0;
+
+	let found = false;
+
+	while ( queue_head < queue_tail ) {
+
+		const current = _fcdQueue[ queue_head ++ ];
+		if ( current === seg1 ) {
+
+			found = true;
+			break;
+
+		}
+
+		const seg = Segments[ current ];
+		const child_depth = _fcdDepth[ current ] + 1;
+
+		for ( let side = 0; side < MAX_SIDES_PER_SEGMENT; side ++ ) {
+
+			const child = seg.children[ side ];
+			if ( child < 0 || child >= Num_segments ) continue;
+			if ( _fcdVisited[ child ] === _fcdVisitGeneration ) continue;
+			if ( ( _fcdDoorwayCallback( current, side ) & wid_flag ) === 0 ) continue;
+
+			_fcdVisited[ child ] = _fcdVisitGeneration;
+			_fcdParent[ child ] = current;
+			_fcdDepth[ child ] = child_depth;
+			_fcdQueue[ queue_tail ++ ] = child;
+
+			// Preserve D1's exclusive finite-depth limit and early abort.
+			if ( depth_limit !== - 1 && child_depth === depth_limit ) return - 1;
+
+		}
+
+	}
+
+	if ( found !== true ) return - 1;
+
+	let path_length = 0;
+	let path_segment = seg1;
+
+	while ( path_segment !== - 1 && path_length < MAX_SEGMENTS ) {
+
+		_fcdPath[ path_length ++ ] = path_segment;
+		if ( path_segment === seg0 ) break;
+		path_segment = _fcdParent[ path_segment ];
+
+	}
+
+	if ( path_length < 2 || _fcdPath[ path_length - 1 ] !== seg0 ) return - 1;
+
+	for ( let i = 0; i < path_length; i ++ ) {
+
+		const path_seg = Segments[ _fcdPath[ i ] ];
+		let cx = 0;
+		let cy = 0;
+		let cz = 0;
+
+		for ( let vertex = 0; vertex < 8; vertex ++ ) {
+
+			const vertex_offset = path_seg.verts[ vertex ] * 3;
+			cx += Vertices[ vertex_offset ];
+			cy += Vertices[ vertex_offset + 1 ];
+			cz += Vertices[ vertex_offset + 2 ];
+
+		}
+
+		_fcdCenterX[ i ] = cx / 8;
+		_fcdCenterY[ i ] = cy / 8;
+		_fcdCenterZ[ i ] = cz / 8;
+
+	}
+
+	let dx = p1_x - _fcdCenterX[ 1 ];
+	let dy = p1_y - _fcdCenterY[ 1 ];
+	let dz = p1_z - _fcdCenterZ[ 1 ];
+	let distance = vm_vec_mag_quick_components( dx, dy, dz );
+
+	const first_path_center = path_length - 2;
+	dx = p0_x - _fcdCenterX[ first_path_center ];
+	dy = p0_y - _fcdCenterY[ first_path_center ];
+	dz = p0_z - _fcdCenterZ[ first_path_center ];
+	distance += vm_vec_mag_quick_components( dx, dy, dz );
+
+	for ( let i = 1; i < path_length - 2; i ++ ) {
+
+		dx = _fcdCenterX[ i ] - _fcdCenterX[ i + 1 ];
+		dy = _fcdCenterY[ i ] - _fcdCenterY[ i + 1 ];
+		dz = _fcdCenterZ[ i ] - _fcdCenterZ[ i + 1 ];
+		distance += vm_vec_mag_quick_components( dx, dy, dz );
+
+	}
+
+	return distance;
 
 }
 

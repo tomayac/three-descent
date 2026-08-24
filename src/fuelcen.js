@@ -4,7 +4,7 @@
 import { Segments, Vertices } from './mglobal.js';
 import { VCLIP_MORPHING_ROBOT } from './fireball.js';
 import { Vclips } from './bm.js';
-import { digi_play_sample_3d } from './digi.js';
+import { digi_play_sample_world } from './digi.js';
 
 // Segment special types (from SEGMENT.H)
 export const SEGMENT_IS_NOTHING = 0;
@@ -19,6 +19,14 @@ const MATCEN_LIFE_BASE = 30.0;		// seconds (30 - 2*Difficulty)
 const ROBOT_GEN_TIME = 5.0;		// seconds base spawn timer
 const NUM_EXTRY_ROBOTS = 15;		// Ported from: FUELCEN.C line 577 — extra robot slots beyond original count
 let _getDifficultyLevel = null;		// callback from main.js
+
+// D1 rand() returns 0..32767 and is consumed as a fixed-point number without
+// first scaling it to F1_0, yielding [0, 0.5) in world-time expressions.
+function matcen_random_half_unit() {
+
+	return Math.floor( Math.random() * 32768 ) / 65536.0;
+
+}
 
 // RobotCenters[] — matcen static data loaded from level
 const RobotCenters = [];
@@ -62,6 +70,75 @@ export function fuelcen_reset() {
 	RobotCenters.length = 0;
 	Station.length = 0;
 	Num_robot_centers = 0;
+
+}
+
+// D1 STATE.C persists the runtime FuelCenter/Station array.  The table-backed
+// robot flags and segment topology are rebuilt from the level; these are the
+// mutable fields that determine whether, when, and how often each matcen can
+// emit another robot.
+export function fuelcen_get_save_state() {
+
+	const stations = new Array( Station.length );
+	for ( let i = 0; i < Station.length; i ++ ) {
+
+		const station = Station[ i ];
+		stations[ i ] = {
+			type: station.Type,
+			segnum: station.segnum,
+			flag: station.Flag,
+			enabled: station.Enabled,
+			lives: station.Lives,
+			capacity: station.Capacity,
+			maxCapacity: station.MaxCapacity,
+			timer: station.Timer,
+			disableTime: station.Disable_time
+		};
+
+	}
+	return { stations: stations };
+
+}
+
+export function fuelcen_restore_save_state( state ) {
+
+	if ( state === null || state === undefined || typeof state !== 'object' ||
+		Array.isArray( state.stations ) !== true ||
+		state.stations.length !== Station.length ) return false;
+
+	// Validate the complete snapshot first.  A malformed localStorage record
+	// must not leave half the level's materialization centers restored.
+	for ( let i = 0; i < Station.length; i ++ ) {
+
+		const saved = state.stations[ i ];
+		const station = Station[ i ];
+		if ( saved === null || typeof saved !== 'object' ||
+			saved.type !== station.Type || saved.segnum !== station.segnum ||
+			( saved.flag !== 0 && saved.flag !== 1 ) ||
+			( saved.enabled !== 0 && saved.enabled !== 1 ) ||
+			Number.isInteger( saved.lives ) !== true ||
+			saved.lives < 0 || saved.lives > 255 ||
+			Number.isFinite( saved.capacity ) !== true || saved.capacity < 0 ||
+			Number.isFinite( saved.maxCapacity ) !== true || saved.maxCapacity < 0 ||
+			Number.isFinite( saved.timer ) !== true || saved.timer < 0 ||
+			Number.isFinite( saved.disableTime ) !== true ) return false;
+
+	}
+
+	for ( let i = 0; i < Station.length; i ++ ) {
+
+		const saved = state.stations[ i ];
+		const station = Station[ i ];
+		station.Flag = saved.flag;
+		station.Enabled = saved.enabled;
+		station.Lives = saved.lives;
+		station.Capacity = saved.capacity;
+		station.MaxCapacity = saved.maxCapacity;
+		station.Timer = saved.timer;
+		station.Disable_time = saved.disableTime;
+
+	}
+	return true;
 
 }
 
@@ -233,11 +310,37 @@ export function fuelcen_frame_process() {
 				const dz = pp.z - robotcen.Center_z;
 				const dist = Math.sqrt( dx * dx + dy * dy + dz * dz );
 
-				top_time = Math.min( dist / 64.0 + Math.random() * 2.0 + 2.0, ROBOT_GEN_TIME );
+				top_time = dist / 64.0 + matcen_random_half_unit() * 2.0 + 2.0;
+				if ( top_time > ROBOT_GEN_TIME ) {
+
+					top_time = ROBOT_GEN_TIME + matcen_random_half_unit();
+
+				}
+				if ( top_time < 2.0 ) {
+
+					top_time = 1.5 + matcen_random_half_unit() * 2.0;
+
+				}
 
 			}
 
 			if ( robotcen.Timer > top_time ) {
+
+				// Make sure this matcen hasn't already put out its max without any being killed.
+				// Ported from: FUELCEN.C lines 671-681 — count robots created by THIS matcen,
+				// limit = Difficulty_level + 3. This MUST run before the morph effect; otherwise
+				// we play the materialize flash + sound and then abort, leaving a phantom morph.
+				if ( _countRobotsFromMatcen !== null ) {
+
+					const d = _getDifficultyLevel !== null ? _getDifficultyLevel() : 1;
+					if ( _countRobotsFromMatcen( i ) > d + 3 ) {
+
+						robotcen.Timer /= 2;
+						continue;
+
+					}
+
+				}
 
 				// Whack any robot or player in the matcen segment before spawning
 				// Ported from: FUELCEN.C lines 683-702
@@ -273,7 +376,7 @@ export function fuelcen_frame_process() {
 
 						_createExplosion(
 							robotcen.Center_x, robotcen.Center_y, robotcen.Center_z,
-							4.0, VCLIP_MORPHING_ROBOT
+							10.0, VCLIP_MORPHING_ROBOT
 						);
 
 					}
@@ -283,7 +386,7 @@ export function fuelcen_frame_process() {
 					const morphVclip = Vclips[ VCLIP_MORPHING_ROBOT ];
 					if ( morphVclip !== undefined && morphVclip.sound_num >= 0 ) {
 
-						digi_play_sample_3d( morphVclip.sound_num, 0.8,
+						digi_play_sample_world( morphVclip.sound_num, 1.0, robotcen.segnum,
 							robotcen.Center_x, robotcen.Center_y, robotcen.Center_z );
 
 					}
@@ -297,52 +400,33 @@ export function fuelcen_frame_process() {
 
 		} else if ( robotcen.Flag === 1 ) {
 
-			// Morphing state — wait for animation to finish, then spawn
-			// VCLIP_MORPHING_ROBOT play time is typically ~1 second
-			const MORPH_TIME = 0.5;	// Spawn halfway through animation
+			// Morphing state — create the robot halfway through the configured
+			// materialization clip, not at a hardcoded wall-clock time.
+			const morphVclip = Vclips[ VCLIP_MORPHING_ROBOT ];
+			const morphTime = morphVclip !== undefined &&
+				Number.isFinite( morphVclip.play_time ) === true && morphVclip.play_time > 0
+				? morphVclip.play_time * 0.5 : 0.5;
 
-			if ( robotcen.Timer > MORPH_TIME ) {
+			if ( robotcen.Timer > morphTime ) {
 
-				// Check per-matcen alive robot count limit
-				// Ported from: FUELCEN.C lines 668-681 — count only robots from THIS matcen
-				// Each matcen tracks robots via matcen_creator, limit = Difficulty_level + 3
-				const d = _getDifficultyLevel !== null ? _getDifficultyLevel() : 1;
-				const maxPerMatcen = d + 3;
-				let canSpawn = true;
+				// Capacity was already verified in the Flag 0 phase (before the morph
+				// effect), so just spawn the robot now. Ported from: FUELCEN.C case 1.
+				const robotType = pickRobotType( RobotCenters[ i ].robot_flags );
 
-				if ( _countRobotsFromMatcen !== null ) {
+				if ( robotType !== - 1 ) {
 
-					const count = _countRobotsFromMatcen( i );
-					if ( count > maxPerMatcen ) {
+					// Spawn the robot, tagging it with this matcen's index
+					if ( _spawnRobot !== null ) {
 
-						canSpawn = false;
-						robotcen.Timer /= 2;
-
-					}
-
-				}
-
-				if ( canSpawn === true ) {
-
-					// Pick a random robot type from the flags bitmask
-					const robotType = pickRobotType( RobotCenters[ i ].robot_flags );
-
-					if ( robotType !== - 1 ) {
-
-						// Spawn the robot, tagging it with this matcen's index
-						if ( _spawnRobot !== null ) {
-
-							_spawnRobot(
-								robotcen.segnum, robotType,
-								robotcen.Center_x, robotcen.Center_y, robotcen.Center_z,
-								i
-							);
-
-						}
-
-						robotcen.Capacity -= 1.0;
+						_spawnRobot(
+							robotcen.segnum, robotType,
+							robotcen.Center_x, robotcen.Center_y, robotcen.Center_z,
+							i
+						);
 
 					}
+
+					robotcen.Capacity -= 1.0;
 
 				}
 

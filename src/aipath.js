@@ -13,9 +13,12 @@ const MAX_DEPTH_TO_SEARCH = 10;
 const MAX_POINT_SEGS = 2500;
 
 // Mode/behavior constants (duplicated from ai.js to avoid circular imports)
-const AIM_HIDE = 8;
+const AIM_HIDE = 5;
 const AIM_STILL = 0;
+const AIM_FOLLOW_PATH = 2;
 const AIB_HIDE = 0x82;
+const AIB_FOLLOW_PATH = 0x84;
+const AIB_STATION = 0x85;
 const AISM_HIDING = 1;
 
 // ------- Pathfinding global storage -------
@@ -636,27 +639,67 @@ export function ai_follow_path( robot, params, visibility, dt, ai_turn_towards_v
 		// Check bounds
 		if ( ailp.cur_path_index >= ailp.path_length || ailp.cur_path_index < 0 ) {
 
-			// Reached end of path — check mode-specific behavior
-			// Ported from: AIPATH.C line 950 — run-from creates new escape path
+			// Reached the end of the path — behavior depends on mode/behavior.
+			// Ported from: ai_follow_path() end-of-path handling in AIPATH.C:975-1047.
+
+			// Run-from: signal ai.js to build a fresh escape path. (AIPATH.C:994)
 			if ( ailp.mode_is_run_from === true ) {
 
-				// Signal to ai.js that we need a new escape path
 				ailp.needs_new_path = true;
+				ailp.path_length = 0;
+				ailp.cur_path_index = 0;
+				return;
 
 			}
 
-			// Hiding robots: reached hiding spot — switch to still and wait
-			// Ported from: AIPATH.C line 979-981
+			// Hiding: reached the hiding spot — stay put until bonked or hit. (AIPATH.C:979-981)
 			if ( ailp.mode === AIM_HIDE ) {
 
 				ailp.mode = AIM_STILL;
 				ailp.submode = AISM_HIDING;
+				ailp.path_length = 0;
+				ailp.cur_path_index = 0;
+				return;
 
 			}
 
-			ailp.path_length = 0;
-			ailp.cur_path_index = 0;
-			return;
+			// Station robots head back toward their home segment. (AIPATH.C:983-989)
+			if ( ailp.behavior === AIB_STATION ) {
+
+				create_path_to_station( robot, 15 );
+				return;
+
+			}
+
+			// Following a path toward the player (not a dedicated path robot): ai.js re-paths
+			// to the player on the next chase frame. (AIPATH.C:990-991 create_path_to_player)
+			if ( ailp.mode === AIM_FOLLOW_PATH && ailp.behavior !== AIB_FOLLOW_PATH ) {
+
+				ailp.path_length = 0;
+				ailp.cur_path_index = 0;
+				return;
+
+			}
+
+			// Default (incl. AIB_FOLLOW_PATH patrol robots): if the opposite end of the path is
+			// reachable, loop straight to it (circular patrol); otherwise reverse direction and
+			// walk back. Ported from: AIPATH.C:993-1047.
+			const opposite_end_index = ( Math.abs( ailp.cur_path_index - ailp.path_length ) < ailp.cur_path_index ) ? 0 : ( ailp.path_length - 1 );
+			const opp = Point_segs[ ailp.hide_index + opposite_end_index ];
+
+			if ( opp !== undefined &&
+				check_line_of_sight( obj.pos_x, obj.pos_y, obj.pos_z, obj.segnum, opp.point_x, opp.point_y, opp.point_z ) === true ) {
+
+				ailp.cur_path_index = opposite_end_index;
+
+			} else {
+
+				ailp.PATH_DIR = - ailp.PATH_DIR;
+				ailp.cur_path_index += ailp.PATH_DIR;	// step back from the out-of-bounds index
+
+			}
+
+			// fall through: move toward the (still valid) goal waypoint computed above
 
 		}
 
@@ -853,5 +896,99 @@ export function aipath_reset() {
 
 	Point_segs_free_index = 0;
 	_last_frame_garbage_collected = - 999;
+
+}
+
+// Save one robot's path independently of Point_segs' process-local indices.
+// D1 serializes the complete Point_segs pool alongside Ai_local_info; the JS
+// save format instead embeds each referenced slice with its owning robot so a
+// level rebuild can safely allocate it into the fresh pool.
+export function aipath_snapshot_robot_path( ailp ) {
+
+	if ( ailp === null || ailp === undefined || ailp.path_length <= 0 ) return null;
+	if ( Number.isInteger( ailp.hide_index ) !== true || ailp.hide_index < 0 ||
+		Number.isInteger( ailp.path_length ) !== true ||
+		ailp.hide_index + ailp.path_length > Point_segs_free_index ) return null;
+	if ( Number.isInteger( ailp.cur_path_index ) !== true || ailp.cur_path_index < 0 ||
+		ailp.cur_path_index >= ailp.path_length ) return null;
+	if ( ailp.PATH_DIR !== 1 && ailp.PATH_DIR !== - 1 ) return null;
+
+	const points = new Array( ailp.path_length );
+	for ( let i = 0; i < ailp.path_length; i ++ ) {
+
+		const point = Point_segs[ ailp.hide_index + i ];
+		points[ i ] = {
+			segnum: point.segnum,
+			x: point.point_x,
+			y: point.point_y,
+			z: point.point_z
+		};
+
+	}
+
+	return {
+		currentIndex: ailp.cur_path_index,
+		direction: ailp.PATH_DIR,
+		points: points
+	};
+
+}
+
+function clear_restored_robot_path( ailp ) {
+
+	ailp.hide_index = - 1;
+	ailp.path_length = 0;
+	ailp.cur_path_index = 0;
+	ailp.PATH_DIR = 1;
+
+}
+
+export function aipath_restore_robot_path( ailp, snapshot ) {
+
+	if ( ailp === null || ailp === undefined ) return false;
+	clear_restored_robot_path( ailp );
+	if ( snapshot === null ) return true;
+	if ( snapshot === undefined || typeof snapshot !== 'object' ||
+		Array.isArray( snapshot.points ) !== true ) return false;
+
+	const points = snapshot.points;
+	const pathLength = points.length;
+	if ( pathLength <= 0 || pathLength > MAX_PATH_LENGTH * 2 - 1 ||
+		Point_segs_free_index + pathLength > MAX_POINT_SEGS ) return false;
+	if ( Number.isInteger( snapshot.currentIndex ) !== true ||
+		snapshot.currentIndex < 0 || snapshot.currentIndex >= pathLength ) return false;
+	if ( snapshot.direction !== 1 && snapshot.direction !== - 1 ) return false;
+
+	// Validate the complete slice before reserving any shared pool entries.
+	for ( let i = 0; i < pathLength; i ++ ) {
+
+		const point = points[ i ];
+		if ( point === null || typeof point !== 'object' ||
+			Number.isInteger( point.segnum ) !== true ||
+			point.segnum < 0 || point.segnum >= Num_segments ||
+			Number.isFinite( point.x ) !== true ||
+			Number.isFinite( point.y ) !== true ||
+			Number.isFinite( point.z ) !== true ) return false;
+
+	}
+
+	const pathStart = Point_segs_free_index;
+	for ( let i = 0; i < pathLength; i ++ ) {
+
+		const saved = points[ i ];
+		const point = Point_segs[ pathStart + i ];
+		point.segnum = saved.segnum;
+		point.point_x = saved.x;
+		point.point_y = saved.y;
+		point.point_z = saved.z;
+
+	}
+
+	Point_segs_free_index += pathLength;
+	ailp.hide_index = pathStart;
+	ailp.path_length = pathLength;
+	ailp.cur_path_index = snapshot.currentIndex;
+	ailp.PATH_DIR = snapshot.direction;
+	return true;
 
 }

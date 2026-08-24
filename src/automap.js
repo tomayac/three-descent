@@ -17,7 +17,7 @@ import {
 	SEGMENT_IS_FUELCEN, SEGMENT_IS_CONTROLCEN, SEGMENT_IS_ROBOTMAKER
 } from './fuelcen.js';
 import {
-	OBJ_HOSTAGE, OBJ_POWERUP, OBJ_NONE,
+	OBJ_HOSTAGE, OBJ_POWERUP, OBJ_NONE, OBJ_PLAYER, OF_SHOULD_BE_DEAD,
 	get_Highest_object_index
 } from './object.js';
 import { POW_KEY_BLUE, POW_KEY_RED, POW_KEY_GOLD } from './collide.js';
@@ -42,6 +42,7 @@ const COLOR_FUELCEN = 5;			// brown (29/63, 27/63, 13/63)
 const COLOR_CONTROLCEN = 6;		// red (29/63, 0, 0)
 const COLOR_ROBOTMAKER = 7;		// magenta (29/63, 0, 31/63)
 const COLOR_HOSTAGE = 8;			// green (0, 31/63, 0)
+const COLOR_PLAYER_START = 9;		// magenta — player start segment (BM_XRGB(31,0,31))
 const COLOR_NONE = 255;			// don't draw
 
 const ColorTable = [];
@@ -54,6 +55,7 @@ ColorTable[ COLOR_FUELCEN ] = [ 29 / 63, 27 / 63, 13 / 63 ];
 ColorTable[ COLOR_CONTROLCEN ] = [ 29 / 63, 0, 0 ];
 ColorTable[ COLOR_ROBOTMAKER ] = [ 29 / 63, 0, 31 / 63 ];
 ColorTable[ COLOR_HOSTAGE ] = [ 0, 31 / 63, 0 ];
+ColorTable[ COLOR_PLAYER_START ] = [ 31 / 63, 0, 31 / 63 ];
 
 // --- Edge data structure (from AUTOMAP.C lines 227-237) ---
 const MAX_EDGES = 6000;
@@ -89,6 +91,7 @@ let _automapGroup = null;		// THREE.Group holding line geometry + objects
 let _edgeLines = null;			// THREE.LineSegments for edges
 let _playerArrow = null;		// THREE.LineSegments for player arrow
 let _objectSprites = [];		// sprites for keys/hostages
+let _playerArrowSize = 5.0;
 
 // Saved camera state
 const _savedCameraPos = new THREE.Vector3();
@@ -121,6 +124,11 @@ export function automap_set_externals( ext ) {
 	if ( ext.mineGroup !== undefined ) _mineGroup = ext.mineGroup;
 
 }
+
+// Segment the player starts the level in; its edges are drawn magenta on the map.
+// Ported from: Player_init[Player_num].segnum highlight in AUTOMAP.C:1071.
+let _playerStartSeg = - 1;
+export function automap_set_player_start( segnum ) { _playerStartSeg = segnum; }
 
 export function getIsAutomap() {
 
@@ -454,7 +462,34 @@ function buildPlayerArrow() {
 	_playerArrow.renderOrder = 999;
 
 	if ( _automapGroup !== null ) _automapGroup.add( _playerArrow );
+	_playerArrowSize = getPlayerObjectSize();
 	updatePlayerArrow();
+
+}
+
+function getPlayerObjectSize() {
+
+	if ( Objects[ 0 ] !== undefined && Objects[ 0 ].type === OBJ_PLAYER && Objects[ 0 ].size > 0 ) {
+
+		return Objects[ 0 ].size;
+
+	}
+
+	const highestObj = get_Highest_object_index();
+
+	for ( let i = 0; i <= highestObj; i ++ ) {
+
+		const obj = Objects[ i ];
+
+		if ( obj !== undefined && obj.type === OBJ_PLAYER && obj.size > 0 ) {
+
+			return obj.size;
+
+		}
+
+	}
+
+	return 5.0;
 
 }
 
@@ -465,7 +500,7 @@ function updatePlayerArrow() {
 	if ( _playerArrow === null ) return;
 
 	const pos = _savedCameraPos;
-	const size = 5.0;	// Player ship size approximation
+	const size = _playerArrowSize;
 
 	// Extract forward, right, up from saved quaternion (Descent coords → Three.js)
 	_tmpVec.set( 0, 0, - 1 ).applyQuaternion( _savedCameraQuat );
@@ -547,7 +582,7 @@ function buildObjectSprites() {
 	for ( let i = 0; i <= highestObj; i ++ ) {
 
 		const obj = Objects[ i ];
-		if ( obj.type === OBJ_NONE ) continue;
+		if ( obj.type === OBJ_NONE || ( obj.flags & OF_SHOULD_BE_DEAD ) !== 0 ) continue;
 
 		if ( obj.type === OBJ_HOSTAGE ) {
 
@@ -882,6 +917,10 @@ function add_segment_edges( segnum ) {
 
 		}
 
+		// Highlight the player's starting segment in magenta. Ported from: AUTOMAP.C:1071 —
+		//   if (segnum == Player_init[Player_num].segnum) color = BM_XRGB(31,0,31);
+		if ( segnum === _playerStartSeg ) color = COLOR_PLAYER_START;
+
 		if ( color !== COLOR_NONE ) {
 
 			const verts = get_side_verts( segnum, sn );
@@ -1057,4 +1096,3 @@ function automap_build_edge_list() {
 	}
 
 }
-

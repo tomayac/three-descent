@@ -1,7 +1,15 @@
 // Ported from: descent-master/MAIN/SONGS.C
-// Song/music management and MIDI playback via Web Audio API
+// Song/music selection and playback orchestration for HMP tracks.
 
-import { hmp_parse, hmp_get_events } from './hmp.js';
+import { hmp_parse, hmp_get_events, hmp_get_duration } from './hmp.js';
+import {
+	opl_init,
+	opl_set_audio_graph,
+	opl_set_master_volume,
+	opl_reset_channels,
+	opl_process_midi_event,
+	opl_stop_all_notes
+} from './opl_synth.js';
 
 // Song constants (from SONGS.H)
 export const SONG_TITLE = 0;
@@ -9,27 +17,33 @@ export const SONG_BRIEFING = 1;
 export const SONG_ENDLEVEL = 2;
 export const SONG_ENDGAME = 3;
 export const SONG_CREDITS = 4;
-export const SONG_LEVEL_MUSIC = 5;	// first level music index
+export const SONG_LEVEL_MUSIC = 5;
+
+const MAX_SONGS = 27;
+const REGISTERED_GAME_SONGS = 22;
+const DEFAULT_MELODIC_BANK = 'melodic.bnk';
+const DEFAULT_DRUM_BANK = 'drum.bnk';
+
+// SONGS.H defines 22 level songs for registered Descent.  Shareware has five;
+// this live binding is selected from descent.sng when that table is available.
+export let NUM_GAME_SONGS = 5;
 
 // Shareware song file mapping
-// The shareware HOG contains: descent.hmp, briefing.hmp, credits.hmp, game0-4.hmp
-const SHAREWARE_SONGS = [
-	'descent.hmp',		// 0: Title
-	'briefing.hmp',	// 1: Briefing
-	null,				// 2: End level (not in shareware)
-	null,				// 3: End game (not in shareware)
-	'credits.hmp',		// 4: Credits
-	'game0.hmp',		// 5: Level 1
-	'game1.hmp',		// 6: Level 2
-	'game2.hmp',		// 7: Level 3
-	'game3.hmp',		// 8: Level 4
-	'game4.hmp',		// 9: Level 5
-	'game0.hmp',		// 10: Level 6 (cycles)
-	'game1.hmp',		// 11: Level 7 (cycles)
+const SHAREWARE_SONG_FILENAMES = [
+	'descent.hmp', 'briefing.hmp', null, 'endgame.hmp', 'credits.hmp',
+	'game0.hmp', 'game1.hmp', 'game2.hmp', 'game3.hmp', 'game4.hmp',
+	'game0.hmp', 'game1.hmp'
 ];
+
+const SHAREWARE_SONGS = SHAREWARE_SONG_FILENAMES.map( filename => ( {
+	filename: filename,
+	melodicBank: DEFAULT_MELODIC_BANK,
+	drumBank: DEFAULT_DRUM_BANK
+} ) );
 
 // External references
 let _hogFile = null;
+let _songs = SHAREWARE_SONGS;
 
 // Playback state
 let _audioContext = null;
@@ -41,400 +55,135 @@ let _looping = false;
 let _events = null;
 let _eventIndex = 0;
 let _startTime = 0;
-let _scheduledUntil = 0;
 let _scheduleTimer = null;
 let _songDuration = 0;
-let _volume = 0.4;
+let _playbackEndTime = 0;
+let _playbackEndIndex = 0;
+let _loopStartTime = 0;
+let _loopStartEventIndex = 0;
+let _loopDuration = 0;
+let _nextSectionEndTime = 0;
+let _hasLoopMarkers = false;
+let _paused = false;
+let _volume = 1.0;
+let _usingWorklet = false;
+let _lastRequestedSong = - 1;
+let _restartSongWhenAudible = false;
 
-// Per-channel state (16 MIDI channels)
-const NUM_CHANNELS = 16;
-const _channels = [];
+function hmiMasterVolume() {
 
-// Active note tracking for cleanup
-const _activeNotes = new Map(); // key: "channel-note" -> { carrier, modulator, noteGain, ... }
-
-// OPL2 voice polyphony limit: exactly 9 melodic voice channels
-// When all are in use, steal the oldest voice to make room
-const OPL2_NUM_VOICES = 9;
-const _voiceSlots = []; // array of { key, startTime } — max OPL2_NUM_VOICES entries
-
-// ============================================================
-// OPL2 FM Synthesis Engine
-// Uses exact instrument parameters from Descent's melodic.bnk
-// ============================================================
-
-// OPL2 waveforms with feedback: cached as PeriodicWave objects
-// Key: "wave-fb" e.g. "0-0" for sine no feedback, "1-4" for half-sine with FB=4
-const _oplWaveCache = new Map();
-
-function getOplWaveform( waveType, fb ) {
-
-	if ( _audioContext === null ) return null;
-
-	const cacheKey = waveType + '-' + fb;
-
-	if ( _oplWaveCache.has( cacheKey ) ) return _oplWaveCache.get( cacheKey );
-
-	// Build PeriodicWave from Fourier coefficients
-	const N = 64; // number of harmonics
-	const real = new Float32Array( N );
-	const imag = new Float32Array( N );
-
-	if ( waveType === 0 ) {
-
-		// Pure sine
-		imag[ 1 ] = 1.0;
-
-	} else if ( waveType === 1 ) {
-
-		// Half-sine: positive half only (negative clamped to 0)
-		// Fourier: 1/π + sin(x)/2 - Σ 2/((4n²-1)π) cos(2nx)
-		real[ 0 ] = 1.0 / Math.PI;
-		imag[ 1 ] = 0.5;
-		for ( let n = 1; n < N / 2; n ++ ) {
-
-			real[ 2 * n ] = - 2.0 / ( ( 4 * n * n - 1 ) * Math.PI );
-
-		}
-
-	} else if ( waveType === 2 ) {
-
-		// Abs-sine: full-wave rectified (always positive)
-		// Fourier: 2/π - Σ 4/((4n²-1)π) cos(2nx)
-		real[ 0 ] = 2.0 / Math.PI;
-		for ( let n = 1; n < N / 2; n ++ ) {
-
-			real[ 2 * n ] = - 4.0 / ( ( 4 * n * n - 1 ) * Math.PI );
-
-		}
-
-	} else if ( waveType === 3 ) {
-
-		// Quarter-sine: sin(x) for 0≤x<π/2, 0 elsewhere
-		// Computed numerically from DFT of the target waveform
-		const M = 1024;
-
-		for ( let k = 0; k < N; k ++ ) {
-
-			let rSum = 0, iSum = 0;
-
-			for ( let j = 0; j < M; j ++ ) {
-
-				const x = ( 2 * Math.PI * j ) / M;
-				const val = ( x < Math.PI / 2 ) ? Math.sin( x ) : 0;
-				rSum += val * Math.cos( 2 * Math.PI * k * j / M );
-				iSum -= val * Math.sin( 2 * Math.PI * k * j / M );
-
-			}
-
-			real[ k ] = rSum / M * 2;
-			imag[ k ] = iSum / M * 2;
-
-		}
-
-		real[ 0 ] /= 2;
-
-	}
-
-	// Apply OPL2 feedback to the waveform
-	// Feedback = modulator self-modulates: output(t) = sin(phase + FB_level * prev_output)
-	// This morphs the waveform from sine → saw-like → noise-like as FB increases
-	// Pre-compute the steady-state waveform for each FB level
-	if ( fb > 0 ) {
-
-		// OPL2 feedback: π / 2^(8-FB) scaling of averaged previous two outputs
-		const fbAmount = Math.PI / Math.pow( 2, 8 - fb );
-
-		// Iterate the feedback equation to find the steady-state waveform
-		const M = 1024;
-		const waveform = new Float32Array( M );
-		let prev1 = 0, prev2 = 0;
-
-		// Run 3 cycles to reach steady state
-		for ( let cycle = 0; cycle < 3; cycle ++ ) {
-
-			for ( let j = 0; j < M; j ++ ) {
-
-				const phase = ( 2 * Math.PI * j ) / M;
-				const fbPhase = phase + fbAmount * ( prev1 + prev2 ) * 0.5;
-				let val;
-
-				if ( waveType === 0 ) {
-
-					val = Math.sin( fbPhase );
-
-				} else if ( waveType === 1 ) {
-
-					val = Math.sin( fbPhase );
-					if ( val < 0 ) val = 0;
-
-				} else if ( waveType === 2 ) {
-
-					val = Math.abs( Math.sin( fbPhase ) );
-
-				} else {
-
-					const normPhase = ( ( fbPhase % ( 2 * Math.PI ) ) + 2 * Math.PI ) % ( 2 * Math.PI );
-					val = ( normPhase < Math.PI / 2 ) ? Math.sin( normPhase ) : 0;
-
-				}
-
-				waveform[ j ] = val;
-				prev2 = prev1;
-				prev1 = val;
-
-			}
-
-		}
-
-		// DFT to get Fourier coefficients of the feedback-modified waveform
-		for ( let k = 0; k < N; k ++ ) {
-
-			let rSum = 0, iSum = 0;
-
-			for ( let j = 0; j < M; j ++ ) {
-
-				rSum += waveform[ j ] * Math.cos( 2 * Math.PI * k * j / M );
-				iSum -= waveform[ j ] * Math.sin( 2 * Math.PI * k * j / M );
-
-			}
-
-			real[ k ] = rSum / M * 2;
-			imag[ k ] = iSum / M * 2;
-
-		}
-
-		real[ 0 ] /= 2;
-
-	}
-
-	const wave = _audioContext.createPeriodicWave( real, imag, { disableNormalization: false } );
-	_oplWaveCache.set( cacheKey, wave );
-	return wave;
+	return Math.min( 127, Math.trunc( _volume * 128 ) );
 
 }
 
-// Convert OPL2 4-bit attack rate (0-15) to time constant (seconds)
-// Derived from OPL2 base rate: AR_BASE = 2826.24ms at effective rate 4
-// Each increment of 4 in effective rate halves the time
-// Register rate R maps to effective rate R*4
-function oplAttackRate( rate ) {
+function effectiveOutputGain() {
 
-	if ( rate === 0 ) return 10.0; // effectively infinite
-	// OPL2 attack: base 2826ms at rate 1, halving per rate step
-	return 2.826 / Math.pow( 2, rate - 1 );
+	if ( _paused === true || _volume === 0 ) return 0;
+	// The OPL3 worklet applies HMI's nonlinear master-volume curve inside the
+	// synth.  The fallback has no chip-level volume model, so scale it here.
+	return _usingWorklet === true ? 1 : _volume;
 
 }
 
-// Convert OPL2 4-bit decay/release rate (0-15) to seconds
-// Derived from OPL2 base rate: DR_BASE = 39280.64ms at effective rate 4
-// Decay/release is ~14x slower than attack at the same register rate
-function oplDecayRate( rate ) {
-
-	if ( rate === 0 ) return 30.0; // effectively infinite
-	// OPL2 decay: base 39280ms at rate 1, halving per rate step
-	return 39.28 / Math.pow( 2, rate - 1 );
-
-}
-
-// Convert OPL2 4-bit sustain level (attenuation) to linear gain
-// SL 0 = 0dB (full sustain), SL 1-14 = -3dB steps, SL 15 = -93dB (silence)
-function oplSustainLevel( sl ) {
-
-	if ( sl === 0 ) return 1.0;
-	if ( sl >= 15 ) return 0.00002; // -93dB, effectively silent
-	return Math.pow( 10, - 3.0 * sl / 20.0 );
-
-}
-
-// Convert OPL2 6-bit total level (attenuation) to linear gain
-// TL 0 = 0dB (max), TL 63 = -47.25dB
-// Each step = -0.75dB
-function oplTotalLevel( tl ) {
-
-	if ( tl === 0 ) return 1.0;
-	if ( tl >= 63 ) return 0.005;
-	return Math.pow( 10, - 0.75 * tl / 20.0 );
-
-}
-
-// Convert OPL2 frequency multiplier field to actual ratio
-// 0=0.5, 1=1, 2=2, ..., 15=15
-function oplMultiplier( mult ) {
-
-	if ( mult === 0 ) return 0.5;
-	return mult;
-
-}
-
-// OPL2 Key Scale Level (KSL) — attenuates higher notes
-// KSL field: 0=off, 1=3.0 dB/oct, 2=1.5 dB/oct, 3=6.0 dB/oct
-// Returns linear gain multiplier (1.0 = no attenuation)
-function oplKeyScaleLevel( kslField, midiNote ) {
-
-	if ( kslField === 0 ) return 1.0;
-
-	// dB per octave for each KSL setting (OPL2 encoding is non-linear)
-	const KSL_DB_PER_OCT = [ 0, 3.0, 1.5, 6.0 ];
-	const dbPerOct = KSL_DB_PER_OCT[ kslField ];
-
-	// Octaves above middle C (MIDI 60)
-	const octavesAboveC4 = ( midiNote - 60 ) / 12.0;
-	if ( octavesAboveC4 <= 0 ) return 1.0; // no attenuation below middle C
-
-	const attenuationDb = dbPerOct * octavesAboveC4;
-	return Math.pow( 10, - attenuationDb / 20.0 );
-
-}
-
-// OPL2 Key Scale Rate (KSR) — faster envelopes for higher notes
-// When KSR bit is set, envelope rates scale with note frequency
-// Returns a rate multiplier (>= 1.0)
-function oplKeyScaleRate( ksrBit, midiNote ) {
-
-	if ( ksrBit === 0 ) return 1.0;
-
-	// OPL2 KSR: key rate number = octave*2 + msb_of_fnum
-	// For MIDI: approximate as octaves above C2 (MIDI 36)
-	const octaves = Math.max( 0, ( midiNote - 36 ) / 12.0 );
-
-	// Each octave doubles the effective rate (halves the envelope time)
-	// Scale is moderate: about 2x faster per 2 octaves
-	return Math.pow( 2, octaves * 0.5 );
-
-}
-
-// Raw OPL2 instrument definitions from Descent's melodic.bnk
-// Format: { mod: { mult, tl, ar, dr, sl, rr, wave, fb, eg, ksl, ksr, am, vib },
-//           car: { mult, tl, ar, dr, sl, rr, wave, eg, ksl, ksr, am, vib } }
-// eg: 0=non-sustaining (decays to silence), 1=sustaining (holds at sustain level)
-const OPL_PATCHES = {};
-
-// GM 0: default (copy of overdriven guitar in Descent's bank)
-OPL_PATCHES[ 0 ] = {
-	mod: { mult: 3, tl: 8, ar: 9, dr: 5, sl: 1, rr: 9, wave: 1, fb: 4, eg: 1, ksl: 1, ksr: 0, am: 0, vib: 0 },
-	car: { mult: 1, tl: 0, ar: 8, dr: 4, sl: 1, rr: 9, wave: 0, eg: 1, ksl: 0, ksr: 0, am: 0, vib: 0 }
-};
-
-// GM 25: Acoustic Guitar (steel) — bright pluck, non-sustaining
-OPL_PATCHES[ 25 ] = {
-	mod: { mult: 3, tl: 20, ar: 15, dr: 3, sl: 9, rr: 10, wave: 1, fb: 6, eg: 0, ksl: 1, ksr: 0, am: 0, vib: 0 },
-	car: { mult: 1, tl: 0, ar: 15, dr: 1, sl: 14, rr: 7, wave: 0, eg: 0, ksl: 0, ksr: 1, am: 0, vib: 0 }
-};
-
-// GM 29: Overdriven Guitar — Descent's signature driving riff
-OPL_PATCHES[ 29 ] = {
-	mod: { mult: 3, tl: 8, ar: 9, dr: 5, sl: 1, rr: 9, wave: 1, fb: 4, eg: 1, ksl: 1, ksr: 0, am: 0, vib: 0 },
-	car: { mult: 1, tl: 0, ar: 8, dr: 4, sl: 1, rr: 9, wave: 0, eg: 1, ksl: 0, ksr: 0, am: 0, vib: 0 }
-};
-
-// GM 38: Synth Bass 1 — punchy, sustaining
-OPL_PATCHES[ 38 ] = {
-	mod: { mult: 1, tl: 11, ar: 15, dr: 4, sl: 14, rr: 8, wave: 0, fb: 5, eg: 1, ksl: 2, ksr: 1, am: 0, vib: 0 },
-	car: { mult: 1, tl: 0, ar: 15, dr: 1, sl: 7, rr: 8, wave: 0, eg: 1, ksl: 0, ksr: 1, am: 0, vib: 0 }
-};
-
-// GM 39: Synth Bass 2 — squelchy, sustaining
-OPL_PATCHES[ 39 ] = {
-	mod: { mult: 1, tl: 18, ar: 15, dr: 1, sl: 2, rr: 8, wave: 0, fb: 5, eg: 1, ksl: 0, ksr: 1, am: 0, vib: 0 },
-	car: { mult: 1, tl: 0, ar: 15, dr: 1, sl: 1, rr: 8, wave: 0, eg: 1, ksl: 0, ksr: 1, am: 0, vib: 0 }
-};
-
-// GM 80: Lead 1 / Square Lead — buzzy, sustaining
-OPL_PATCHES[ 80 ] = {
-	mod: { mult: 2, tl: 25, ar: 15, dr: 15, sl: 0, rr: 3, wave: 2, fb: 0, eg: 1, ksl: 1, ksr: 0, am: 0, vib: 0 },
-	car: { mult: 1, tl: 0, ar: 15, dr: 15, sl: 0, rr: 15, wave: 0, eg: 1, ksl: 0, ksr: 0, am: 0, vib: 0 }
-};
-
-// GM 90: Pad 3 / Polysynth — warm, vibrato, sustaining
-OPL_PATCHES[ 90 ] = {
-	mod: { mult: 1, tl: 23, ar: 9, dr: 1, sl: 3, rr: 4, wave: 0, fb: 6, eg: 1, ksl: 0, ksr: 0, am: 0, vib: 1 },
-	car: { mult: 1, tl: 0, ar: 5, dr: 5, sl: 1, rr: 6, wave: 0, eg: 1, ksl: 0, ksr: 0, am: 0, vib: 1 }
-};
-
-// GM 94: Pad 7 / Halo — ethereal, slow attack, carrier vibrato
-OPL_PATCHES[ 94 ] = {
-	mod: { mult: 1, tl: 9, ar: 1, dr: 1, sl: 3, rr: 3, wave: 0, fb: 5, eg: 1, ksl: 2, ksr: 0, am: 0, vib: 0 },
-	car: { mult: 1, tl: 3, ar: 4, dr: 2, sl: 2, rr: 5, wave: 0, eg: 1, ksl: 0, ksr: 0, am: 0, vib: 1 }
-};
-
-// GM 95: Pad 8 / Sweep — half-sine mod, tremolo
-OPL_PATCHES[ 95 ] = {
-	mod: { mult: 1, tl: 21, ar: 1, dr: 1, sl: 4, rr: 7, wave: 1, fb: 0, eg: 1, ksl: 0, ksr: 0, am: 1, vib: 0 },
-	car: { mult: 1, tl: 0, ar: 12, dr: 15, sl: 0, rr: 7, wave: 0, eg: 1, ksl: 0, ksr: 0, am: 0, vib: 0 }
-};
-
-// GM 100: FX 5 / Brightness — non-sustaining, vibrato, carrier mult 2
-OPL_PATCHES[ 100 ] = {
-	mod: { mult: 1, tl: 13, ar: 15, dr: 1, sl: 5, rr: 1, wave: 1, fb: 0, eg: 0, ksl: 1, ksr: 0, am: 0, vib: 1 },
-	car: { mult: 2, tl: 0, ar: 15, dr: 2, sl: 15, rr: 5, wave: 0, eg: 0, ksl: 0, ksr: 0, am: 0, vib: 1 }
-};
-
-// GM 113: Agogo / Taiko — inharmonic bell, high mod mult, non-sustaining
-OPL_PATCHES[ 113 ] = {
-	mod: { mult: 7, tl: 21, ar: 14, dr: 12, sl: 2, rr: 6, wave: 0, fb: 5, eg: 0, ksl: 0, ksr: 0, am: 0, vib: 0 },
-	car: { mult: 2, tl: 0, ar: 15, dr: 8, sl: 1, rr: 6, wave: 0, eg: 0, ksl: 0, ksr: 0, am: 0, vib: 0 }
-};
-
-// GM 117: Melodic Tom — carrier at 0.5x freq, non-sustaining
-OPL_PATCHES[ 117 ] = {
-	mod: { mult: 1, tl: 1, ar: 15, dr: 8, sl: 4, rr: 7, wave: 2, fb: 2, eg: 0, ksl: 1, ksr: 1, am: 0, vib: 0 },
-	car: { mult: 0, tl: 3, ar: 15, dr: 3, sl: 0, rr: 3, wave: 0, eg: 0, ksl: 0, ksr: 1, am: 0, vib: 0 }
-};
-
-// GM 118: Synth Drum — max feedback, carrier at 0.5x, non-sustaining
-OPL_PATCHES[ 118 ] = {
-	mod: { mult: 1, tl: 14, ar: 15, dr: 1, sl: 0, rr: 6, wave: 2, fb: 7, eg: 0, ksl: 2, ksr: 0, am: 0, vib: 0 },
-	car: { mult: 0, tl: 0, ar: 15, dr: 3, sl: 0, rr: 2, wave: 0, eg: 0, ksl: 0, ksr: 1, am: 0, vib: 0 }
-};
-
-// Generic fallback OPL patch for unmapped programs (basic FM tone)
-const OPL_DEFAULT_PATCH = {
-	mod: { mult: 1, tl: 20, ar: 12, dr: 4, sl: 4, rr: 8, wave: 0, fb: 3, eg: 1, ksl: 0, ksr: 0, am: 0, vib: 0 },
-	car: { mult: 1, tl: 0, ar: 12, dr: 4, sl: 2, rr: 8, wave: 0, eg: 1, ksl: 0, ksr: 0, am: 0, vib: 0 }
-};
-
-// Look up OPL patch for a GM program number
-function getOplPatch( program ) {
-
-	if ( OPL_PATCHES[ program ] !== undefined ) return OPL_PATCHES[ program ];
-	return OPL_DEFAULT_PATCH;
-
-}
-
-// MIDI note to frequency conversion
-function midiToFreq( note ) {
-
-	return 440.0 * Math.pow( 2, ( note - 69 ) / 12.0 );
-
-}
-
-// Initialize song system
 export function songs_init( hogFile ) {
 
 	_hogFile = hogFile;
+	_songs = SHAREWARE_SONGS;
+	NUM_GAME_SONGS = 5;
 
-	// Initialize channel state
-	for ( let i = 0; i < NUM_CHANNELS; i ++ ) {
+	const songFile = hogFile.findFile( 'descent.sng' );
+	if ( songFile !== null ) {
 
-		_channels.push( {
-			program: 0,		// current instrument (0-127)
-			volume: 100,	// channel volume (0-127)
-			pan: 64,		// pan (0=left, 64=center, 127=right)
-			expression: 127,	// expression controller
-			pitchBend: 0	// pitch bend in cents (±200 = ±2 semitones)
-		} );
+		const parsedSongs = parseSongTable( songFile );
+		if ( parsedSongs.length > SONG_LEVEL_MUSIC ) {
+
+			_songs = parsedSongs;
+			NUM_GAME_SONGS = Math.min( REGISTERED_GAME_SONGS,
+				parsedSongs.length - SONG_LEVEL_MUSIC );
+
+		}
 
 	}
 
+	const initialSong = _songs[ SONG_TITLE ];
+	opl_init( hogFile,
+		initialSong?.melodicBank || DEFAULT_MELODIC_BANK,
+		initialSong?.drumBank || DEFAULT_DRUM_BANK );
 	console.log( 'SONGS: Music system initialized' );
 
 }
 
-// Set shared AudioContext from digi.js (avoids Chrome's limit of ~6 AudioContexts)
-export function songs_set_audio_context( ctx, masterGainNode ) {
+function parseSongTable( file ) {
+
+	const bytes = file.readBytes( file.length() );
+	let byteLength = bytes.length;
+	for ( let i = 0; i < bytes.length; i ++ ) {
+
+		if ( bytes[ i ] === 0x1a ) {
+
+			byteLength = i;
+			break;
+
+		}
+
+	}
+
+	let text = '';
+	for ( let i = 0; i < byteLength; i ++ ) text += String.fromCharCode( bytes[ i ] );
+
+	const songs = [];
+	const lines = text.split( /\r\n?|\n/ );
+
+	for ( let i = 0; i < lines.length && songs.length < MAX_SONGS; i ++ ) {
+
+		const line = lines[ i ].trim();
+		if ( line.length === 0 ) continue;
+
+		const fields = line.split( /\s+/ );
+		if ( fields.length < 3 || fields[ 0 ].length === 0 ) {
+
+			console.warn( 'SONGS: Invalid descent.sng row ' + ( i + 1 ) );
+			return [];
+
+		}
+
+		songs.push( {
+			filename: fields[ 0 ],
+			melodicBank: fields[ 1 ],
+			drumBank: fields[ 2 ]
+		} );
+
+	}
+
+	// Descent 1.5's 422-byte table is truncated after twelve rows.  DXX repairs
+	// the missing registered level entries as game08.hmp through game22.hmp.
+	if ( songs.length === 12 && file.length() === 422 ) {
+
+		const repairMelodicBank = songs[ 11 ].melodicBank;
+		const repairDrumBank = songs[ 11 ].drumBank;
+
+		for ( let i = 12; i < MAX_SONGS; i ++ ) {
+
+			const number = i - 4;
+			songs.push( {
+				filename: 'game' + ( number < 10 ? '0' : '' ) + number + '.hmp',
+				melodicBank: repairMelodicBank,
+				drumBank: repairDrumBank
+			} );
+
+		}
+
+	}
+
+	return songs;
+
+}
+
+// Set shared AudioContext from digi.js (avoids multiple contexts)
+export async function songs_set_audio_context( ctx, masterGainNode ) {
 
 	_audioContext = ctx;
+	_usingWorklet = false;
 
 	// Compressor prevents clipping with many simultaneous FM voices
 	_compressor = ctx.createDynamicsCompressor();
@@ -444,15 +193,17 @@ export function songs_set_audio_context( ctx, masterGainNode ) {
 	_compressor.attack.value = 0.003;
 	_compressor.release.value = 0.1;
 
-	// Chain: notes → _masterGain → _compressor → masterGainNode
+	// Chain: synth output -> _masterGain -> _compressor -> masterGainNode
 	_masterGain = ctx.createGain();
-	_masterGain.gain.value = _volume;
+	_masterGain.gain.value = effectiveOutputGain();
 	_masterGain.connect( _compressor );
 	_compressor.connect( masterGainNode );
 
+	_usingWorklet = await opl_set_audio_graph( ctx, _masterGain );
+	_masterGain.gain.value = effectiveOutputGain();
+
 }
 
-// Ensure AudioContext exists (falls back to creating its own if none shared)
 function ensureAudioContext() {
 
 	if ( _audioContext !== null ) return true;
@@ -460,6 +211,7 @@ function ensureAudioContext() {
 	try {
 
 		_audioContext = new ( window.AudioContext || window.webkitAudioContext )();
+		_usingWorklet = false;
 
 		_compressor = _audioContext.createDynamicsCompressor();
 		_compressor.threshold.value = - 12;
@@ -469,9 +221,15 @@ function ensureAudioContext() {
 		_compressor.release.value = 0.1;
 
 		_masterGain = _audioContext.createGain();
-		_masterGain.gain.value = _volume;
+		_masterGain.gain.value = effectiveOutputGain();
 		_masterGain.connect( _compressor );
 		_compressor.connect( _audioContext.destination );
+
+		// This path exists only when the digital-audio subsystem did not provide
+		// its shared context.  Keep it wholly on the synchronous fallback backend;
+		// switching an already-scheduled song to a late worklet would split voices
+		// between two synthesizers.
+		void opl_set_audio_graph( _audioContext, _masterGain, false );
 
 		return true;
 
@@ -484,16 +242,100 @@ function ensureAudioContext() {
 
 }
 
-// Play a song by index
+function findFirstEventAfter( time ) {
+
+	if ( _events === null ) return 0;
+
+	for ( let i = 0; i < _events.length; i ++ ) {
+
+		if ( _events[ i ].time > time ) return i;
+
+	}
+
+	return _events.length;
+
+}
+
+function configureSongTiming( parsedDuration ) {
+
+	_songDuration = Math.max(
+		_events[ _events.length - 1 ].time,
+		Number.isFinite( parsedDuration ) ? parsedDuration : 0
+	);
+
+	if ( _songDuration <= 0 ) {
+
+		_songDuration = 0.01;
+
+	}
+
+	_hasLoopMarkers = false;
+	_loopStartTime = 0;
+	_loopStartEventIndex = 0;
+	_loopDuration = _songDuration;
+	_playbackEndTime = _songDuration;
+	_playbackEndIndex = _events.length;
+
+	let markerStart = - 1;
+	let markerStartEventIndex = - 1;
+	let markerEnd = - 1;
+
+	for ( let i = 0; i < _events.length; i ++ ) {
+
+		const ev = _events[ i ];
+		if ( ev.type !== 0xB ) continue;
+
+		if ( markerStart < 0 && ev.data1 === 110 ) {
+
+			markerStart = ev.time;
+			markerStartEventIndex = i;
+
+		} else if ( markerStart >= 0 && ev.data1 === 111 && ev.time >= markerStart ) {
+
+			markerEnd = ev.time;
+			break;
+
+		}
+
+	}
+
+	if ( markerStart >= 0 && markerEnd > markerStart ) {
+
+		_hasLoopMarkers = true;
+		_loopStartTime = markerStart;
+		_loopStartEventIndex = markerStartEventIndex;
+		_playbackEndTime = markerEnd;
+		_playbackEndIndex = findFirstEventAfter( _playbackEndTime );
+		_loopDuration = _playbackEndTime - _loopStartTime;
+
+	}
+
+}
+
 export function songs_play_song( songnum, loop ) {
 
 	if ( _hogFile === null ) return;
+	if ( Number.isInteger( songnum ) !== true || songnum < 0 || songnum >= _songs.length ) {
 
-	// Stop current song
+		console.warn( 'SONGS: Invalid song number ' + songnum );
+		return;
+
+	}
+
+	const song = _songs[ songnum ];
+	const filename = song?.filename || null;
+	const file = filename !== null ? _hogFile.findFile( filename ) : null;
+
+	// DXX preserves the current level track when the optional end-level song is
+	// absent.  Shareware intentionally has no end-level HMP.
+	if ( songnum === SONG_ENDLEVEL && _currentSong >= SONG_LEVEL_MUSIC && file === null ) {
+
+		console.log( 'SONGS: End-level music unavailable; keeping current level song' );
+		return;
+
+	}
+
 	songs_stop();
-
-	// Get filename
-	const filename = ( songnum < SHAREWARE_SONGS.length ) ? SHAREWARE_SONGS[ songnum ] : null;
 
 	if ( filename === null ) {
 
@@ -502,12 +344,22 @@ export function songs_play_song( songnum, loop ) {
 
 	}
 
-	// Load HMP from HOG
-	const file = _hogFile.findFile( filename );
+	// DIGI.C remembers every non-null MIDI request before opening or loading it.
+	// If music is disabled, restoring the volume later retries this song and
+	// forces looping, matching digi_set_midi_volume().
+	_lastRequestedSong = songnum;
+	_restartSongWhenAudible = true;
 
 	if ( file === null ) {
 
 		console.warn( 'SONGS: ' + filename + ' not found in HOG' );
+		return;
+
+	}
+
+	if ( hmiMasterVolume() < 1 ) {
+
+		console.log( 'SONGS: Music disabled; deferring ' + filename );
 		return;
 
 	}
@@ -522,7 +374,6 @@ export function songs_play_song( songnum, loop ) {
 
 	}
 
-	// Get flattened event list with absolute times in seconds
 	_events = hmp_get_events( hmpFile );
 
 	if ( _events.length === 0 ) {
@@ -532,61 +383,77 @@ export function songs_play_song( songnum, loop ) {
 
 	}
 
-	// Find song duration
-	_songDuration = _events[ _events.length - 1 ].time + 1.0;
+	configureSongTiming( hmp_get_duration( hmpFile ) );
 
 	if ( ensureAudioContext() !== true ) return;
+	if ( opl_init( _hogFile, song.melodicBank, song.drumBank ) !== true ) {
 
-	// Resume if suspended
+		console.warn( 'SONGS: Failed to load instrument banks for ' + filename );
+		return;
+
+	}
+
 	if ( _audioContext.state === 'suspended' ) {
 
 		_audioContext.resume();
 
 	}
 
-	// Reset channel state
-	for ( let i = 0; i < NUM_CHANNELS; i ++ ) {
+	opl_reset_channels();
 
-		_channels[ i ].program = 0;
-		_channels[ i ].volume = 100;
-		_channels[ i ].pan = 64;
-		_channels[ i ].expression = 127;
-		_channels[ i ].pitchBend = 0;
-
-	}
-
-	// Start playback
 	_currentSong = songnum;
 	_playing = true;
+	_restartSongWhenAudible = false;
 	_looping = ( loop === true || loop === 1 );
 	_eventIndex = 0;
-	_startTime = _audioContext.currentTime + 0.1; // small delay for scheduling
-	_scheduledUntil = 0;
+	_startTime = _audioContext.currentTime + 0.1;
+	_nextSectionEndTime = _startTime + _playbackEndTime;
 
-	// Schedule events in chunks
 	scheduleNextChunk();
 
 	console.log( 'SONGS: Playing ' + filename + ' (' + _events.length + ' events, ' +
-		_songDuration.toFixed( 1 ) + 's' + ( _looping ? ', looping' : '' ) + ')' );
+		_songDuration.toFixed( 1 ) + 's' + ( _looping ? ', looping' : '' ) +
+		( _hasLoopMarkers ? ', loop markers ' + _loopStartTime.toFixed( 3 ) + 's-' + _playbackEndTime.toFixed( 3 ) + 's' : '' ) +
+		')' );
 
 }
 
-// Play level music
 export function songs_play_level_song( levelnum ) {
 
-	// Map level number to song index
-	// Shareware has 5 game tracks (game0-4.hmp) cycling through 7 levels
-	const songIndex = SONG_LEVEL_MUSIC + ( ( levelnum - 1 ) % 5 );
-	songs_play_song( songIndex, true );
+	if ( Number.isInteger( levelnum ) !== true || levelnum === 0 || NUM_GAME_SONGS <= 0 ) {
+
+		console.warn( 'SONGS: Invalid level number ' + levelnum );
+		return;
+
+	}
+
+	// Ported from SONGS.C: negative level numbers are secret levels and index
+	// directly by -levelnum; normal levels index by (levelnum-1).
+	const songnum = ( levelnum < 0 )
+		? ( ( - levelnum ) % NUM_GAME_SONGS )
+		: ( ( levelnum - 1 ) % NUM_GAME_SONGS );
+
+	songs_play_song( SONG_LEVEL_MUSIC + songnum, true );
 
 }
 
-// Stop current song
 export function songs_stop() {
+
+	// D1 keeps the last non-null song request after stopping.  A later
+	// zero-to-audible volume transition restarts it if no song handle exists.
+	if ( _lastRequestedSong >= 0 ) _restartSongWhenAudible = true;
 
 	_playing = false;
 	_currentSong = - 1;
 	_events = null;
+	_songDuration = 0;
+	_playbackEndTime = 0;
+	_playbackEndIndex = 0;
+	_loopStartTime = 0;
+	_loopStartEventIndex = 0;
+	_loopDuration = 0;
+	_nextSectionEndTime = 0;
+	_hasLoopMarkers = false;
 
 	if ( _scheduleTimer !== null ) {
 
@@ -595,608 +462,130 @@ export function songs_stop() {
 
 	}
 
-	// Stop all active notes
-	stopAllNotes();
+	opl_stop_all_notes();
 
 }
 
-// Pause current song (remember position for resume)
-let _pauseTime = 0;
+// MENU.C stops a muted MIDI handle only when the Options screen closes.  This
+// lets the slider mute/unmute the current position while it is still open,
+// while a later visit restarts the remembered song from its beginning.
+export function songs_stop_if_silent() {
+
+	if ( hmiMasterVolume() < 1 ) songs_stop();
+
+}
 
 export function songs_pause() {
 
-	if ( _playing !== true ) return;
-	if ( _audioContext === null ) return;
-
-	_pauseTime = _audioContext.currentTime - _startTime;
-	_playing = false;
-
-	if ( _scheduleTimer !== null ) {
-
-		clearTimeout( _scheduleTimer );
-		_scheduleTimer = null;
-
-	}
-
-	stopAllNotes();
+	_paused = true;
+	if ( _masterGain !== null ) _masterGain.gain.value = 0;
 
 }
 
-// Resume paused song from saved position
 export function songs_resume_playback() {
 
-	if ( _events === null || _pauseTime <= 0 ) return;
-	if ( _audioContext === null ) return;
-
-	_playing = true;
-	_startTime = _audioContext.currentTime - _pauseTime;
-
-	// Find the event index that corresponds to our resume position
-	_eventIndex = 0;
-	for ( let i = 0; i < _events.length; i ++ ) {
-
-		if ( _events[ i ].time > _pauseTime ) break;
-		_eventIndex = i + 1;
-
-	}
-
-	scheduleNextChunk();
+	_paused = false;
+	if ( _masterGain !== null ) _masterGain.gain.value = effectiveOutputGain();
 
 }
 
-// Set music volume (0.0 to 1.0)
 export function songs_set_volume( vol ) {
 
-	_volume = vol;
+	if ( Number.isFinite( vol ) !== true ) return false;
+	const oldMasterVolume = hmiMasterVolume();
+	_volume = Math.max( 0, Math.min( 1, vol ) );
+	const newMasterVolume = hmiMasterVolume();
+	opl_set_master_volume( newMasterVolume );
 
 	if ( _masterGain !== null ) {
 
-		_masterGain.gain.value = vol;
+		_masterGain.gain.value = effectiveOutputGain();
 
 	}
 
+	// DIGI.C uses > 1 here (rather than merely non-zero).  Normal Descent
+	// settings move in sixteen-step increments, so this distinction only
+	// affects direct API callers but is retained exactly.
+	if ( oldMasterVolume < 1 && newMasterVolume > 1 &&
+		_restartSongWhenAudible === true && _lastRequestedSong >= 0 ) {
+
+		songs_play_song( _lastRequestedSong, true );
+
+	}
+	return true;
+
 }
 
-// Schedule the next chunk of MIDI events
 function scheduleNextChunk() {
 
 	if ( _playing !== true || _events === null ) return;
 
-	const SCHEDULE_AHEAD = 2.0; // schedule 2 seconds ahead
-	const now = _audioContext.currentTime;
-	const songTime = now - _startTime;
-	const scheduleUntilTime = songTime + SCHEDULE_AHEAD;
-
-	while ( _eventIndex < _events.length ) {
-
-		const ev = _events[ _eventIndex ];
-
-		if ( ev.time > scheduleUntilTime ) break;
-
-		const playTime = _startTime + ev.time;
-
-		// Only schedule if in the future
-		if ( playTime >= now - 0.01 ) {
-
-			processMidiEvent( ev, playTime );
-
-		}
-
-		_eventIndex ++;
-
-	}
-
-	// Check if song is done
-	if ( _eventIndex >= _events.length ) {
-
-		if ( _looping === true ) {
-
-			// Restart song
-			_eventIndex = 0;
-			_startTime = _startTime + _songDuration;
-
-			// Reset channels
-			for ( let i = 0; i < NUM_CHANNELS; i ++ ) {
-
-				_channels[ i ].program = 0;
-				_channels[ i ].volume = 100;
-				_channels[ i ].pan = 64;
-				_channels[ i ].expression = 127;
-				_channels[ i ].pitchBend = 0;
-
-			}
-
-		} else {
-
-			_playing = false;
-			return;
-
-		}
-
-	}
-
-	// Schedule next chunk
-	_scheduleTimer = setTimeout( scheduleNextChunk, 500 );
-
-}
-
-// Process a single MIDI event
-function processMidiEvent( ev, playTime ) {
-
-	const ch = ev.channel;
-
-	switch ( ev.type ) {
-
-		case 0x8: // Note Off
-			scheduleNoteOff( ch, ev.data1, playTime );
-			break;
-
-		case 0x9: // Note On
-			if ( ev.data2 === 0 ) {
-
-				// velocity 0 = note off
-				scheduleNoteOff( ch, ev.data1, playTime );
-
-			} else {
-
-				scheduleNoteOn( ch, ev.data1, ev.data2, playTime );
-
-			}
-
-			break;
-
-		case 0xB: // Control Change
-			handleControlChange( ch, ev.data1, ev.data2 );
-			break;
-
-		case 0xC: // Program Change
-			_channels[ ch ].program = ev.data1;
-			break;
-
-		case 0xE: // Pitch Bend
-			handlePitchBend( ch, ev.data1, ev.data2, playTime );
-			break;
-
-	}
-
-}
-
-// Schedule a note-on using OPL2-accurate 2-operator FM synthesis
-// Modulator → Carrier topology with exact bank file parameters
-function scheduleNoteOn( channel, note, velocity, time ) {
-
-	if ( _audioContext === null ) return;
-
-	// Stop any existing note on this channel/pitch with a short fade to avoid click
-	const key = channel + '-' + note;
-	const existing = _activeNotes.get( key );
-
-	if ( existing !== undefined ) {
-
-		try {
-
-			existing.noteGain.gain.cancelAndHoldAtTime( time );
-			existing.noteGain.gain.linearRampToValueAtTime( 0, time + 0.003 );
-			existing.carrier.stop( time + 0.005 );
-			existing.modulator.stop( time + 0.005 );
-
-		} catch ( e ) { /* already stopped */ }
-
-		_activeNotes.delete( key );
-
-		// Free voice slot
-		for ( let vs = 0; vs < _voiceSlots.length; vs ++ ) {
-
-			if ( _voiceSlots[ vs ].key === key ) {
-
-				_voiceSlots.splice( vs, 1 );
-				break;
-
-			}
-
-		}
-
-	}
-
-	// OPL2 9-voice polyphony limit: steal oldest voice if all slots full
-	if ( _voiceSlots.length >= OPL2_NUM_VOICES ) {
-
-		// Steal the oldest voice (first in array = earliest startTime)
-		const oldest = _voiceSlots.shift();
-		const oldNote = _activeNotes.get( oldest.key );
-
-		if ( oldNote !== undefined ) {
-
-			try {
-
-				oldNote.noteGain.gain.cancelAndHoldAtTime( time );
-				oldNote.noteGain.gain.linearRampToValueAtTime( 0, time + 0.003 );
-				oldNote.carrier.stop( time + 0.005 );
-				oldNote.modulator.stop( time + 0.005 );
-
-			} catch ( e ) { /* already stopped */ }
-
-			_activeNotes.delete( oldest.key );
-
-		}
-
-	}
-
-	// Get OPL patch from instrument program
-	const program = _channels[ channel ].program;
-	const opl = getOplPatch( program );
-	const freq = midiToFreq( note );
-	const vel = velocity / 127;
-
-	// --- Convert OPL2 register values to Web Audio parameters ---
-
-	// Frequency multipliers
-	const modFreq = freq * oplMultiplier( opl.mod.mult );
-	const carFreq = freq * oplMultiplier( opl.car.mult );
-
-	// Modulator depth from total level (attenuation → linear gain)
-	// In OPL2, modulator output modulates carrier phase. Web Audio FM works in Hz,
-	// so we convert: modDepth_Hz = modIndex * carrierFreq
-	// OPL2 at TL=0 produces ~4π radians of peak phase deviation
-	const modKSL = oplKeyScaleLevel( opl.mod.ksl, note );
-	const modDepthScale = oplTotalLevel( opl.mod.tl ) * modKSL;
-	const peakMod = modDepthScale * carFreq * 8.0; // velocity does NOT affect modulator (OPL2 spec)
-
-	// Carrier output level from total level (with KSL attenuation)
-	const carKSL = oplKeyScaleLevel( opl.car.ksl, note );
-	const carLevel = oplTotalLevel( opl.car.tl ) * carKSL;
-
-	// KSR: key scale rate — faster envelopes for higher notes
-	const modKSR = oplKeyScaleRate( opl.mod.ksr, note );
-	const carKSR = oplKeyScaleRate( opl.car.ksr, note );
-
-	// ADSR times (divided by KSR multiplier for faster high-note envelopes)
-	const modAR = oplAttackRate( opl.mod.ar ) / modKSR;
-	const modDR = oplDecayRate( opl.mod.dr ) / modKSR;
-	const modSL = oplSustainLevel( opl.mod.sl );
-	const modRR = oplDecayRate( opl.mod.rr ) / modKSR;
-	const carAR = oplAttackRate( opl.car.ar ) / carKSR;
-	const carDR = oplDecayRate( opl.car.dr ) / carKSR;
-	const carSL = oplSustainLevel( opl.car.sl );
-	const carRR = oplDecayRate( opl.car.rr ) / carKSR;
-
-	// EG type: 0 = non-sustaining (after decay, continues at release rate to silence)
-	const modSustaining = opl.mod.eg === 1;
-	const carSustaining = opl.car.eg === 1;
-
-	// --- Modulator oscillator ---
-	// Waveform includes pre-computed feedback (baked into PeriodicWave)
-	const modulator = _audioContext.createOscillator();
-	const modWave = getOplWaveform( opl.mod.wave, opl.mod.fb );
-
-	if ( modWave !== null ) {
-
-		modulator.setPeriodicWave( modWave );
-
-	} else {
-
-		modulator.type = 'sine';
-
-	}
-
-	modulator.frequency.value = modFreq;
-
-	// Modulator depth envelope (controls FM brightness over time)
-	// OPL2: attack is exponential (fast rise then taper), decay is exponential in amplitude
-	const modGain = _audioContext.createGain();
-	modGain.gain.setValueAtTime( 0, time );
-
-	if ( peakMod > 0.1 ) {
-
-		const modSustainVal = modSustaining === true ? Math.max( peakMod * modSL, 0.0001 ) : 0.0001;
-
-		// OPL2 attack: exponential approach (fast start, tapers off)
-		// setTargetAtTime approximates this: reaches ~95% at 3×timeConstant
-		modGain.gain.setTargetAtTime( peakMod, time, modAR / 3 );
-
-		// OPL2 decay: exponential decay in amplitude (linear in dB)
-		modGain.gain.setTargetAtTime( modSustainVal, time + modAR, modDR / 3 );
-
-		// Non-sustaining: after decay phase, continue at release rate to silence
-		if ( modSustaining !== true ) {
-
-			modGain.gain.setTargetAtTime( 0.0001, time + modAR + modDR, modRR / 3 );
-
-		}
-
-	}
-
-	modulator.connect( modGain );
-
-	// --- Carrier oscillator (audible output) ---
-	const carrier = _audioContext.createOscillator();
-	const carWave = getOplWaveform( opl.car.wave, 0 ); // carrier never has feedback
-
-	if ( carWave !== null ) {
-
-		carrier.setPeriodicWave( carWave );
-
-	} else {
-
-		carrier.type = 'sine';
-
-	}
-
-	carrier.frequency.value = carFreq;
-
-	// Connect modulator → carrier frequency (FM)
-	modGain.connect( carrier.frequency );
-
-	// Apply pitch bend to BOTH operators (OPL2 changes channel frequency for both)
-	if ( _channels[ channel ].pitchBend !== 0 ) {
-
-		carrier.detune.setValueAtTime( _channels[ channel ].pitchBend, time );
-		modulator.detune.setValueAtTime( _channels[ channel ].pitchBend, time );
-
-	}
-
-	// --- Carrier amplitude ADSR envelope ---
-	const noteGain = _audioContext.createGain();
-
-	// Volume: velocity² × channel volume × expression × carrier level
-	// Velocity only affects carrier (OPL2 spec: velocity maps to carrier TL only)
-	const velSq = vel * vel;
-	const channelVol = _channels[ channel ].volume / 127;
-	const expression = _channels[ channel ].expression / 127;
-	const vol = velSq * channelVol * expression * carLevel * 0.18;
-
-	const carSustainVal = carSustaining === true ? Math.max( vol * carSL, 0.0001 ) : 0.0001;
-
-	// OPL2 attack: exponential approach curve
-	noteGain.gain.setValueAtTime( 0, time );
-	noteGain.gain.setTargetAtTime( vol, time, carAR / 3 );
-
-	// OPL2 decay: exponential decay in amplitude
-	noteGain.gain.setTargetAtTime( carSustainVal, time + carAR, carDR / 3 );
-
-	// Non-sustaining carrier: after decay, continue at release rate to silence
-	if ( carSustaining !== true ) {
-
-		noteGain.gain.setTargetAtTime( 0.0001, time + carAR + carDR, carRR / 3 );
-
-	}
-
-	// --- OPL2 Vibrato (VIB) — frequency modulation at 6.1 Hz ---
-	// Applied to carrier frequency as detune in cents
-	let vibLfo = null;
-
-	if ( opl.car.vib === 1 || opl.mod.vib === 1 ) {
-
-		vibLfo = _audioContext.createOscillator();
-		vibLfo.frequency.value = 6.1; // OPL2 vibrato rate
-		vibLfo.type = 'sine';
-
-		// OPL2 shallow vibrato depth: ~7 cents
-		if ( opl.car.vib === 1 ) {
-
-			const vibCarGain = _audioContext.createGain();
-			vibCarGain.gain.value = 7.0; // 7 cents peak deviation
-			vibLfo.connect( vibCarGain );
-			vibCarGain.connect( carrier.detune );
-
-		}
-
-		if ( opl.mod.vib === 1 ) {
-
-			const vibModGain = _audioContext.createGain();
-			vibModGain.gain.value = 7.0;
-			vibLfo.connect( vibModGain );
-			vibModGain.connect( modulator.detune );
-
-		}
-
-		vibLfo.start( time );
-		vibLfo.stop( time + Math.min( ( carSustaining === true ) ? 10.0 : ( carAR + carDR + carRR + 1.0 ), 10.0 ) );
-
-	}
-
-	// --- OPL2 Tremolo (AM) — amplitude modulation at 3.7 Hz ---
-	// Applied to carrier output gain
-	let amLfo = null;
-	let amGain = null;
-
-	if ( opl.car.am === 1 ) {
-
-		// AM creates a gain node oscillating between (1 - depth) and 1.0
-		// OPL2 shallow AM depth: 1.0 dB ≈ ±0.06 linear
-		amLfo = _audioContext.createOscillator();
-		amLfo.frequency.value = 3.7; // OPL2 tremolo rate
-		amLfo.type = 'sine';
-
-		amGain = _audioContext.createGain();
-		amGain.gain.value = 1.0; // base = unity
-
-		const amDepthNode = _audioContext.createGain();
-		amDepthNode.gain.value = 0.06; // 1.0 dB ≈ 0.06 linear
-		amLfo.connect( amDepthNode );
-		amDepthNode.connect( amGain.gain );
-
-		amLfo.start( time );
-		amLfo.stop( time + Math.min( ( carSustaining === true ) ? 10.0 : ( carAR + carDR + carRR + 1.0 ), 10.0 ) );
-
-		// Insert AM gain between carrier output and noteGain
-		carrier.connect( amGain );
-		amGain.connect( noteGain );
-
-	} else {
-
-		carrier.connect( noteGain );
-
-	}
-
-	// --- Build output chain ---
-
-	// Pan: map MIDI 0-127 to Web Audio -1 to +1
-	const panValue = ( _channels[ channel ].pan - 64 ) / 64;
-	let panNode = null;
-
-	if ( typeof _audioContext.createStereoPanner === 'function' ) {
-
-		panNode = _audioContext.createStereoPanner();
-		panNode.pan.setValueAtTime( panValue, time );
-		noteGain.connect( panNode );
-		panNode.connect( _masterGain );
-
-	} else {
-
-		noteGain.connect( _masterGain );
-
-	}
-
-	carrier.start( time );
-	modulator.start( time );
-
-	// Auto-stop: max note duration (non-sustaining notes stop sooner)
-	const maxDuration = ( carSustaining === true ) ? 10.0 : ( carAR + carDR + carRR + 1.0 );
-	const stopTime = time + Math.min( maxDuration, 10.0 );
-	carrier.stop( stopTime );
-	modulator.stop( stopTime );
-
-	_activeNotes.set( key, {
-		carrier: carrier,
-		modulator: modulator,
-		noteGain: noteGain,
-		modGain: modGain,
-		pan: panNode,
-		carRR: carRR,
-		modRR: modRR,
-		endTime: stopTime
-	} );
-
-	// Register in voice slot tracker (oldest first for FIFO stealing)
-	_voiceSlots.push( { key: key, startTime: time } );
-
-}
-
-// Schedule a note-off with OPL2-style release envelopes
-// Uses exponential decay (setTargetAtTime) matching OPL2's linear-in-dB release
-function scheduleNoteOff( channel, note, time ) {
-
-	const key = channel + '-' + note;
-	const active = _activeNotes.get( key );
-
-	if ( active === undefined ) return;
-
-	const carRelease = active.carRR;
-	const modRelease = active.modRR;
-	const maxRelease = Math.max( carRelease, modRelease );
-	const stopTime = time + maxRelease + 0.1;
-
-	try {
-
-		// Cancel any scheduled automation and freeze at current value
-		active.noteGain.gain.cancelAndHoldAtTime( time );
-		// OPL2 release: exponential decay in amplitude
-		active.noteGain.gain.setTargetAtTime( 0.0001, time, carRelease / 3 );
-
-		active.modGain.gain.cancelAndHoldAtTime( time );
-		active.modGain.gain.setTargetAtTime( 0.0001, time, modRelease / 3 );
-
-		active.carrier.stop( stopTime );
-		active.modulator.stop( stopTime );
-
-	} catch ( e ) { /* already stopped */ }
-
-	_activeNotes.delete( key );
-
-	// Free voice slot
-	for ( let vs = 0; vs < _voiceSlots.length; vs ++ ) {
-
-		if ( _voiceSlots[ vs ].key === key ) {
-
-			_voiceSlots.splice( vs, 1 );
-			break;
-
-		}
-
-	}
-
-}
-
-// Handle MIDI Control Change
-function handleControlChange( channel, controller, value ) {
-
-	switch ( controller ) {
-
-		case 7: // Channel Volume
-			_channels[ channel ].volume = value;
-			break;
-
-		case 10: // Pan
-			_channels[ channel ].pan = value;
-			break;
-
-		case 11: // Expression
-			_channels[ channel ].expression = value;
-			break;
-
-		case 121: // Reset All Controllers
-			_channels[ channel ].volume = 100;
-			_channels[ channel ].pan = 64;
-			_channels[ channel ].expression = 127;
-			_channels[ channel ].pitchBend = 0;
-			break;
-
-	}
-
-}
-
-// Handle MIDI Pitch Bend
-// Pitch bend value: (data2 << 7) | data1, centered at 8192
-// Range: ±2 semitones (±200 cents)
-function handlePitchBend( channel, data1, data2, playTime ) {
-
-	const bendValue = ( ( data2 << 7 ) | data1 ) - 8192;	// -8192 to +8191
-	const bendCents = ( bendValue / 8192 ) * 200;			// ±200 cents = ±2 semitones
-	_channels[ channel ].pitchBend = bendCents;
-
-	// Apply to all active notes on this channel (both carrier AND modulator)
-	for ( const [ key, active ] of _activeNotes ) {
-
-		if ( key.startsWith( channel + '-' ) === true ) {
-
-			try {
-
-				active.carrier.detune.setValueAtTime( bendCents, playTime );
-				active.modulator.detune.setValueAtTime( bendCents, playTime );
-
-			} catch ( e ) { /* oscillator may have stopped */ }
-
-		}
-
-	}
-
-}
-
-// Stop all currently sounding notes
-function stopAllNotes() {
-
-	if ( _audioContext === null ) return;
-
+	const SCHEDULE_AHEAD = 2.0;
+	const MAX_WRAP_PASSES = 4;
 	const now = _audioContext.currentTime;
 
-	for ( const [ key, active ] of _activeNotes ) {
+	let wrapPasses = 0;
 
-		try {
+	while ( wrapPasses < MAX_WRAP_PASSES ) {
 
-			active.noteGain.gain.cancelScheduledValues( now );
-			active.noteGain.gain.setValueAtTime( 0, now );
-			active.modGain.gain.cancelScheduledValues( now );
-			active.modGain.gain.setValueAtTime( 0, now );
-			active.carrier.stop( now + 0.01 );
-			active.modulator.stop( now + 0.01 );
+		const songTime = now - _startTime;
+		const scheduleUntilTime = songTime + SCHEDULE_AHEAD;
 
-		} catch ( e ) { /* already stopped */ }
+		while ( _eventIndex < _playbackEndIndex ) {
+
+			const ev = _events[ _eventIndex ];
+
+			if ( ev.time > scheduleUntilTime ) break;
+
+			// A throttled/background tab can wake after the two-second lookahead has
+			// expired.  The HMP stream still consumes every event in order; schedule
+			// overdue events at the current audio time instead of dropping note-offs,
+			// program changes, or controller state.
+			const playTime = Math.max( now, _startTime + ev.time );
+			opl_process_midi_event( ev, playTime );
+
+			_eventIndex ++;
+
+		}
+
+		if ( _eventIndex < _playbackEndIndex ) break;
+
+		if ( _looping !== true || _loopDuration <= 0 ) {
+
+			if ( now >= _nextSectionEndTime - 0.01 ) {
+
+				_playing = false;
+				return;
+
+			}
+
+			break;
+
+		}
+
+		_eventIndex = ( _hasLoopMarkers === true ) ? _loopStartEventIndex : 0;
+		_startTime += _loopDuration;
+		_nextSectionEndTime += _loopDuration;
+		wrapPasses ++;
 
 	}
 
-	_activeNotes.clear();
-	_voiceSlots.length = 0;
+	let delayMs = 50;
+
+	if ( _eventIndex >= _playbackEndIndex ) {
+
+		const remainingMs = Math.max( 10, ( _nextSectionEndTime - _audioContext.currentTime ) * 1000 );
+		delayMs = Math.min( 100, remainingMs );
+
+	}
+
+	if ( wrapPasses >= MAX_WRAP_PASSES ) {
+
+		delayMs = 20;
+
+	}
+
+	_scheduleTimer = setTimeout( scheduleNextChunk, delayMs );
 
 }
 

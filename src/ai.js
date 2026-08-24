@@ -2,45 +2,375 @@
 // Robot AI: awareness, rotation, firing, movement
 
 import { find_point_seg, compute_center_point_on_side, compute_segment_center } from './gameseg.js';
-import { find_vector_intersection, HIT_NONE, HIT_WALL, HIT_BAD_P0 } from './fvi.js';
+import { find_vector_intersection, sphere_intersects_wall, HIT_NONE, HIT_WALL, HIT_BAD_P0 } from './fvi.js';
 import { Laser_create_new, PARENT_ROBOT, PROXIMITY_ID, laser_get_weapon } from './laser.js';
-import { object_create_explosion } from './fireball.js';
+import { object_create_explosion, VCLIP_MORPHING_ROBOT } from './fireball.js';
 import { Weapon_info } from './weapon.js';
-import { digi_play_sample_3d, SOUND_LASER_FIRED, SOUND_BOSS_SHARE_SEE, SOUND_BOSS_SHARE_DIE } from './digi.js';
-import { Robot_info, N_robot_types,
+import { digi_play_sample_world, digi_kill_sound_linked_to_object,
+	digi_link_sound_to_object2,
+	SOUND_BOSS_SHARE_SEE, SOUND_BOSS_SHARE_DIE } from './digi.js';
+import { Robot_info, N_robot_types, Vclips,
 	N_ANIM_STATES, AS_REST, AS_ALERT, AS_FIRE, AS_RECOIL, AS_FLINCH,
 	AIS_NONE, AIS_REST, AIS_SRCH, AIS_LOCK, AIS_FLIN, AIS_FIRE, AIS_RECO, AIS_ERR_,
 	Mike_to_matt_xlate, ANIM_RATE, Flinch_scale, Attack_scale } from './bm.js';
-import { Segments, Num_segments, Walls, GameTime } from './mglobal.js';
+import { Vertices, Segments, Num_segments, Walls, GameTime } from './mglobal.js';
 import { IS_CHILD, MAX_SIDES_PER_SEGMENT } from './segment.js';
 import { wall_open_door, wall_is_doorway, WID_FLY_FLAG, WALL_DOOR, WALL_DOOR_CLOSED, WALL_DOOR_LOCKED, KEY_NONE } from './wall.js';
 import { create_path_to_player, create_path_to_station, create_n_segment_path,
 	ai_follow_path, check_line_of_sight, aipath_reset,
 	aipath_set_externals, aipath_set_frame_count } from './aipath.js';
-import { Polygon_models, polyobj_calc_gun_points } from './polyobj.js';
+import { Polygon_models, polyobj_set_anim_angles, polyobj_set_cloak,
+	polyobj_update_cloak_render } from './polyobj.js';
+import { OBJ_ROBOT, OF_SHOULD_BE_DEAD, PF_BOUNCE, PF_TURNROLL, PF_USES_THRUST,
+	PF_PERSISTENT, obj_relink } from './object.js';
+import { vm_vector_2_matrix } from './vecmat.js';
+
+function playWeaponFlashSoundAt( weaponType, segnum, pos_x, pos_y, pos_z ) {
+
+	if ( weaponType < 0 || weaponType >= Weapon_info.length ) return;
+	const sound = Weapon_info[ weaponType ].flash_sound;
+	if ( sound < 0 ) return;
+	digi_play_sample_world( sound, 1.0, segnum, pos_x, pos_y, pos_z );
+
+}
+
+function relink_robot( robot, newsegnum ) {
+
+	const obj = robot.obj;
+	if ( obj.segnum === newsegnum ) return;
+
+	if ( robot.objnum !== undefined && robot.objnum >= 0 ) {
+
+		obj_relink( robot.objnum, newsegnum );
+
+	} else {
+
+		// Runtime spawns are canonicalized in a separate lifecycle path.
+		obj.segnum = newsegnum;
+
+	}
+
+}
+
+function mark_robot_dead( robot ) {
+
+	robot.alive = false;
+	const explosionPending = robot_has_pending_explosion( robot );
+	if ( explosionPending !== true ) {
+
+		robot.obj.flags |= OF_SHOULD_BE_DEAD;
+
+	}
+
+}
+
+function robot_has_pending_explosion( robot ) {
+
+	return ( Number.isFinite( robot.explosionDelay ) === true &&
+		robot.explosionDelay >= 0 ) ||
+		( Number.isFinite( robot.explosionDeleteDelay ) === true &&
+			robot.explosionDeleteDelay >= 0 );
+
+}
 
 // ------- Gun point calculation -------
 // Ported from: calc_gun_point() in ROBOT.C lines 169-213
 // Computes world-space gun position for a robot given its model, orientation, and gun number
 
-// Cache of model-local gun points per model_num (computed once, reused)
-// Key: model_num, Value: array of { x, y, z } in model-local space
+// Cache immutable gun definitions; current joint angles are applied per shot.
+// Key: model_num, Value: array of { x, y, z, submodel }
 const _gunPointCache = {};
 
 // Pre-allocated result object (Golden Rule #5)
 const _gunPoint = { x: 0, y: 0, z: 0 };
 
-// Get model-local gun points for a model (cached)
-function get_model_gun_points( model_num ) {
+const ROBOT_PHYSICS_STEP = 1.0 / 64.0;
+const ROBOT_TURNROLL_SCALE = ( 0x4ec4 / 2 ) / 65536.0;
+const ROBOT_ROLL_RATE = Math.PI / 4.0;
 
-	if ( _gunPointCache[ model_num ] !== undefined ) return _gunPointCache[ model_num ];
+function apply_robot_local_rotation( robot, pitch, heading, bank ) {
+
+	if ( pitch === 0 && heading === 0 && bank === 0 ) return;
+	const obj = robot.obj;
+	const sinp = Math.sin( pitch ), cosp = Math.cos( pitch );
+	const sinb = Math.sin( bank ), cosb = Math.cos( bank );
+	const sinh = Math.sin( heading ), cosh = Math.cos( heading );
+
+	// vm_angles_2_matrix(), followed by the local post-rotation performed by
+	// do_physics_sim_rot().  Object orientation stores its right/up/forward
+	// basis as columns of the local-to-world transform.
+	const m1 = cosb * cosh + sinb * sinp * sinh;
+	const m2 = cosb * sinh * sinp - sinb * cosh;
+	const m3 = sinh * cosp;
+	const m4 = sinb * cosp;
+	const m5 = cosb * cosp;
+	const m6 = - sinp;
+	const m7 = sinb * cosh * sinp - cosb * sinh;
+	const m8 = sinb * sinh + cosb * cosh * sinp;
+	const m9 = cosh * cosp;
+
+	const rx = obj.orient_rvec_x, ry = obj.orient_rvec_y, rz = obj.orient_rvec_z;
+	const ux = obj.orient_uvec_x, uy = obj.orient_uvec_y, uz = obj.orient_uvec_z;
+	const fx = obj.orient_fvec_x, fy = obj.orient_fvec_y, fz = obj.orient_fvec_z;
+
+	let new_rx = rx * m1 + ux * m4 + fx * m7;
+	let new_ry = ry * m1 + uy * m4 + fy * m7;
+	let new_rz = rz * m1 + uz * m4 + fz * m7;
+	let new_ux = rx * m2 + ux * m5 + fx * m8;
+	let new_uy = ry * m2 + uy * m5 + fy * m8;
+	let new_uz = rz * m2 + uz * m5 + fz * m8;
+	let new_fx = rx * m3 + ux * m6 + fx * m9;
+	let new_fy = ry * m3 + uy * m6 + fy * m9;
+	let new_fz = rz * m3 + uz * m6 + fz * m9;
+
+	obj.orient_rvec_x = new_rx; obj.orient_rvec_y = new_ry; obj.orient_rvec_z = new_rz;
+	obj.orient_uvec_x = new_ux; obj.orient_uvec_y = new_uy; obj.orient_uvec_z = new_uz;
+	obj.orient_fvec_x = new_fx; obj.orient_fvec_y = new_fy; obj.orient_fvec_z = new_fz;
+
+}
+
+function fix_robot_orientation( robot ) {
+
+	const obj = robot.obj;
+	let fx = obj.orient_fvec_x, fy = obj.orient_fvec_y, fz = obj.orient_fvec_z;
+	let ux = obj.orient_uvec_x, uy = obj.orient_uvec_y, uz = obj.orient_uvec_z;
+	let magnitude = Math.sqrt( fx * fx + fy * fy + fz * fz );
+	if ( magnitude <= 1e-12 ) return false;
+	fx /= magnitude; fy /= magnitude; fz /= magnitude;
+	magnitude = Math.sqrt( ux * ux + uy * uy + uz * uz );
+	if ( magnitude <= 1e-12 ) return false;
+	ux /= magnitude; uy /= magnitude; uz /= magnitude;
+
+	let rx = uy * fz - uz * fy;
+	let ry = uz * fx - ux * fz;
+	let rz = ux * fy - uy * fx;
+	magnitude = Math.sqrt( rx * rx + ry * ry + rz * rz );
+	if ( magnitude <= 1e-12 ) return false;
+	rx /= magnitude; ry /= magnitude; rz /= magnitude;
+	ux = fy * rz - fz * ry;
+	uy = fz * rx - fx * rz;
+	uz = fx * ry - fy * rx;
+
+	obj.orient_rvec_x = rx; obj.orient_rvec_y = ry; obj.orient_rvec_z = rz;
+	obj.orient_uvec_x = ux; obj.orient_uvec_y = uy; obj.orient_uvec_z = uz;
+	obj.orient_fvec_x = fx; obj.orient_fvec_y = fy; obj.orient_fvec_z = fz;
+	return true;
+
+}
+
+export function ai_integrate_robot_rotation( robot, dt ) {
+
+	if ( robot === null || robot === undefined || robot.obj === null ||
+		robot.obj === undefined || Number.isFinite( dt ) !== true || dt <= 0 ) return false;
+	const obj = robot.obj;
+	const phys = obj.mtype;
+	if ( phys === null || phys === undefined ) return false;
+	if ( phys.rotvel_x === 0 && phys.rotvel_y === 0 && phys.rotvel_z === 0 &&
+		phys.rotthrust_x === 0 && phys.rotthrust_y === 0 && phys.rotthrust_z === 0 ) return false;
+
+	if ( phys.drag > 0 ) {
+
+		let count = Math.floor( dt / ROBOT_PHYSICS_STEP );
+		const remainder = dt - count * ROBOT_PHYSICS_STEP;
+		const fraction = remainder / ROBOT_PHYSICS_STEP;
+		const drag = phys.drag * 2.5;
+
+		if ( ( phys.flags & PF_USES_THRUST ) !== 0 && phys.mass > 0 ) {
+
+			const accel_x = phys.rotthrust_x / phys.mass;
+			const accel_y = phys.rotthrust_y / phys.mass;
+			const accel_z = phys.rotthrust_z / phys.mass;
+			while ( count > 0 ) {
+
+				phys.rotvel_x = ( phys.rotvel_x + accel_x ) * ( 1.0 - drag );
+				phys.rotvel_y = ( phys.rotvel_y + accel_y ) * ( 1.0 - drag );
+				phys.rotvel_z = ( phys.rotvel_z + accel_z ) * ( 1.0 - drag );
+				count --;
+
+			}
+			const scale = 1.0 - fraction * drag;
+			phys.rotvel_x = ( phys.rotvel_x + accel_x * fraction ) * scale;
+			phys.rotvel_y = ( phys.rotvel_y + accel_y * fraction ) * scale;
+			phys.rotvel_z = ( phys.rotvel_z + accel_z * fraction ) * scale;
+
+		} else {
+
+			let totalDrag = 1.0;
+			while ( count > 0 ) {
+
+				totalDrag *= 1.0 - drag;
+				count --;
+
+			}
+			totalDrag *= 1.0 - fraction * drag;
+			phys.rotvel_x *= totalDrag;
+			phys.rotvel_y *= totalDrag;
+			phys.rotvel_z *= totalDrag;
+
+		}
+
+	}
+
+	if ( phys.turnroll !== 0 ) apply_robot_local_rotation( robot, 0, 0, - phys.turnroll );
+	apply_robot_local_rotation(
+		robot,
+		phys.rotvel_x * Math.PI * 2.0 * dt,
+		phys.rotvel_y * Math.PI * 2.0 * dt,
+		phys.rotvel_z * Math.PI * 2.0 * dt
+	);
+
+	if ( ( phys.flags & PF_TURNROLL ) !== 0 ) {
+
+		const desiredBank = - phys.rotvel_y * Math.PI * 2.0 * ROBOT_TURNROLL_SCALE;
+		const delta = desiredBank - phys.turnroll;
+		const limit = ROBOT_ROLL_RATE * dt;
+		phys.turnroll += Math.max( - limit, Math.min( limit, delta ) );
+
+	}
+	if ( phys.turnroll !== 0 ) apply_robot_local_rotation( robot, 0, 0, phys.turnroll );
+	if ( fix_robot_orientation( robot ) !== true ) return false;
+
+	if ( robot.mesh !== null && robot.mesh !== undefined ) updateMeshOrientation( robot );
+	return true;
+
+}
+
+function wrap_robot_rotation_delta( angle ) {
+
+	if ( angle > Math.PI ) return angle - Math.PI * 2.0;
+	if ( angle < - Math.PI ) return angle + Math.PI * 2.0;
+	return angle;
+
+}
+
+function set_robot_rotvel_and_saturate( current, delta ) {
+
+	if ( current * delta < 0 && Math.abs( delta ) < 0.125 ) return delta / 4.0;
+	return delta;
+
+}
+
+// Ported from physics_turn_towards_vector() in PHYSICS.C.  This changes
+// rotational velocity; do_physics_sim_rot() applies the orientation later.
+function ai_physics_turn_towards_vector( robot, goal_x, goal_y, goal_z, rate ) {
+
+	if ( robot === null || robot === undefined || robot.obj === null ||
+		robot.obj === undefined || Number.isFinite( goal_x ) !== true ||
+		Number.isFinite( goal_y ) !== true || Number.isFinite( goal_z ) !== true ||
+		Number.isFinite( rate ) !== true || rate <= 0 ) return false;
+	const obj = robot.obj;
+	const phys = obj.mtype;
+	if ( phys === null || phys === undefined ) return false;
+
+	const goalMagnitude = Math.sqrt( goal_x * goal_x + goal_y * goal_y + goal_z * goal_z );
+	if ( goalMagnitude <= 1e-12 ) return false;
+	goal_x /= goalMagnitude;
+	goal_y /= goalMagnitude;
+	goal_z /= goalMagnitude;
+	if ( robot.morphing === true ) rate *= 2.0;
+
+	const goalPitch = Math.asin( Math.max( - 1.0, Math.min( 1.0, - goal_y ) ) );
+	const goalHeading = Math.atan2( goal_x, goal_z );
+	const currentPitch = Math.asin(
+		Math.max( - 1.0, Math.min( 1.0, - obj.orient_fvec_y ) )
+	);
+	const currentHeading = Math.atan2( obj.orient_fvec_x, obj.orient_fvec_z );
+
+	let deltaPitch = wrap_robot_rotation_delta( goalPitch - currentPitch ) /
+		( rate * Math.PI * 2.0 );
+	let deltaHeading = wrap_robot_rotation_delta( goalHeading - currentHeading ) /
+		( rate * Math.PI * 2.0 );
+	if ( Math.abs( deltaPitch ) < 1.0 / 16.0 ) deltaPitch *= 4.0;
+	if ( Math.abs( deltaHeading ) < 1.0 / 16.0 ) deltaHeading *= 4.0;
+
+	phys.rotvel_x = set_robot_rotvel_and_saturate( phys.rotvel_x, deltaPitch );
+	phys.rotvel_y = set_robot_rotvel_and_saturate( phys.rotvel_y, deltaHeading );
+	phys.rotvel_z = 0;
+	return true;
+
+}
+
+// Ported from physics_turn_towards_vector() + phys_apply_rot() in PHYSICS.C.
+// Robot rotational velocity uses Descent turns/second, not radians/second.
+export function ai_apply_rotational_force( robot, force_x, force_y, force_z ) {
+
+	if ( robot === null || robot === undefined || robot.obj === null ||
+		robot.obj === undefined ) return false;
+	if ( Number.isFinite( force_x ) !== true || Number.isFinite( force_y ) !== true ||
+		Number.isFinite( force_z ) !== true ) return false;
+	const obj = robot.obj;
+	const phys = obj.mtype;
+	if ( phys === null || phys === undefined || phys.mass <= 0 ) return false;
+
+	const forceMagnitude = Math.sqrt(
+		force_x * force_x + force_y * force_y + force_z * force_z
+	);
+	if ( forceMagnitude <= 1e-12 ) return false;
+	const scaledMagnitude = forceMagnitude / 8.0;
+	let rate;
+	if ( scaledMagnitude < 1.0 / 256.0 || scaledMagnitude < phys.mass / 16384.0 ) {
+
+		rate = 4.0;
+
+	} else {
+
+		rate = phys.mass / scaledMagnitude;
+		if ( rate < 0.25 ) rate = 0.25;
+		if ( robot.aiLocal !== null && robot.aiLocal !== undefined ) {
+
+			robot.aiLocal.skip_ai_count = 2;
+
+		}
+
+	}
+	return ai_physics_turn_towards_vector( robot, force_x, force_y, force_z, rate );
+
+}
+
+// Get model-local gun points for a model (cached)
+function get_model_gun_points( model_num, robot_type ) {
+
+	const ri = robot_type >= 0 && robot_type < N_robot_types ? Robot_info[ robot_type ] : null;
+	const useRobotInfo = ri !== null && ri.compiled === true;
+	const cacheKey = useRobotInfo === true ? 'r' + robot_type : 'm' + model_num;
+	if ( _gunPointCache[ cacheKey ] !== undefined ) return _gunPointCache[ cacheKey ];
 
 	const model = Polygon_models[ model_num ];
-	if ( model === null || model === undefined || model.n_guns === 0 ) return null;
+	if ( model === null || model === undefined ) return null;
 
-	// polyobj_calc_gun_points transforms from submodel-local to model-local space
-	const points = polyobj_calc_gun_points( model );
-	_gunPointCache[ model_num ] = points;
+	const points = [];
+	if ( useRobotInfo === true ) {
+
+		for ( let gun = 0; gun < ri.n_guns; gun ++ ) {
+
+			const point = ri.gun_points[ gun ];
+			points.push( {
+				x: point.x,
+				y: point.y,
+				z: point.z,
+				submodel: ri.gun_submodels[ gun ]
+			} );
+
+		}
+
+	} else {
+
+		if ( model.n_guns === 0 ) return null;
+		for ( let gun = 0; gun < model.n_guns; gun ++ ) {
+
+			const point = model.gun_points[ gun ];
+			points.push( {
+				x: point.x,
+				y: point.y,
+				z: point.z,
+				submodel: model.gun_submodels[ gun ]
+			} );
+
+		}
+
+	}
+
+	_gunPointCache[ cacheKey ] = points;
 	return points;
 
 }
@@ -49,7 +379,7 @@ function get_model_gun_points( model_num ) {
 // Ported from: calc_gun_point() in ROBOT.C lines 169-213
 // obj = robot object, gun_num = which gun (0-based)
 // Returns _gunPoint (pre-allocated, overwritten each call)
-function calc_gun_point( obj, gun_num ) {
+export function ai_calc_gun_point( obj, gun_num ) {
 
 	const model_num = ( obj.rtype !== null ) ? obj.rtype.model_num : - 1;
 	if ( model_num < 0 ) {
@@ -63,7 +393,7 @@ function calc_gun_point( obj, gun_num ) {
 
 	}
 
-	const points = get_model_gun_points( model_num );
+	const points = get_model_gun_points( model_num, obj.id );
 	if ( points === null || gun_num >= points.length ) {
 
 		// Fallback
@@ -75,8 +405,44 @@ function calc_gun_point( obj, gun_num ) {
 
 	}
 
-	// Get model-local gun point
+	const model = Polygon_models[ model_num ];
+
+	// Start with the gun point in its owning submodel's local coordinates.
 	const gp = points[ gun_num ];
+	let px = gp.x;
+	let py = gp.y;
+	let pz = gp.z;
+	let submodel = gp.submodel;
+	let parentDepth = 0;
+	const animAngles = obj.rtype.anim_angles;
+
+	// Instance up the submodel tree exactly as ROBOT.C calc_gun_point(): rotate
+	// by each current joint angle, then translate by that submodel's offset.
+	while ( submodel !== 0 && submodel < model.n_models && parentDepth ++ < MAX_SUBMODELS_AI ) {
+
+		const angle = animAngles[ submodel ];
+		const pitch = angle !== undefined ? angle.p : 0;
+		const bank = angle !== undefined ? angle.b : 0;
+		const heading = angle !== undefined ? angle.h : 0;
+		const sp = Math.sin( pitch );
+		const cp = Math.cos( pitch );
+		const sb = Math.sin( bank );
+		const cb = Math.cos( bank );
+		const sh = Math.sin( heading );
+		const ch = Math.cos( heading );
+
+		const tx = ( cb * ch + sb * sp * sh ) * px +
+			( cb * sp * sh - sb * ch ) * py + sh * cp * pz;
+		const ty = sb * cp * px + cb * cp * py - sp * pz;
+		const tz = ( sb * sp * ch - cb * sh ) * px +
+			( sb * sh + cb * sp * ch ) * py + ch * cp * pz;
+		const offset = model.submodel_offsets[ submodel ];
+		px = tx + offset.x;
+		py = ty + offset.y;
+		pz = tz + offset.z;
+		submodel = model.submodel_parents[ submodel ];
+
+	}
 
 	// Transform by object orientation matrix (transposed = inverse rotation)
 	// Ported from: vm_copy_transpose_matrix + vm_vec_rotate in ROBOT.C line 211
@@ -85,9 +451,9 @@ function calc_gun_point( obj, gun_num ) {
 	//   result.x = rvec . pnt
 	//   result.y = uvec . pnt
 	//   result.z = fvec . pnt
-	const wx = obj.orient_rvec_x * gp.x + obj.orient_uvec_x * gp.y + obj.orient_fvec_x * gp.z;
-	const wy = obj.orient_rvec_y * gp.x + obj.orient_uvec_y * gp.y + obj.orient_fvec_y * gp.z;
-	const wz = obj.orient_rvec_z * gp.x + obj.orient_uvec_z * gp.y + obj.orient_fvec_z * gp.z;
+	const wx = obj.orient_rvec_x * px + obj.orient_uvec_x * py + obj.orient_fvec_x * pz;
+	const wy = obj.orient_rvec_y * px + obj.orient_uvec_y * py + obj.orient_fvec_y * pz;
+	const wz = obj.orient_rvec_z * px + obj.orient_uvec_z * py + obj.orient_fvec_z * pz;
 
 	// Add object position
 	_gunPoint.x = obj.pos_x + wx;
@@ -139,10 +505,21 @@ const NDL = 5;
 // Mode constants
 const AIM_STILL = 0;
 const AIM_CHASE_OBJECT = 3;
-const AIM_RUN_FROM_OBJECT = 5;
-const AIM_HIDE = 8;
-const AIM_FOLLOW_PATH = 6;
+const AIM_RUN_FROM_OBJECT = 4;
+const AIM_HIDE = 5;
+const AIM_FOLLOW_PATH = 2;
 const AIM_OPEN_DOOR = 7;
+
+// Ported from: ai_behavior_to_mode() in AI.C lines 578-592.
+export function ai_behavior_to_mode( behavior ) {
+
+	if ( behavior === AIB_NORMAL ) return AIM_CHASE_OBJECT;
+	if ( behavior === AIB_HIDE ) return AIM_HIDE;
+	if ( behavior === AIB_RUN_FROM ) return AIM_RUN_FROM_OBJECT;
+	if ( behavior === AIB_FOLLOW_PATH ) return AIM_FOLLOW_PATH;
+	return AIM_STILL;
+
+}
 
 // AIM_HIDE submodes (stored in flags[4] / SUBMODE)
 const AISM_GOHIDE = 0;
@@ -153,6 +530,7 @@ const ROBOT_BRAIN = 7;
 
 // Escape path length for run-from robots (AVOID_SEG_LENGTH in AIPATH.C)
 const AVOID_SEG_LENGTH = 7;
+const BABY_SPIDER_ID = 14;
 
 // Boss robot constants (from AI.C lines 331-362)
 const BOSS_CLOAK_DURATION = 7.0;		// F1_0*7
@@ -176,6 +554,66 @@ let Boss_dying_sound_playing = false;
 let Boss_hit_this_frame = false;
 let Boss_cloaked = false;
 let _bossRobot = null;	// Reference to the boss robot entry in liveRobots
+
+const AI_CLOAKED_FLAG = 6;
+const CLOAK_FADE_DURATION_ROBOT = 1.0;
+
+function update_robot_cloak_render( robot, dt ) {
+
+	if ( robot === null || robot === undefined || robot.mesh === null ) return;
+	if ( robot.alive !== true || robot.morphing === true ) {
+
+		polyobj_set_cloak( robot.mesh, 0, 1, 33 );
+		return;
+
+	}
+
+	const obj = robot.obj;
+	const ctype = obj.ctype;
+	const flags = ctype !== null && ctype !== undefined ? ctype.flags : null;
+	const robotInfo = obj.id >= 0 && obj.id < N_robot_types ? Robot_info[ obj.id ] : null;
+	const isBoss = robotInfo !== null && robotInfo !== undefined && robotInfo.boss_flag > 0;
+	if ( isBoss === true && flags !== null && flags !== undefined ) {
+
+		flags[ AI_CLOAKED_FLAG ] = Boss_cloaked === true ? 1 : 0;
+
+	} else if ( robotInfo !== null && robotInfo !== undefined && robotInfo.cloak_type === 1 &&
+		flags !== null && flags !== undefined ) {
+
+		// init_ai_object() applies RI_CLOAKED_ALWAYS to every new robot, including
+		// matcen, gated, and contained robots created after level initialization.
+		flags[ AI_CLOAKED_FLAG ] = 1;
+
+	}
+	const cloaked = isBoss === true ? Boss_cloaked === true : (
+		robotInfo !== null && robotInfo !== undefined && robotInfo.cloak_type === 1 ||
+		flags !== null && flags !== undefined && flags[ AI_CLOAKED_FLAG ] !== 0
+	);
+
+	if ( cloaked !== true ) {
+
+		polyobj_set_cloak( robot.mesh, 0, 1, 33 );
+		return;
+
+	}
+
+	robot.mesh.visible = true;
+	let cloakStart = GameTime - 10;
+	let cloakEnd = GameTime + 10;
+	if ( isBoss === true ) {
+
+		cloakStart = Boss_cloak_start_time;
+		cloakEnd = Boss_cloak_end_time;
+
+	}
+
+	const elapsed = GameTime - cloakStart;
+	const total = cloakEnd - cloakStart;
+	polyobj_update_cloak_render(
+		robot.mesh, elapsed, total, CLOAK_FADE_DURATION_ROBOT, dt
+	);
+
+}
 
 // Boss gating state (from AI.C lines 361-362, 399-401)
 let Last_gate_time = 0;
@@ -204,6 +642,10 @@ const PA_WEAPON_WALL_COLLISION = 2;
 const PA_PLAYER_COLLISION = 3;
 const PA_WEAPON_ROBOT_COLLISION = 4;
 const PLAYER_AWARENESS_INITIAL_TIME = 3.0; // seconds (F1_0 * 3 in C)
+
+// Global believed player position used by control center firing when cloaked.
+// Ported from: AI.C Believed_player_pos
+const Believed_player_pos = { x: 0, y: 0, z: 0 };
 
 // Ai_transition_table[event][current_state][goal_state] → new_goal_state
 // Ported from: AI.C lines 486-534
@@ -297,6 +739,16 @@ export function ai_do_cloak_stuff() {
 
 	}
 
+	Believed_player_pos.x = pp.x;
+	Believed_player_pos.y = pp.y;
+	Believed_player_pos.z = pp.z;
+
+}
+
+export function ai_get_believed_player_pos() {
+
+	return Believed_player_pos;
+
 }
 
 // New_awareness array: one entry per segment, stores max awareness level
@@ -364,7 +816,8 @@ function getRobotParams( robotId ) {
 
 }
 
-// AI local state for each robot (runtime, not saved to disk)
+// AI local state for each robot.  D1 saves the complete Ai_local_info block;
+// gameseq.js mirrors these runtime fields into the browser save format.
 export class AILocalInfo {
 
 	constructor() {
@@ -375,7 +828,10 @@ export class AILocalInfo {
 		this.previous_visibility = 0;
 		this.next_fire = 0;
 		this.rapidfire_count = 0;
-		this.time_player_seen = 0;
+		this.time_player_seen = GameTime;
+		this.time_player_sound_attacked = GameTime;
+		this.next_misc_sound_time = GameTime;
+		this.skip_ai_count = 0;
 
 		// Velocity (Descent coordinates) — ported from physics_info.velocity in AI.C
 		this.vel_x = 0;
@@ -418,7 +874,7 @@ export class AILocalInfo {
 		// Danger laser tracking for evasion (from AISTRUCT.H: danger_laser_num, danger_laser_signature)
 		// Ported from: set_robot_location_info() in OBJECT.C lines 742-759
 		this.danger_laser_idx = - 1;	// index into weapon pool (-1 = no danger)
-		this.danger_laser_id = - 1;		// unique ID to validate weapon still exists
+		this.danger_laser_id = - 1;		// weapon signature to validate slot reuse
 
 		// Animation state tracking (from AISTRUCT.H: GOAL_STATE, CURRENT_STATE)
 		this.goal_state = AIS_NONE;
@@ -458,6 +914,7 @@ let _getPlayerDead = null;		// () => bool
 let _isPlayerCloaked = null;	// () => bool
 let _onMeleeAttack = null;		// ( damage, claw_sound, pos_x, pos_y, pos_z ) => void
 let _onBumpPlayer = null;		// ( robot, vel_x, vel_y, vel_z, mass ) => void
+let _onRobotCollisionDamage = null;	// ( robot, force_x, force_y, force_z ) => bool
 let _onBossDeath = null;		// ( robot ) => void — called when boss death sequence completes
 let _onCreateExplosion = null;	// ( x, y, z, size ) => void — create explosion effect
 let _onSpawnGatedRobot = null;	// ( segnum, robotType, pos_x, pos_y, pos_z ) => robot — spawn gated robot
@@ -479,12 +936,144 @@ export function ai_set_externals( ext ) {
 	if ( ext.isPlayerCloaked !== undefined ) _isPlayerCloaked = ext.isPlayerCloaked;
 	if ( ext.onMeleeAttack !== undefined ) _onMeleeAttack = ext.onMeleeAttack;
 	if ( ext.onBumpPlayer !== undefined ) _onBumpPlayer = ext.onBumpPlayer;
+	if ( ext.onRobotCollisionDamage !== undefined ) {
+
+		_onRobotCollisionDamage = ext.onRobotCollisionDamage;
+
+	}
 	if ( ext.onBossDeath !== undefined ) _onBossDeath = ext.onBossDeath;
 	if ( ext.onCreateExplosion !== undefined ) _onCreateExplosion = ext.onCreateExplosion;
 	if ( ext.onSpawnGatedRobot !== undefined ) _onSpawnGatedRobot = ext.onSpawnGatedRobot;
 
 	// Pass robots reference to aipath for garbage collection
 	if ( ext.robots !== undefined ) aipath_set_externals( { robots: ext.robots } );
+
+}
+
+// D1's rand() contributes a fixed-point value in [0, 0.5) when added to
+// F1_0 in the robot misc-sound timers.
+function ai_random_half_unit() {
+
+	return Math.floor( Math.random() * 32768 ) / 65536;
+
+}
+
+function ai_quick_vector_magnitude( x, y, z ) {
+
+	let largest = Math.abs( x );
+	let middle = Math.abs( y );
+	let smallest = Math.abs( z );
+	if ( largest < middle ) { const t = largest; largest = middle; middle = t; }
+	if ( middle < smallest ) { const t = middle; middle = smallest; smallest = t; }
+	if ( largest < middle ) { const t = largest; largest = middle; middle = t; }
+	return largest + middle * 3 / 8 + smallest * 3 / 16;
+
+}
+
+// OBJECT.C create_small_fireball_on_object(): place a small explosion half an
+// object radius away along a quick-normalized random vector. Boss callers
+// supply their own large size scale; rand() contributes [0, .5), not [0, 1).
+function create_small_fireball_on_robot( robot, sizeScale ) {
+
+	if ( _onCreateExplosion === null ) return false;
+	const obj = robot.obj;
+	let x = ( Math.floor( Math.random() * 32768 ) - 16384 ) | 1;
+	let y = Math.floor( Math.random() * 32768 ) - 16384;
+	let z = Math.floor( Math.random() * 32768 ) - 16384;
+	const magnitude = ai_quick_vector_magnitude( x, y, z );
+	if ( magnitude <= 0 ) return false;
+	const offsetScale = obj.size / ( 2 * magnitude );
+	x = obj.pos_x + x * offsetScale;
+	y = obj.pos_y + y * offsetScale;
+	z = obj.pos_z + z * offsetScale;
+	if ( find_point_seg( x, y, z, obj.segnum ) < 0 ) return false;
+	const size = sizeScale * ( 1 + ai_random_half_unit() * 4 );
+	_onCreateExplosion( x, y, z, size );
+	return true;
+
+}
+
+// Ported from: AI.C compute_vis_and_vec() robot see/attack sound scheduling.
+// Visibility is deliberately retained while the player is cloaked, matching
+// D1's use of the last uncloaked visibility state.
+function update_robot_awareness_sounds(
+	obj, ailp, params, visibility, dist, playerIsCloaked
+) {
+
+	const difficulty = _getDifficultyLevel !== null ? _getDifficultyLevel() : 1;
+
+	if ( playerIsCloaked === true ) {
+
+		if ( ailp.next_misc_sound_time < GameTime && ailp.next_fire < 1 && dist < 20 ) {
+
+			ailp.next_misc_sound_time = GameTime +
+				( 1 + ai_random_half_unit() ) * ( 7 - difficulty );
+			if ( params.see_sound >= 0 ) {
+
+				digi_play_sample_world(
+					params.see_sound, 1.0, obj.segnum,
+					obj.pos_x, obj.pos_y, obj.pos_z
+				);
+
+			}
+
+		}
+		return;
+
+	}
+
+	if ( ailp.previous_visibility !== visibility && visibility === 2 ) {
+
+		if ( ailp.previous_visibility === 0 ) {
+
+			if ( ailp.time_player_seen + 0.5 < GameTime ) {
+
+				if ( params.see_sound >= 0 ) {
+
+					digi_play_sample_world(
+						params.see_sound, 1.0, obj.segnum,
+						obj.pos_x, obj.pos_y, obj.pos_z
+					);
+
+				}
+				ailp.time_player_sound_attacked = GameTime;
+				ailp.next_misc_sound_time = GameTime + 1 + ai_random_half_unit() * 4;
+
+			}
+
+		} else if ( ailp.time_player_sound_attacked + 0.25 < GameTime ) {
+
+			if ( params.attack_sound >= 0 ) {
+
+				digi_play_sample_world(
+					params.attack_sound, 1.0, obj.segnum,
+					obj.pos_x, obj.pos_y, obj.pos_z
+				);
+
+			}
+			ailp.time_player_sound_attacked = GameTime;
+
+		}
+
+	}
+
+	if ( visibility === 2 && ailp.next_misc_sound_time < GameTime ) {
+
+		ailp.next_misc_sound_time = GameTime +
+			( 1 + ai_random_half_unit() ) * ( 7 - difficulty ) / 2;
+		if ( params.attack_sound >= 0 ) {
+
+			digi_play_sample_world(
+				params.attack_sound, 1.0, obj.segnum,
+				obj.pos_x, obj.pos_y, obj.pos_z
+			);
+
+		}
+
+	}
+
+	ailp.previous_visibility = visibility;
+	if ( visibility !== 0 ) ailp.time_player_seen = GameTime;
 
 }
 
@@ -508,12 +1097,17 @@ export function init_robots_for_level() {
 
 	}
 
+	Believed_player_pos.x = 0;
+	Believed_player_pos.y = 0;
+	Believed_player_pos.z = 0;
+
 	// Reset pathfinding storage
 	aipath_reset();
 
 	for ( let i = 0; i < _robots.length; i ++ ) {
 
 		const robot = _robots[ i ];
+		if ( robot.obj.type !== OBJ_ROBOT ) continue;
 
 		// Create ai_local state (skip if already has one — matcen spawned robots)
 		if ( robot.aiLocal === undefined ) {
@@ -527,6 +1121,29 @@ export function init_robots_for_level() {
 		const ctype = robot.obj.ctype;
 		const behavior = ( ctype !== null ) ? ctype.behavior : AIB_NORMAL;
 		robot.aiLocal.behavior = behavior;
+
+		// init_ai_object() always starts the static animation machine at rest
+		// and aims it toward search, independently of the serialized level flags.
+		robot.aiLocal.current_state = AIS_REST;
+		robot.aiLocal.goal_state = AIS_SRCH;
+		if ( ctype !== null && ctype.flags !== undefined ) {
+
+			ctype.flags[ 1 ] = AIS_REST;
+			ctype.flags[ 2 ] = AIS_SRCH;
+			ctype.flags[ AI_CLOAKED_FLAG ] = robot.obj.id >= 0 && robot.obj.id < N_robot_types &&
+				Robot_info[ robot.obj.id ].cloak_type === 1 ? 1 : 0;
+
+		}
+
+		// init_ai_object() makes every normal AI-controlled robot bounce off
+		// walls and accumulate turn roll, regardless of the flags serialized in
+		// the level object.  Robot eggs intentionally bypass this initializer in
+		// the original game and retain their separate creation flags.
+		if ( robot.obj.mtype !== null && robot.obj.mtype !== undefined ) {
+
+			robot.obj.mtype.flags |= PF_BOUNCE | PF_TURNROLL;
+
+		}
 
 		// Store hide_segment for station/hide/follow_path/run_from behaviors
 		// Ported from: AI.C line 647-650 — these behaviors use hide_segment from level data
@@ -580,6 +1197,16 @@ export function init_robots_for_level() {
 
 	// Initialize boss teleport segments (from AI.C init_ai_objects lines 709-721)
 	init_boss_segments();
+	for ( let i = 0; i < _robots.length; i ++ ) {
+
+		const robot = _robots[ i ];
+		if ( robot.obj.type === OBJ_ROBOT && robot.alive === true ) {
+
+			update_robot_cloak_render( robot, 0 );
+
+		}
+
+	}
 
 }
 
@@ -627,13 +1254,16 @@ export function ai_set_boss_hit() {
 // Danger laser notification — called when player fires a weapon
 // Sets danger_laser on robots that are near the player's aim direction
 // Ported from: set_robot_location_info() in OBJECT.C lines 742-759
-// In the C code, this checks if the robot is near the center of the screen.
-// We simplify: check dot product of (aim dir, dir-to-robot) > threshold.
+// C behavior: abs(view_x) < 4 && abs(view_y) < 4 in rotated view coordinates.
 export function ai_notify_player_fired_laser( weaponIdx, dir_x, dir_y, dir_z ) {
 
 	if ( _robots === null ) return;
 	if ( _getPlayerPos === null ) return;
 
+	const weapon = laser_get_weapon( weaponIdx );
+	if ( weapon === null ) return;
+
+	const weaponSignature = weapon.signature;
 	const pp = _getPlayerPos();
 	const px = pp.x;
 	const py = pp.y;
@@ -646,14 +1276,37 @@ export function ai_notify_player_fired_laser( weaponIdx, dir_x, dir_y, dir_z ) {
 	const ndy = dir_y / dmag;
 	const ndz = dir_z / dmag;
 
-	// C code checks: abs(screen_x) < F1_0*4 && abs(screen_y) < F1_0*4
-	// This roughly corresponds to a cone around the aim direction
-	// We use dot > 0.9 (~25 degree half-angle) as equivalent
-	const AIM_DOT_THRESHOLD = 0.9;
+	// Build a view basis aligned to the fired direction.
+	// right = up_ref x forward, up = forward x right
+	let rdx = ndz;
+	let rdy = 0;
+	let rdz = - ndx;
+	let rmag = Math.sqrt( rdx * rdx + rdy * rdy + rdz * rdz );
+
+	if ( rmag < 0.001 ) {
+
+		rdx = 0;
+		rdy = - ndz;
+		rdz = ndy;
+		rmag = Math.sqrt( rdx * rdx + rdy * rdy + rdz * rdz );
+
+	}
+
+	if ( rmag < 0.001 ) return;
+	rdx /= rmag;
+	rdy /= rmag;
+	rdz /= rmag;
+
+	const udx = ndy * rdz - ndz * rdy;
+	const udy = ndz * rdx - ndx * rdz;
+	const udz = ndx * rdy - ndy * rdx;
+
+	const SCREEN_CENTER_THRESHOLD = 4.0;
 
 	for ( let i = 0; i < _robots.length; i ++ ) {
 
 		const robot = _robots[ i ];
+		if ( robot.obj.type !== OBJ_ROBOT ) continue;
 		if ( robot.alive !== true ) continue;
 		if ( robot.aiLocal === undefined ) continue;
 
@@ -661,16 +1314,17 @@ export function ai_notify_player_fired_laser( weaponIdx, dir_x, dir_y, dir_z ) {
 		const rx = robot.obj.pos_x - px;
 		const ry = robot.obj.pos_y - py;
 		const rz = robot.obj.pos_z - pz;
-		const rdist = Math.sqrt( rx * rx + ry * ry + rz * rz );
-		if ( rdist < 1.0 ) continue;	// too close
+		const viewZ = rx * ndx + ry * ndy + rz * ndz;
+		if ( viewZ <= 0 ) continue;	// behind player
 
-		const dot = ( rx * ndx + ry * ndy + rz * ndz ) / rdist;
+		const viewX = rx * rdx + ry * rdy + rz * rdz;
+		const viewY = rx * udx + ry * udy + rz * udz;
 
-		if ( dot > AIM_DOT_THRESHOLD ) {
+		if ( Math.abs( viewX ) < SCREEN_CENTER_THRESHOLD && Math.abs( viewY ) < SCREEN_CENTER_THRESHOLD ) {
 
 			// Robot is near the aim direction — assign danger laser
 			robot.aiLocal.danger_laser_idx = weaponIdx;
-			robot.aiLocal.danger_laser_id = weaponIdx;	// used as a simple identifier
+			robot.aiLocal.danger_laser_id = weaponSignature;
 
 		}
 
@@ -682,6 +1336,50 @@ export function ai_notify_player_fired_laser( weaponIdx, dir_x, dir_y, dir_z ) {
 // Boss robot behavior
 // Ported from: AI.C lines 2271-2528
 // ---------------------------------------------------------------
+
+// Return true if boss can fit in a segment.
+// Ported from: boss_fits_in_seg() in AI.C lines 2237-2261
+function boss_fits_in_seg( bossObj, segnum ) {
+
+	if ( segnum < 0 || segnum >= Num_segments ) return false;
+
+	const seg = Segments[ segnum ];
+	const segcenter = compute_segment_center( segnum );
+	const bossRad = ( ( bossObj.size !== undefined && bossObj.size > 0 ) ? bossObj.size : 1.0 ) * 0.75;
+
+	for ( let posnum = 0; posnum < 9; posnum ++ ) {
+
+		let px, py, pz;
+
+		if ( posnum === 0 ) {
+
+			px = segcenter.x;
+			py = segcenter.y;
+			pz = segcenter.z;
+
+		} else {
+
+			const vi = seg.verts[ posnum - 1 ];
+			const vx = Vertices[ vi * 3 + 0 ];
+			const vy = Vertices[ vi * 3 + 1 ];
+			const vz = Vertices[ vi * 3 + 2 ];
+			px = ( vx + segcenter.x ) * 0.5;
+			py = ( vy + segcenter.y ) * 0.5;
+			pz = ( vz + segcenter.z ) * 0.5;
+
+		}
+
+		if ( sphere_intersects_wall( px, py, pz, segnum, bossRad ) !== true ) {
+
+			return true;
+
+		}
+
+	}
+
+	return false;
+
+}
 
 // BFS to find segments the boss can teleport to
 // Ported from: init_boss_segments() in AI.C lines 2271-2355
@@ -757,8 +1455,9 @@ function init_boss_segments() {
 			head &= ( QUEUE_SIZE - 1 );
 			visited[ child ] = 1;
 
-			// Add to teleport segments (skip size check — simplified from C)
-			if ( Num_boss_teleport_segs < MAX_BOSS_TELEPORT_SEGS ) {
+			// Teleport list must pass boss size check (gating list below does not).
+			// Ported from: init_boss_segments(..., size_check=1) in AI.C lines 709, 2333-2335
+			if ( Num_boss_teleport_segs < MAX_BOSS_TELEPORT_SEGS && boss_fits_in_seg( _bossRobot.obj, child ) === true ) {
 
 				Boss_teleport_segs[ Num_boss_teleport_segs ++ ] = child;
 
@@ -874,7 +1573,7 @@ function teleport_boss() {
 	obj.pos_x = center.x;
 	obj.pos_y = center.y;
 	obj.pos_z = center.z;
-	obj.segnum = randSeg;
+	relink_robot( robot, randSeg );
 
 	Last_teleport_time = GameTime;
 
@@ -883,36 +1582,12 @@ function teleport_boss() {
 	if ( _getPlayerPos !== null ) {
 
 		const pp = _getPlayerPos();
-		const dx = pp.x - obj.pos_x;
-		const dy = pp.y - obj.pos_y;
-		const dz = pp.z - obj.pos_z;
-		const dist = Math.sqrt( dx * dx + dy * dy + dz * dz );
-
-		if ( dist > 0.001 ) {
-
-			obj.orient_fvec_x = dx / dist;
-			obj.orient_fvec_y = dy / dist;
-			obj.orient_fvec_z = dz / dist;
-
-			// Reconstruct right/up vectors from new forward
-			let ux = 0, uy = 1, uz = 0;
-			let rx = obj.orient_fvec_y * uz - obj.orient_fvec_z * uy;
-			let ry = obj.orient_fvec_z * ux - obj.orient_fvec_x * uz;
-			let rz = obj.orient_fvec_x * uy - obj.orient_fvec_y * ux;
-			let rmag = Math.sqrt( rx * rx + ry * ry + rz * rz );
-
-			if ( rmag > 0.001 ) {
-
-				rx /= rmag; ry /= rmag; rz /= rmag;
-				ux = ry * obj.orient_fvec_z - rz * obj.orient_fvec_y;
-				uy = rz * obj.orient_fvec_x - rx * obj.orient_fvec_z;
-				uz = rx * obj.orient_fvec_y - ry * obj.orient_fvec_x;
-				obj.orient_rvec_x = rx; obj.orient_rvec_y = ry; obj.orient_rvec_z = rz;
-				obj.orient_uvec_x = ux; obj.orient_uvec_y = uy; obj.orient_uvec_z = uz;
-
-			}
-
-		}
+		vm_vector_2_matrix(
+			obj,
+			pp.x - obj.pos_x,
+			pp.y - obj.pos_y,
+			pp.z - obj.pos_z
+		);
 
 	}
 
@@ -921,9 +1596,6 @@ function teleport_boss() {
 
 		robot.mesh.position.set( obj.pos_x, obj.pos_y, - obj.pos_z );
 		updateMeshOrientation( robot );
-
-		// Mesh stays invisible if boss is cloaked
-		robot.mesh.visible = ( Boss_cloaked !== true );
 
 	}
 
@@ -934,8 +1606,26 @@ function teleport_boss() {
 
 	}
 
-	// Play teleport sound and create arrival effect
-	digi_play_sample_3d( SOUND_BOSS_SHARE_SEE, 1.0, obj.pos_x, obj.pos_y, obj.pos_z );
+	// Play the morphing cue at the teleport destination before replacing the
+	// boss's prior linked sound with its long-range hum.
+	const morphClip = Vclips[ VCLIP_MORPHING_ROBOT ];
+	if ( morphClip !== undefined && morphClip.sound_num >= 0 ) {
+
+		digi_play_sample_world(
+			morphClip.sound_num, 1.0, obj.segnum,
+			obj.pos_x, obj.pos_y, obj.pos_z
+		);
+
+	}
+
+	if ( Number.isInteger( robot.objnum ) === true && robot.objnum >= 0 ) {
+
+		digi_kill_sound_linked_to_object( robot.objnum );
+		digi_link_sound_to_object2(
+			SOUND_BOSS_SHARE_SEE, robot.objnum, true, 1.0, 512.0
+		);
+
+	}
 
 	if ( _onCreateExplosion !== null ) {
 
@@ -993,7 +1683,12 @@ function gate_in_robot() {
 	const center = compute_segment_center( segnum );
 
 	// Spawn the robot via callback
-	_onSpawnGatedRobot( segnum, robotType, center.x, center.y, center.z );
+	if ( _onSpawnGatedRobot( segnum, robotType, center.x, center.y, center.z ) !== true ) {
+
+		Last_gate_time = GameTime - Gate_interval * 3 / 4;
+		return false;
+
+	}
 
 	Last_gate_time = GameTime;
 
@@ -1040,11 +1735,6 @@ function do_boss_stuff() {
 			if ( GameTime > Boss_cloak_end_time ) {
 
 				Boss_cloaked = false;
-				if ( robot.mesh !== null ) {
-
-					robot.mesh.visible = true;
-
-				}
 
 			}
 
@@ -1059,12 +1749,6 @@ function do_boss_stuff() {
 				Boss_cloak_end_time = GameTime + BOSS_CLOAK_DURATION;
 				Boss_cloaked = true;
 
-				if ( robot.mesh !== null ) {
-
-					robot.mesh.visible = false;
-
-				}
-
 			}
 
 		}
@@ -1075,9 +1759,14 @@ function do_boss_stuff() {
 
 	}
 
-	// Boss gating: spawn robots near the player at intervals
-	// Ported from: do_boss_stuff() in AI.C lines 2530-2591
-	if ( Boss_dying !== true && Num_boss_gate_segs > 0 ) {
+	// Robot gating belongs only to the registered super-boss (boss_flag == 2).
+	// The Episode 1/shareware boss is boss_flag == 1 and runs do_boss_stuff()
+	// without do_super_boss_stuff(), whose entire implementation is excluded by
+	// #ifndef SHAREWARE in AI.C.
+	// Ported from: AI.C do_ai_frame() lines 2992-3018 and
+	// do_super_boss_stuff() lines 2532-2594.
+	if ( Boss_dying !== true && Robot_info[ robot.obj.id ].boss_flag === 2 &&
+		Num_boss_gate_segs > 0 ) {
 
 		// Fix timer wraparound
 		if ( Last_gate_time > GameTime ) Last_gate_time = GameTime;
@@ -1112,10 +1801,13 @@ function do_boss_stuff() {
 // Ported from: start_boss_death_sequence() in AI.C lines 2399-2406
 export function start_boss_death_sequence( robot ) {
 
-	if ( robot === null || robot === undefined ) return;
+	if ( robot === null || robot === undefined ) return false;
 	const rtype = robot.obj.id;
-	if ( rtype < 0 || rtype >= N_robot_types ) return;
-	if ( Robot_info[ rtype ].boss_flag <= 0 ) return;
+	if ( rtype < 0 || rtype >= N_robot_types ) return false;
+	if ( Robot_info[ rtype ].boss_flag <= 0 ) return false;
+	// apply_damage_to_robot() in D1 returns immediately once shields are below
+	// zero, so later weapon contacts cannot restart the six-second death clock.
+	if ( Boss_dying === true ) return false;
 
 	Boss_dying = true;
 	Boss_dying_start_time = GameTime;
@@ -1128,12 +1820,201 @@ export function start_boss_death_sequence( robot ) {
 		if ( robot.mesh !== null ) {
 
 			robot.mesh.visible = true;
+			polyobj_set_cloak( robot.mesh, 0, 1, 33 );
 
 		}
 
 	}
 
 	console.log( 'BOSS: Death sequence started!' );
+	return true;
+
+}
+
+// D1's AI save block preserves an in-progress boss death.  Store elapsed time
+// for the port's staged renderer and for compatibility with saves created
+// before the main GameTime clock itself was serialized.
+export function ai_get_boss_death_save_state() {
+
+	return {
+		dying: Boss_dying,
+		elapsed: Boss_dying === true ? Math.max( GameTime - Boss_dying_start_time, 0 ) : 0,
+		soundPlaying: Boss_dying_sound_playing,
+		meshQuaternion: Boss_dying === true && _bossRobot !== null &&
+			_bossRobot.mesh !== null && _bossRobot.mesh !== undefined
+			? {
+				x: _bossRobot.mesh.quaternion.x,
+				y: _bossRobot.mesh.quaternion.y,
+				z: _bossRobot.mesh.quaternion.z,
+				w: _bossRobot.mesh.quaternion.w
+			} : null
+	};
+
+}
+
+export function ai_restore_boss_death_save_state( state ) {
+
+	if ( state === null || state === undefined || typeof state !== 'object' ||
+		typeof state.dying !== 'boolean' ) return false;
+
+	if ( state.dying !== true ) {
+
+		Boss_dying = false;
+		Boss_dying_start_time = 0;
+		Boss_dying_sound_playing = false;
+		return true;
+
+	}
+
+	if ( _bossRobot === null || _bossRobot.alive !== true ) return false;
+	const elapsed = Number.isFinite( state.elapsed ) ? Math.max( state.elapsed, 0 ) : 0;
+	Boss_dying = true;
+	Boss_dying_start_time = GameTime - elapsed;
+	// Level restoration tears down every WebAudio source before rebuilding the
+	// mine.  A serialized "playing" flag therefore has no live source behind it;
+	// clear runtime ownership so the next late-stage frame starts the sound again.
+	Boss_dying_sound_playing = false;
+	Boss_cloaked = false;
+	if ( _bossRobot.mesh !== null ) {
+
+		const q = state.meshQuaternion;
+		if ( q !== null && q !== undefined &&
+			Number.isFinite( q.x ) && Number.isFinite( q.y ) &&
+			Number.isFinite( q.z ) && Number.isFinite( q.w ) ) {
+
+			const lengthSq = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+			if ( lengthSq > 1e-12 ) {
+
+				_bossRobot.mesh.quaternion.set( q.x, q.y, q.z, q.w ).normalize();
+
+			}
+
+		}
+		_bossRobot.mesh.visible = true;
+		polyobj_set_cloak( _bossRobot.mesh, 0, 1, 33 );
+
+	}
+	return true;
+
+}
+
+// D1's ai_save_state() persists the global AI block in addition to each
+// object's local/static state.  Keep the same clock values now that GameTime is
+// restored before level construction, and embed the existing boss-death state
+// for compatibility with the browser port's staged explosion renderer.
+export function ai_get_save_state() {
+
+	const cloakInfo = new Array( MAX_AI_CLOAK_INFO );
+	for ( let i = 0; i < MAX_AI_CLOAK_INFO; i ++ ) {
+
+		const info = Ai_cloak_info[ i ];
+		cloakInfo[ i ] = {
+			lastTime: info.last_time,
+			x: info.last_x,
+			y: info.last_y,
+			z: info.last_z
+		};
+
+	}
+
+	return {
+		overallAgitation: Overall_agitation,
+		cloakInfo: cloakInfo,
+		boss: {
+			cloakStartTime: Boss_cloak_start_time,
+			cloakEndTime: Boss_cloak_end_time,
+			lastTeleportTime: Last_teleport_time,
+			teleportInterval: Boss_teleport_interval,
+			cloakInterval: Boss_cloak_interval,
+			lastGateTime: Last_gate_time,
+			gateInterval: Gate_interval,
+			hitThisFrame: Boss_hit_this_frame,
+			cloaked: Boss_cloaked,
+			death: ai_get_boss_death_save_state()
+		}
+	};
+
+}
+
+function restore_ai_finite( state, name, fallback ) {
+
+	const value = state[ name ];
+	return Number.isFinite( value ) === true ? value : fallback;
+
+}
+
+export function ai_restore_save_state( state ) {
+
+	if ( state === null || state === undefined || typeof state !== 'object' ) return false;
+
+	if ( Number.isInteger( state.overallAgitation ) === true &&
+		state.overallAgitation >= 0 && state.overallAgitation <= OVERALL_AGITATION_MAX ) {
+
+		Overall_agitation = state.overallAgitation;
+
+	}
+
+	if ( Array.isArray( state.cloakInfo ) ) {
+
+		const count = Math.min( state.cloakInfo.length, MAX_AI_CLOAK_INFO );
+		for ( let i = 0; i < count; i ++ ) {
+
+			const saved = state.cloakInfo[ i ];
+			if ( saved === null || typeof saved !== 'object' ||
+				Number.isFinite( saved.lastTime ) !== true ||
+				Number.isFinite( saved.x ) !== true ||
+				Number.isFinite( saved.y ) !== true ||
+				Number.isFinite( saved.z ) !== true ) continue;
+
+			const info = Ai_cloak_info[ i ];
+			info.last_time = saved.lastTime;
+			info.last_x = saved.x;
+			info.last_y = saved.y;
+			info.last_z = saved.z;
+
+		}
+
+	}
+
+	const boss = state.boss;
+	if ( boss !== null && boss !== undefined && typeof boss === 'object' ) {
+
+		Boss_cloak_start_time = restore_ai_finite( boss, 'cloakStartTime', Boss_cloak_start_time );
+		Boss_cloak_end_time = restore_ai_finite( boss, 'cloakEndTime', Boss_cloak_end_time );
+		Last_teleport_time = restore_ai_finite( boss, 'lastTeleportTime', Last_teleport_time );
+		Last_gate_time = restore_ai_finite( boss, 'lastGateTime', Last_gate_time );
+
+		if ( Number.isFinite( boss.teleportInterval ) === true && boss.teleportInterval > 0 ) {
+
+			Boss_teleport_interval = boss.teleportInterval;
+
+		}
+		if ( Number.isFinite( boss.cloakInterval ) === true && boss.cloakInterval > 0 ) {
+
+			Boss_cloak_interval = boss.cloakInterval;
+
+		}
+		if ( Number.isFinite( boss.gateInterval ) === true && boss.gateInterval > 0 ) {
+
+			Gate_interval = boss.gateInterval;
+
+		}
+		if ( typeof boss.hitThisFrame === 'boolean' ) Boss_hit_this_frame = boss.hitThisFrame;
+		if ( typeof boss.cloaked === 'boolean' ) Boss_cloaked = boss.cloaked;
+
+		if ( boss.death !== undefined ) ai_restore_boss_death_save_state( boss.death );
+
+		if ( _bossRobot !== null && _bossRobot.obj.ctype !== null &&
+			_bossRobot.obj.ctype !== undefined && _bossRobot.obj.ctype.flags !== undefined ) {
+
+			_bossRobot.obj.ctype.flags[ AI_CLOAKED_FLAG ] = Boss_cloaked === true ? 1 : 0;
+			update_robot_cloak_render( _bossRobot, 0 );
+
+		}
+
+	}
+
+	return true;
 
 }
 
@@ -1147,18 +2028,15 @@ function do_boss_dying_frame() {
 	const obj = robot.obj;
 	const elapsed = GameTime - Boss_dying_start_time;
 
-	// Spin the boss with increasing rotational velocity
-	// Ported from: AI.C lines 2419-2421
-	// rotvel = elapsed / N, in fixang/s where F1_0 = 1 revolution
-	// Converted to radians: elapsed * (2π / N)
-	if ( robot.mesh !== null ) {
+	// Spin the boss with increasing canonical physics velocity.  D1 stores
+	// these as turns per second and lets the ordinary post-AI physics pass
+	// advance both the object orientation and its rendered mesh.
+	// Ported from: AI.C lines 2419-2421.
+	if ( obj.mtype !== null && obj.mtype !== undefined ) {
 
-		const angVelX = elapsed * ( 2 * Math.PI / 9 );
-		const angVelY = elapsed * ( 2 * Math.PI / 5 );
-		const angVelZ = elapsed * ( 2 * Math.PI / 7 );
-		robot.mesh.rotateX( angVelX * _dt );
-		robot.mesh.rotateY( angVelY * _dt );
-		robot.mesh.rotateZ( angVelZ * _dt );
+		obj.mtype.rotvel_x = elapsed / 9;
+		obj.mtype.rotvel_y = elapsed / 5;
+		obj.mtype.rotvel_z = elapsed / 7;
 
 	}
 
@@ -1170,32 +2048,30 @@ function do_boss_dying_frame() {
 		if ( Boss_dying_sound_playing !== true ) {
 
 			Boss_dying_sound_playing = true;
-			digi_play_sample_3d( SOUND_BOSS_SHARE_DIE, 1.0, obj.pos_x, obj.pos_y, obj.pos_z );
+			digi_play_sample_world(
+				SOUND_BOSS_SHARE_DIE, 4.0, obj.segnum,
+				obj.pos_x, obj.pos_y, obj.pos_z,
+				undefined, 1024.0
+			);
 
-		}
+		} else if ( ai_random_half_unit() < _dt * 16 ) {
 
-		// C: rand() < FrameTime*16 — frequent fireballs during death sound
-		if ( Math.random() < _dt * 16 && _onCreateExplosion !== null ) {
+			// C: rand() < FrameTime*16, with rand() represented as [0, .5).
 
-			const rx = ( Math.random() - 0.5 ) * obj.size;
-			const ry = ( Math.random() - 0.5 ) * obj.size;
-			const rz = ( Math.random() - 0.5 ) * obj.size;
-			_onCreateExplosion( obj.pos_x + rx, obj.pos_y + ry, obj.pos_z + rz,
-				2.0 + Math.random() * 3.0 );
+			create_small_fireball_on_robot(
+				robot, ( 1 + ai_random_half_unit() ) * 8
+			);
 
 		}
 
 	} else {
 
-		// Earlier in death — less frequent fireballs
-		// C: rand() < FrameTime*8
-		if ( Math.random() < _dt * 8 && _onCreateExplosion !== null ) {
+		// Earlier in death: rand() < FrameTime*8 in the same half-unit range.
+		if ( ai_random_half_unit() < _dt * 8 ) {
 
-			const rx = ( Math.random() - 0.5 ) * obj.size;
-			const ry = ( Math.random() - 0.5 ) * obj.size;
-			const rz = ( Math.random() - 0.5 ) * obj.size;
-			_onCreateExplosion( obj.pos_x + rx, obj.pos_y + ry, obj.pos_z + rz,
-				1.0 + Math.random() * 2.0 );
+			create_small_fireball_on_robot(
+				robot, ( 0.5 + ai_random_half_unit() ) * 8
+			);
 
 		}
 
@@ -1213,7 +2089,7 @@ function do_boss_dying_frame() {
 		}
 
 		// Mark boss as dead
-		robot.alive = false;
+		mark_robot_dead( robot );
 		Boss_dying = false;
 		_bossRobot = null;
 
@@ -1230,9 +2106,11 @@ function do_boss_dying_frame() {
 // Ported from: robot_set_angles() in ROBOT.C lines 274-317 (gun_nums initialization)
 const _gunNumsCache = {};
 
-function get_gun_nums( model_num, n_guns ) {
+function get_gun_nums( model_num, robot_type, n_guns ) {
 
-	const key = model_num + '_' + n_guns;
+	const ri = robot_type >= 0 && robot_type < N_robot_types ? Robot_info[ robot_type ] : null;
+	const useRobotInfo = ri !== null && ri.compiled === true;
+	const key = ( useRobotInfo === true ? 'r' + robot_type : 'm' + model_num ) + '_' + n_guns;
 	if ( _gunNumsCache[ key ] !== undefined ) return _gunNumsCache[ key ];
 
 	const model = Polygon_models[ model_num ];
@@ -1250,9 +2128,11 @@ function get_gun_nums( model_num, n_guns ) {
 	gunNums[ 0 ] = - 1;	// Submodel 0 (body root) never animates
 
 	// Walk parent chains from each gun's submodel to assign gun groups
-	for ( let g = 0; g < n_guns && g < model.n_guns; g ++ ) {
+	const gunSubmodels = useRobotInfo === true ? ri.gun_submodels : model.gun_submodels;
+	const availableGuns = useRobotInfo === true ? ri.n_guns : model.n_guns;
+	for ( let g = 0; g < n_guns && g < availableGuns; g ++ ) {
 
-		let m = model.gun_submodels[ g ];
+		let m = gunSubmodels[ g ];
 
 		while ( m !== 0 && m < model.n_models ) {
 
@@ -1285,12 +2165,13 @@ function do_silly_animation( robot ) {
 
 	const model = Polygon_models[ model_num ];
 	if ( model === null || model === undefined ) return 0;
-	if ( model.anim_angs === null ) return 0;
+	const animAngles = ri.anim_angs !== null ? ri.anim_angs : model.anim_angs;
+	if ( animAngles === null ) return 0;
 
-	const n_guns = model.n_guns;
+	const n_guns = ri.compiled === true ? ri.n_guns : model.n_guns;
 	if ( n_guns === 0 ) return 0;
 
-	const gunNums = get_gun_nums( model_num, n_guns );
+	const gunNums = get_gun_nums( model_num, robotType, n_guns );
 	if ( gunNums === null ) return;
 
 	// Map AI state to animation state
@@ -1298,9 +2179,9 @@ function do_silly_animation( robot ) {
 	const robot_state = ( stateIdx >= 0 && stateIdx < Mike_to_matt_xlate.length )
 		? Mike_to_matt_xlate[ stateIdx ] : AS_REST;
 
-	if ( robot_state >= model.anim_angs.length ) return;
+	if ( robot_state >= animAngles.length ) return;
 
-	const targetAngles = model.anim_angs[ robot_state ];
+	const targetAngles = animAngles[ robot_state ];
 
 	// Speed modifier based on attack/flinch
 	let flinch_attack_scale = 1;
@@ -1318,8 +2199,6 @@ function do_silly_animation( robot ) {
 
 	// Process each gun group + body
 	for ( let gun_num = 0; gun_num <= n_guns; gun_num ++ ) {
-
-		let gun_at_goal = 1;
 
 		for ( let m = 1; m < model.n_models; m ++ ) {
 
@@ -1341,7 +2220,6 @@ function do_silly_animation( robot ) {
 				if ( jp[ axis ] !== curp[ axis ] ) {
 
 					if ( gun_num === 0 ) at_goal = 0;
-					gun_at_goal = 0;
 
 					goalp[ axis ] = jp[ axis ];
 
@@ -1375,8 +2253,10 @@ function do_silly_animation( robot ) {
 
 		}
 
-		// Check if gun reached its goal
-		if ( gun_at_goal === 1 ) {
+		// D1 deliberately carries one at_goal flag through the whole gun loop.
+		// Gun 0 is the animation-state authority; once it is off-goal, later gun
+		// groups cannot report an achieved state during this frame.
+		if ( at_goal === 1 ) {
 
 			ailp.anim_achieved_state[ gun_num ] = ailp.anim_goal_state[ gun_num ];
 
@@ -1452,7 +2332,7 @@ function ai_frame_animation( robot, dt ) {
 
 			}
 
-			if ( Math.abs( delta_to_goal ) > 0.001 ) {
+			if ( delta_to_goal !== 0 ) {
 
 				const scaled_delta = deltaang[ axis ] * dt;
 				curang[ axis ] += scaled_delta;
@@ -1483,37 +2363,6 @@ function ai_frame_animation( robot, dt ) {
 
 }
 
-// Apply current animation angles to the robot's mesh submodel groups
-// Called after ai_frame_animation to update Three.js rotations
-function apply_robot_anim_angles( robot ) {
-
-	if ( robot.submodelGroups === undefined || robot.submodelGroups === null ) return;
-
-	const obj = robot.obj;
-	if ( obj.rtype === null ) return;
-
-	const anims = obj.rtype.anim_angles;
-	const groups = robot.submodelGroups;
-
-	for ( let i = 1; i < groups.length; i ++ ) {
-
-		const g = groups[ i ];
-		if ( g === undefined || g === null ) continue;
-
-		const a = anims[ i ];
-		if ( a === undefined ) continue;
-
-		// Convert Descent angles to Three.js rotations (Z-negate coordinate conversion)
-		// Pitch (X) and Heading (Y) are negated, Bank (Z) stays same
-		// Euler order 'YXZ' matches Descent's H,P,B application order
-		g.rotation.x = - a.p;
-		g.rotation.y = - a.h;
-		g.rotation.z = a.b;
-
-	}
-
-}
-
 // Reset gun nums cache (call on level change)
 export function ai_reset_anim_cache() {
 
@@ -1537,6 +2386,14 @@ export function create_awareness_event( segnum, pos_x, pos_y, pos_z, type ) {
 
 	if ( Num_awareness_events >= MAX_AWARENESS_EVENTS ) return;
 	if ( segnum < 0 || segnum >= Num_segments ) return;
+
+	// Keep cloaked-player believed position fresh when noisy events happen.
+	// Ported from: add_awareness_event() in AI.C
+	if ( type === PA_WEAPON_WALL_COLLISION || type === PA_PLAYER_COLLISION || type === PA_WEAPON_ROBOT_COLLISION ) {
+
+		ai_do_cloak_stuff();
+
+	}
 
 	const evt = Awareness_events[ Num_awareness_events ];
 	evt.segnum = segnum;
@@ -1632,6 +2489,7 @@ function set_player_awareness_all() {
 	for ( let i = 0; i < _robots.length; i ++ ) {
 
 		const robot = _robots[ i ];
+		if ( robot.obj.type !== OBJ_ROBOT ) continue;
 		if ( robot.alive !== true ) continue;
 		if ( robot.aiLocal === undefined ) continue;
 
@@ -1672,6 +2530,8 @@ function ai_check_robot_robot_collisions() {
 		const mass0 = ( obj0.mtype != null && obj0.mtype.mass > 0 ) ? obj0.mtype.mass : 4.0;
 
 		for ( let j = i + 1; j < n; j ++ ) {
+
+			if ( r0.alive !== true ) break;
 
 			const r1 = _robots[ j ];
 			if ( r1.alive !== true ) continue;
@@ -1718,22 +2578,69 @@ function ai_check_robot_robot_collisions() {
 			const dvy = ailp0.vel_y - ailp1.vel_y;
 			const dvz = ailp0.vel_z - ailp1.vel_z;
 
-			// Project velocity difference onto collision normal
+			// Project velocity difference onto the separation axis.  With the axis
+			// pointing from obj1 to obj0, a negative value means they are approaching.
 			const relVelNormal = dvx * nx + dvy * ny + dvz * nz;
 
-			// Only apply impulse if robots are moving toward each other
-			if ( relVelNormal > 0 ) {
+			// FVI dispatches collide_robot_and_robot only on an approaching contact.
+			// Preserve that gate here because this port detects overlap after motion.
+			if ( relVelNormal < 0 ) {
 
-				const impulse = massScale * relVelNormal;
-				const impulse0 = impulse / mass0;
-				const impulse1 = impulse / mass1;
+				// bump_two_objects uses the complete relative-velocity vector, not
+				// merely its collision-normal projection.  obj1 receives force first;
+				// obj0 receives the exact opposite.
+				const force_x = dvx * massScale;
+				const force_y = dvy * massScale;
+				const force_z = dvz * massScale;
+				const difficulty = _getDifficultyLevel !== null ? _getDifficultyLevel() : 1;
+				const rotationScale = 1.0 / ( 4 + difficulty );
+				const rtype1 = obj1.id;
+				const boss1 = rtype1 >= 0 && rtype1 < N_robot_types &&
+					Robot_info[ rtype1 ].boss_flag > 0;
+				const persistent1 = obj1.mtype !== null && obj1.mtype !== undefined &&
+					( obj1.mtype.flags & PF_PERSISTENT ) !== 0;
+				if ( boss1 !== true && persistent1 !== true ) {
 
-				ailp0.vel_x -= nx * impulse0;
-				ailp0.vel_y -= ny * impulse0;
-				ailp0.vel_z -= nz * impulse0;
-				ailp1.vel_x += nx * impulse1;
-				ailp1.vel_y += ny * impulse1;
-				ailp1.vel_z += nz * impulse1;
+					ailp1.vel_x += force_x / mass1;
+					ailp1.vel_y += force_y / mass1;
+					ailp1.vel_z += force_z / mass1;
+					ai_apply_rotational_force(
+						r1,
+						force_x * rotationScale,
+						force_y * rotationScale,
+						force_z * rotationScale
+					);
+					if ( _onRobotCollisionDamage !== null ) {
+
+						_onRobotCollisionDamage( r1, force_x, force_y, force_z );
+
+					}
+
+				}
+
+				const rtype0 = obj0.id;
+				const boss0 = rtype0 >= 0 && rtype0 < N_robot_types &&
+					Robot_info[ rtype0 ].boss_flag > 0;
+				const persistent0 = obj0.mtype !== null && obj0.mtype !== undefined &&
+					( obj0.mtype.flags & PF_PERSISTENT ) !== 0;
+				if ( boss0 !== true && persistent0 !== true ) {
+
+					ailp0.vel_x -= force_x / mass0;
+					ailp0.vel_y -= force_y / mass0;
+					ailp0.vel_z -= force_z / mass0;
+					ai_apply_rotational_force(
+						r0,
+						- force_x * rotationScale,
+						- force_y * rotationScale,
+						- force_z * rotationScale
+					);
+					if ( _onRobotCollisionDamage !== null ) {
+
+						_onRobotCollisionDamage( r0, - force_x, - force_y, - force_z );
+
+					}
+
+				}
 
 			}
 
@@ -1760,8 +2667,28 @@ export function ai_do_frame( dt ) {
 	for ( let i = 0; i < _robots.length; i ++ ) {
 
 		const robot = _robots[ i ];
+		if ( robot.obj.type !== OBJ_ROBOT ) continue;
 		if ( robot.alive !== true ) continue;
 		if ( robot.aiLocal === undefined ) continue;
+		const robotType = robot.obj.id;
+		const isBoss = robotType >= 0 && robotType < N_robot_types &&
+			Robot_info[ robotType ].boss_flag > 0;
+
+		// D1 runs the boss cloak/teleport/death state machine before its generic
+		// distance time-slice return.  A distant boss must therefore finish its
+		// death countdown on the exact frame that the timer expires, even when
+		// the rest of its ordinary AI work is skipped this frame.
+		// Ported from: AI.C do_ai_frame() lines 2992-3038.
+		if ( isBoss === true ) {
+
+			do_boss_stuff();
+			if ( robot.alive !== true ) continue;
+
+		}
+		// Original AI keys per-object time slicing, cloak state, and movement hashes
+		// by the canonical object number.  The live wrapper array may be compacted
+		// after runtime spawns die, so its index is not a stable object identity.
+		const objectIndex = ( robot.objnum !== undefined && robot.objnum >= 0 ) ? robot.objnum : i;
 
 		// Distance-based time-slicing: skip distant robots on some frames
 		// Ported from: AI.C lines 3021-3038 — robot LOD processing
@@ -1771,17 +2698,50 @@ export function ai_do_frame( dt ) {
 		const rdz = robot.obj.pos_z - playerPos.z;
 		const rdistSq = rdx * rdx + rdy * rdy + rdz * rdz;
 
-		if ( rdistSq > 62500 ) { // 250^2 = 62500
+		let processAI = true;
+		if ( robot.aiLocal.skip_ai_count > 0 ) {
 
-			if ( ( FrameCount + i ) % 4 !== 0 ) continue;
+			robot.aiLocal.skip_ai_count --;
+			processAI = false;
+
+		} else if ( rdistSq > 62500 ) { // 250^2 = 62500
+
+			if ( ( FrameCount + objectIndex ) % 4 !== 0 ) processAI = false;
 
 		} else if ( rdistSq > 22500 ) { // 150^2 = 22500
 
-			if ( ( FrameCount + i ) % 2 !== 0 ) continue;
+			if ( ( FrameCount + objectIndex ) % 2 !== 0 ) processAI = false;
 
 		}
 
-		do_ai_for_robot( robot, playerPos, i );
+		if ( processAI === true ) {
+
+			do_ai_for_robot( robot, playerPos, objectIndex, isBoss );
+
+		}
+
+	}
+
+	// OBJECT.C runs the control callback first, then applies MT_PHYSICS as a
+	// separate stage.  AI time slicing must therefore never time-slice motion,
+	// and a CT_NONE body continues moving until its delayed explosion deletes it.
+	for ( let i = 0; i < _robots.length; i ++ ) {
+
+		const robot = _robots[ i ];
+		if ( robot.obj.type !== OBJ_ROBOT || robot.aiLocal === undefined ) continue;
+		if ( robot.alive !== true && robot_has_pending_explosion( robot ) !== true ) continue;
+		ai_integrate_robot_rotation( robot, dt );
+		ai_integrate_robot_translation( robot, dt );
+
+	}
+
+	// Cloak shading is a draw-time effect in OBJECT.C, so it must continue to
+	// advance even when distant-robot AI was time-sliced out this frame.
+	for ( let i = 0; i < _robots.length; i ++ ) {
+
+		const robot = _robots[ i ];
+		if ( robot.obj.type !== OBJ_ROBOT || robot.alive !== true ) continue;
+		update_robot_cloak_render( robot, dt );
 
 	}
 
@@ -1792,7 +2752,7 @@ export function ai_do_frame( dt ) {
 }
 
 // Process AI for a single robot
-function do_ai_for_robot( robot, playerPos, robotIndex ) {
+function do_ai_for_robot( robot, playerPos, robotIndex, bossFrameProcessed = false ) {
 
 	const obj = robot.obj;
 	const ailp = robot.aiLocal;
@@ -1801,6 +2761,16 @@ function do_ai_for_robot( robot, playerPos, robotIndex ) {
 	// Whether this robot can open doors (for pathfinding through closed doors)
 	// Ported from: ai_door_is_openable() in AI.C lines 1983-2004
 	const canOpenDoors = ai_can_open_doors( obj, ailp.behavior );
+
+	// If the firing timer was already ready at the start of the frame, cancel a
+	// pending flinch before any behavior or joint target is selected.  Doing this
+	// after animation adds an extra flinch frame and disagrees with D1's ordering.
+	// Ported from: AI.C lines 2681-2686.
+	if ( ailp.goal_state === AIS_FLIN && ailp.next_fire < 0 ) {
+
+		ailp.goal_state = AIS_FIRE;
+
+	}
 
 	// Decrement timers
 	ailp.next_fire -= _dt;
@@ -1832,6 +2802,12 @@ function do_ai_for_robot( robot, playerPos, robotIndex ) {
 
 		}
 
+	} else {
+
+		// No player awareness: settle the goal state back to rest.
+		// Ported from: AI.C:2933 — else aip->GOAL_STATE = AIS_REST;
+		ailp.goal_state = AIS_REST;
+
 	}
 
 	// Compute target position: real player pos, or believed pos if cloaked
@@ -1861,6 +2837,16 @@ function do_ai_for_robot( robot, playerPos, robotIndex ) {
 		target_y = ci.last_y;
 		target_z = ci.last_z;
 
+		Believed_player_pos.x = target_x;
+		Believed_player_pos.y = target_y;
+		Believed_player_pos.z = target_z;
+
+	} else {
+
+		Believed_player_pos.x = playerPos.x;
+		Believed_player_pos.y = playerPos.y;
+		Believed_player_pos.z = playerPos.z;
+
 	}
 
 	// Compute vector to target (Descent coordinates)
@@ -1876,7 +2862,7 @@ function do_ai_for_robot( robot, playerPos, robotIndex ) {
 
 	if ( isBoss === true ) {
 
-		do_boss_stuff();
+		if ( bossFrameProcessed !== true ) do_boss_stuff();
 
 		// Boss dying — skip normal AI, spinning handled by do_boss_dying_frame
 		if ( Boss_dying === true ) return;
@@ -1939,26 +2925,9 @@ function do_ai_for_robot( robot, playerPos, robotIndex ) {
 
 	}
 
-	// Update awareness based on visibility
-	if ( visibility === 2 ) {
-
-		// Play see_sound when robot first spots the player
-		if ( ailp.previous_visibility === 0 && params.see_sound !== - 1 ) {
-
-			digi_play_sample_3d( params.see_sound, 0.6, obj.pos_x, obj.pos_y, obj.pos_z );
-
-		}
-
-		ailp.player_awareness_type = PA_WEAPON_ROBOT_COLLISION; // max awareness
-		ailp.player_awareness_time = PLAYER_AWARENESS_INITIAL_TIME;
-		ailp.time_player_seen = 0; // could track GameTime here
-
-	} else if ( visibility === 1 && ailp.player_awareness_type < 2 ) {
-
-		ailp.player_awareness_type = 2;
-		ailp.player_awareness_time = PLAYER_AWARENESS_INITIAL_TIME / 2;
-
-	}
+	update_robot_awareness_sounds(
+		obj, ailp, params, visibility, dist, playerIsCloaked
+	);
 
 	// Occasionally make non-still robots create a path to the player based on agitation
 	// Ported from: AI.C lines 2818-2828
@@ -1983,7 +2952,6 @@ function do_ai_for_robot( robot, playerPos, robotIndex ) {
 					if ( playerSeg !== - 1 ) {
 
 						create_path_to_player( robot, obj.segnum, playerSeg, canOpenDoors, pathLen );
-						ailp.previous_visibility = visibility;
 						return;
 
 					}
@@ -2124,6 +3092,11 @@ function do_ai_for_robot( robot, playerPos, robotIndex ) {
 
 	}
 
+	// D1 assigns the recoil state after the attack logic and state-transition
+	// table have run.  Keep the gun which actually attacked so that handoff
+	// cannot be overwritten by the transition work later in this frame.
+	let recoilGun = - 1;
+
 	// Act based on mode
 	if ( ailp.mode === AIM_CHASE_OBJECT ) {
 
@@ -2148,7 +3121,7 @@ function do_ai_for_robot( robot, playerPos, robotIndex ) {
 				const meleeRange = obj.size + PLAYER_SIZE + 2.0;
 				if ( dist < meleeRange ) {
 
-					do_ai_robot_melee_attack( robot, params );
+					recoilGun = do_ai_robot_melee_attack( robot, params );
 
 				}
 
@@ -2159,7 +3132,9 @@ function do_ai_for_robot( robot, playerPos, robotIndex ) {
 			// Ranged fire at player (with rapidfire burst support)
 			if ( visibility === 2 && dot > FIRE_DOT_THRESHOLD && ailp.next_fire <= 0 ) {
 
-				ai_fire_at_player( robot, robotIndex, dirToPlayer_x, dirToPlayer_y, dirToPlayer_z, params );
+				recoilGun = ai_fire_at_player(
+					robot, robotIndex, dirToPlayer_x, dirToPlayer_y, dirToPlayer_z, params
+				);
 
 				// Rapidfire burst behavior
 				ailp.rapidfire_count ++;
@@ -2286,7 +3261,27 @@ function do_ai_for_robot( robot, playerPos, robotIndex ) {
 
 			if ( bombSeg !== - 1 ) {
 
-				Laser_create_new( bdir_x, bdir_y, bdir_z, bpos_x, bpos_y, bpos_z, bombSeg, PARENT_ROBOT, PROXIMITY_ID );
+				let parentSpeed = Math.sqrt(
+					ailp.vel_x * ailp.vel_x + ailp.vel_y * ailp.vel_y + ailp.vel_z * ailp.vel_z
+				);
+				if ( ailp.vel_x * obj.orient_fvec_x + ailp.vel_y * obj.orient_fvec_y +
+					ailp.vel_z * obj.orient_fvec_z < 0 ) {
+
+					parentSpeed = - parentSpeed;
+
+				}
+				const bombIdx = Laser_create_new(
+					bdir_x, bdir_y, bdir_z, bpos_x, bpos_y, bpos_z,
+					bombSeg, PARENT_ROBOT, PROXIMITY_ID, 1.0, undefined, false, parentSpeed,
+					robot.objnum, obj.signature
+				);
+				if ( bombIdx !== - 1 ) {
+
+					playWeaponFlashSoundAt(
+						PROXIMITY_ID, bombSeg, bpos_x, bpos_y, bpos_z
+					);
+
+				}
 
 			}
 
@@ -2334,7 +3329,9 @@ function do_ai_for_robot( robot, playerPos, robotIndex ) {
 		// Fire at player if we can see them while pathfinding
 		if ( visibility === 2 && dot > FIRE_DOT_THRESHOLD && ailp.next_fire <= 0 ) {
 
-			ai_fire_at_player( robot, robotIndex, dirToPlayer_x, dirToPlayer_y, dirToPlayer_z, params );
+			recoilGun = ai_fire_at_player(
+				robot, robotIndex, dirToPlayer_x, dirToPlayer_y, dirToPlayer_z, params
+			);
 			ailp.next_fire = params.firing_wait;
 
 		}
@@ -2412,7 +3409,9 @@ function do_ai_for_robot( robot, playerPos, robotIndex ) {
 			// But still fire at player if visible
 			if ( visibility === 2 && dot > FIRE_DOT_THRESHOLD && ailp.next_fire <= 0 ) {
 
-				ai_fire_at_player( robot, robotIndex, dirToPlayer_x, dirToPlayer_y, dirToPlayer_z, params );
+				recoilGun = ai_fire_at_player(
+					robot, robotIndex, dirToPlayer_x, dirToPlayer_y, dirToPlayer_z, params
+				);
 				ailp.next_fire = params.firing_wait;
 
 			}
@@ -2461,7 +3460,9 @@ function do_ai_for_robot( robot, playerPos, robotIndex ) {
 			// Fire at player while moving if visible
 			if ( visibility === 2 && dot > FIRE_DOT_THRESHOLD && ailp.next_fire <= 0 ) {
 
-				ai_fire_at_player( robot, robotIndex, dirToPlayer_x, dirToPlayer_y, dirToPlayer_z, params );
+				recoilGun = ai_fire_at_player(
+					robot, robotIndex, dirToPlayer_x, dirToPlayer_y, dirToPlayer_z, params
+				);
 				ailp.next_fire = params.firing_wait;
 
 			}
@@ -2470,25 +3471,11 @@ function do_ai_for_robot( robot, playerPos, robotIndex ) {
 
 	}
 
-	// Apply velocity drag — prevents infinite sliding after knockback
-	// Ported from: drag applied per frame in PHYSICS.C
-	{
-
-		const robotDrag = ( obj.mtype != null && obj.mtype.drag > 0 ) ? obj.mtype.drag : 0.05;
-		const dragFactor = 1.0 - robotDrag;
-		ailp.vel_x *= dragFactor;
-		ailp.vel_y *= dragFactor;
-		ailp.vel_z *= dragFactor;
-
-	}
-
-	// Integrate velocity — position += velocity * dt
-	// Applies to all active modes (chase, path follow, run-from, open-door, hide all use velocity)
+	// Stuck recovery consumes retry counts left by the preceding frame's
+	// post-control physics pass, matching OBJECT.C's control-before-movement order.
 	if ( ailp.mode === AIM_CHASE_OBJECT || ailp.mode === AIM_FOLLOW_PATH ||
 		ailp.mode === AIM_RUN_FROM_OBJECT || ailp.mode === AIM_OPEN_DOOR ||
 		ailp.mode === AIM_HIDE ) {
-
-		ai_integrate_velocity( robot );
 
 		// Stuck detection: if too many consecutive wall-hit retries, unstick the robot
 		// Ported from: AI.C lines 2835-2887 — consecutive_retries > 3
@@ -2577,9 +3564,9 @@ function do_ai_for_robot( robot, playerPos, robotIndex ) {
 
 	}
 
-	ailp.previous_visibility = visibility;
-
-	// Deal with cloaking for robots which are cloaked except just before firing.
+	// Deal with the per-frame cloak flag for robots whose cloak state follows
+	// their firing timer.  Preserve D1's exact comparison and stored AI flag;
+	// the renderer consumes the flag after all robot AI has run.
 	// Ported from: AI.C lines 2787-2791
 	{
 
@@ -2589,15 +3576,10 @@ function do_ai_for_robot( robot, playerPos, robotIndex ) {
 			const ri_cloak = Robot_info[ rtype_cloak ];
 			if ( ri_cloak.cloak_type === 2 ) {
 
-				// RI_CLOAKED_EXCEPT_FIRING = 2
-				// Cloak when not about to fire (next_fire >= 0.5s), uncloak when about to fire
-				if ( ailp.next_fire >= 0.5 ) {
+				const ctype = obj.ctype;
+				if ( ctype !== null && ctype !== undefined && ctype.flags !== undefined ) {
 
-					if ( robot.mesh !== null ) robot.mesh.visible = false;
-
-				} else {
-
-					if ( robot.mesh !== null ) robot.mesh.visible = true;
+					ctype.flags[ AI_CLOAKED_FLAG ] = ailp.next_fire < 0.5 ? 1 : 0;
 
 				}
 
@@ -2620,21 +3602,32 @@ function do_ai_for_robot( robot, playerPos, robotIndex ) {
 
 	}
 
-	// Handle non-animating robots: skip animation, just sync current to goal
-	// Ported from: AI.C lines 3394-3397
-	const object_animates = do_silly_animation( robot );
+	// Once the flinch pose has been reached, start returning to the alert/lock
+	// pose before selecting this frame's joint targets.  The later awareness
+	// transition can temporarily select flinch again, so this pre-animation
+	// handoff is what keeps the joints progressing instead of oscillating.
+	// Ported from: AI.C lines 2906-2907.
+	if ( ailp.goal_state === AIS_FLIN && ailp.current_state === AIS_FLIN ) {
+
+		ailp.goal_state = AIS_LOCK;
+
+	}
+
+	// D1 advances polygon joints only for robots within 100 world units.  Farther
+	// robots still advance the static AI state so they cannot get stuck waiting
+	// for an animation which was deliberately skipped.
+	// Ported from: AI.C lines 2910-2921
+	let object_animates = 0;
+	if ( dist < 100.0 ) {
+
+		object_animates = do_silly_animation( robot );
+		if ( object_animates !== 0 ) ai_frame_animation( robot, _dt );
+
+	}
 
 	if ( object_animates === 0 ) {
 
 		ailp.current_state = ailp.goal_state;
-
-	}
-
-	// Boss flinch override: if goal is flinch but it's time to fire, switch to fire
-	// Ported from: AI.C lines 2729-2731
-	if ( ailp.goal_state === AIS_FLIN && ailp.next_fire < 0 ) {
-
-		ailp.goal_state = AIS_FIRE;
 
 	}
 
@@ -2673,15 +3666,10 @@ function do_ai_for_robot( robot, playerPos, robotIndex ) {
 	// Ported from: AI.C lines 3424-3429
 	if ( ailp.goal_state === AIS_FIRE ) {
 
-		const robotType = robot.obj.id;
-		if ( robotType >= 0 && robotType < N_robot_types ) {
+		const num_guns = get_robot_gun_count( robot.obj );
+		for ( let i = 0; i < num_guns; i ++ ) {
 
-			const num_guns = Robot_info[ robotType ].n_guns;
-			for ( let i = 0; i < num_guns; i ++ ) {
-
-				ailp.anim_goal_state[ i ] = AIS_FIRE;
-
-			}
+			ailp.anim_goal_state[ i ] = AIS_FIRE;
 
 		}
 
@@ -2695,9 +3683,28 @@ function do_ai_for_robot( robot, playerPos, robotIndex ) {
 
 	}
 
-	// Process joint animation
-	ai_frame_animation( robot, _dt );
-	apply_robot_anim_angles( robot );
+	// ai_do_actual_firing_stuff() changes both the robot and active gun to
+	// recoil after firing/clawing, then advances CURRENT_GUN.  Apply this after
+	// the transition table, matching that ordering and preserving the recoil.
+	if ( recoilGun >= 0 ) {
+
+		ailp.goal_state = AIS_RECO;
+		if ( recoilGun < ailp.anim_goal_state.length ) {
+
+			ailp.anim_goal_state[ recoilGun ] = AIS_RECO;
+
+		}
+
+	}
+
+	// Apply the current joint pose to the rendered hierarchy.  Nearby robots
+	// reached this pose through ai_frame_animation(); distant robots retain their
+	// last pose exactly as the original renderer did.
+	if ( obj.rtype !== null ) {
+
+		polyobj_set_anim_angles( robot.submodelGroups, obj.rtype.anim_angles );
+
+	}
 
 }
 
@@ -2706,8 +3713,6 @@ function do_ai_for_robot( robot, playerPos, robotIndex ) {
 // Apply pseudo-random rotation to idle robots for lifelike motion
 // Ported from: ai_turn_randomly() in AI.C lines 875-902
 function ai_turn_randomly( robot, dirToPlayer_x, dirToPlayer_y, dirToPlayer_z, turn_time, previous_visibility ) {
-
-	const ailp = robot.aiLocal;
 
 	// 1/4 of the time, cheat and turn toward player if previously visible
 	// Ported from: AI.C line 880-883
@@ -2722,32 +3727,20 @@ function ai_turn_randomly( robot, dirToPlayer_x, dirToPlayer_y, dirToPlayer_z, t
 
 	}
 
-	// Chaotic pseudo-random rotation: rotvel feeds back on itself
+	// Chaotic pseudo-random rotation: canonical physics rotvel feeds back on
+	// itself here, then do_physics_sim_rot() applies it after AI for this frame.
 	// Ported from: AI.C lines 888-900
 	// F1_0/64 = 1/64 ≈ 0.015625, F1_0/8 = 0.125
-	ailp.rotvel_y += 0.015625;
-
-	ailp.rotvel_x += ailp.rotvel_y / 6;
-	ailp.rotvel_y += ailp.rotvel_z / 4;
-	ailp.rotvel_z += ailp.rotvel_x / 10;
-
-	if ( Math.abs( ailp.rotvel_x ) > 0.125 ) ailp.rotvel_x /= 4;
-	if ( Math.abs( ailp.rotvel_y ) > 0.125 ) ailp.rotvel_y /= 4;
-	if ( Math.abs( ailp.rotvel_z ) > 0.125 ) ailp.rotvel_z /= 4;
-
-	// Apply rotational velocity to orientation (rotate around Y axis primarily)
-	// Use the rotvel to build a small goal direction offset from current forward
 	const obj = robot.obj;
-	const goal_x = obj.orient_fvec_x + ailp.rotvel_y * _dt * 2;
-	const goal_y = obj.orient_fvec_y + ailp.rotvel_x * _dt * 2;
-	const goal_z = obj.orient_fvec_z + ailp.rotvel_z * _dt * 2;
-	const mag = Math.sqrt( goal_x * goal_x + goal_y * goal_y + goal_z * goal_z );
-
-	if ( mag > 0.001 ) {
-
-		ai_turn_towards_vector( goal_x / mag, goal_y / mag, goal_z / mag, robot, turn_time * 2 );
-
-	}
+	const phys = obj.mtype;
+	if ( phys === null || phys === undefined ) return;
+	phys.rotvel_y += 1.0 / 64.0;
+	phys.rotvel_x += phys.rotvel_y / 6.0;
+	phys.rotvel_y += phys.rotvel_z / 4.0;
+	phys.rotvel_z += phys.rotvel_x / 10.0;
+	if ( Math.abs( phys.rotvel_x ) > 0.125 ) phys.rotvel_x /= 4.0;
+	if ( Math.abs( phys.rotvel_y ) > 0.125 ) phys.rotvel_y /= 4.0;
+	if ( Math.abs( phys.rotvel_z ) > 0.125 ) phys.rotvel_z /= 4.0;
 
 }
 
@@ -2799,6 +3792,12 @@ function ai_can_open_doors( obj, behavior ) {
 function ai_turn_towards_vector( goal_x, goal_y, goal_z, robot, turn_time ) {
 
 	const obj = robot.obj;
+	if ( obj.type === OBJ_ROBOT && obj.id === BABY_SPIDER_ID ) {
+
+		ai_physics_turn_towards_vector( robot, goal_x, goal_y, goal_z, turn_time );
+		return;
+
+	}
 
 	// Current forward vector
 	let fvec_x = obj.orient_fvec_x;
@@ -3203,7 +4202,7 @@ function ai_move_relative_to_player( robot, dist, vec_x, vec_y, vec_z, robotInde
 
 		const dweapon = laser_get_weapon( ailp.danger_laser_idx );
 
-		if ( dweapon !== null ) {
+		if ( dweapon !== null && dweapon.signature === ailp.danger_laser_id ) {
 
 			// Vector from robot to laser
 			const vtlx = dweapon.pos_x - robot.obj.pos_x;
@@ -3268,7 +4267,7 @@ function ai_move_relative_to_player( robot, dist, vec_x, vec_y, vec_z, robotInde
 
 		}
 
-		// Weapon no longer valid or not heading at us — clear it
+		// Weapon no longer valid/not matching signature, or not heading at us — clear it
 		ailp.danger_laser_idx = - 1;
 		ailp.danger_laser_id = - 1;
 
@@ -3360,7 +4359,7 @@ function move_towards_segment_center( robot ) {
 
 		} else if ( newSeg !== obj.segnum ) {
 
-			obj.segnum = newSeg;
+			relink_robot( robot, newSeg );
 
 		}
 
@@ -3383,7 +4382,7 @@ function move_towards_segment_center( robot ) {
 
 		} else if ( newSeg !== obj.segnum ) {
 
-			obj.segnum = newSeg;
+			relink_robot( robot, newSeg );
 
 		}
 
@@ -3434,7 +4433,7 @@ function move_object_to_legal_spot( robot ) {
 		const newSeg = find_point_seg( obj.pos_x, obj.pos_y, obj.pos_z, obj.segnum );
 		if ( newSeg !== - 1 ) {
 
-			obj.segnum = newSeg;
+			relink_robot( robot, newSeg );
 
 			// Update mesh position
 			if ( robot.mesh !== null ) {
@@ -3456,7 +4455,7 @@ function move_object_to_legal_spot( robot ) {
 
 	// Couldn't find a legal spot — kill the robot
 	// Ported from: AI.C line 1940 — apply_damage_to_robot(objp, objp->shields*2, ...)
-	robot.alive = false;
+	mark_robot_dead( robot );
 	if ( robot.mesh !== null && robot.mesh.parent !== null ) {
 
 		robot.mesh.parent.remove( robot.mesh );
@@ -3465,12 +4464,73 @@ function move_object_to_legal_spot( robot ) {
 
 }
 
-// Integrate robot velocity into position with FVI collision detection + wall sliding
-// Ported from: PHYSICS.C do_physics_sim() wall-slide behavior
-function ai_integrate_velocity( robot ) {
+// Apply D1's fixed 1/64-second thrust/drag integration to the port's
+// authoritative robot velocity.  Ai_local owns that velocity in this port;
+// mirror it into physics_info so render, save, debris, and collision readers
+// observe one canonical result.
+function ai_integrate_robot_linear_velocity( robot, dt ) {
+
+	const obj = robot.obj;
+	const phys = obj.mtype;
+	const ailp = robot.aiLocal;
+	if ( phys === null || phys === undefined || Number.isFinite( dt ) !== true || dt <= 0 ) return;
+
+	if ( phys.drag > 0 ) {
+
+		let count = Math.floor( dt / ROBOT_PHYSICS_STEP );
+		const remainder = dt - count * ROBOT_PHYSICS_STEP;
+		const fraction = remainder / ROBOT_PHYSICS_STEP;
+		const drag = phys.drag;
+
+		if ( ( phys.flags & PF_USES_THRUST ) !== 0 && phys.mass > 0 ) {
+
+			const accel_x = phys.thrust_x / phys.mass;
+			const accel_y = phys.thrust_y / phys.mass;
+			const accel_z = phys.thrust_z / phys.mass;
+			while ( count > 0 ) {
+
+				ailp.vel_x = ( ailp.vel_x + accel_x ) * ( 1.0 - drag );
+				ailp.vel_y = ( ailp.vel_y + accel_y ) * ( 1.0 - drag );
+				ailp.vel_z = ( ailp.vel_z + accel_z ) * ( 1.0 - drag );
+				count --;
+
+			}
+			const scale = 1.0 - fraction * drag;
+			ailp.vel_x = ( ailp.vel_x + accel_x * fraction ) * scale;
+			ailp.vel_y = ( ailp.vel_y + accel_y * fraction ) * scale;
+			ailp.vel_z = ( ailp.vel_z + accel_z * fraction ) * scale;
+
+		} else {
+
+			let totalDrag = 1.0;
+			while ( count > 0 ) {
+
+				totalDrag *= 1.0 - drag;
+				count --;
+
+			}
+			totalDrag *= 1.0 - fraction * drag;
+			ailp.vel_x *= totalDrag;
+			ailp.vel_y *= totalDrag;
+			ailp.vel_z *= totalDrag;
+
+		}
+
+	}
+
+	phys.velocity_x = ailp.vel_x;
+	phys.velocity_y = ailp.vel_y;
+	phys.velocity_z = ailp.vel_z;
+
+}
+
+// Integrate robot velocity into position with FVI collision detection + wall sliding.
+// Ported from: PHYSICS.C do_physics_sim() wall-slide behavior.
+function ai_integrate_robot_translation( robot, dt ) {
 
 	const obj = robot.obj;
 	const ailp = robot.aiLocal;
+	ai_integrate_robot_linear_velocity( robot, dt );
 
 	// Skip if no significant velocity
 	const speedSq = ailp.vel_x * ailp.vel_x + ailp.vel_y * ailp.vel_y + ailp.vel_z * ailp.vel_z;
@@ -3486,7 +4546,7 @@ function ai_integrate_velocity( robot ) {
 
 	for ( let iter = 0; iter < MAX_ITERS; iter ++ ) {
 
-		const remaining_dt = _dt * ( 1.0 - iter / MAX_ITERS );
+		const remaining_dt = dt * ( 1.0 - iter / MAX_ITERS );
 		if ( remaining_dt < 0.0001 ) break;
 
 		const p1_x = p0_x + ailp.vel_x * remaining_dt;
@@ -3496,7 +4556,7 @@ function ai_integrate_velocity( robot ) {
 		const hit = find_vector_intersection(
 			p0_x, p0_y, p0_z,
 			p1_x, p1_y, p1_z,
-			curSeg, robotSize * 0.8,
+			curSeg, robotSize,
 			- 1, 0
 		);
 
@@ -3607,7 +4667,7 @@ function ai_integrate_velocity( robot ) {
 	obj.pos_x = p0_x;
 	obj.pos_y = p0_y;
 	obj.pos_z = p0_z;
-	obj.segnum = curSeg;
+	relink_robot( robot, curSeg );
 
 	// Update mesh position (Descent -> Three.js: negate Z)
 	if ( robot.mesh !== null ) {
@@ -3620,6 +4680,18 @@ function ai_integrate_velocity( robot ) {
 
 // ------- Melee Attack -------
 
+function get_robot_gun_count( obj ) {
+
+	if ( obj === null || obj === undefined || obj.rtype === null ) return 0;
+	const model_num = obj.rtype.model_num;
+	if ( model_num < 0 ) return 0;
+	const model = Polygon_models[ model_num ];
+	if ( model === null || model === undefined ) return 0;
+	const ri = obj.id >= 0 && obj.id < N_robot_types ? Robot_info[ obj.id ] : null;
+	return ri !== null && ri.compiled === true ? ri.n_guns : model.n_guns;
+
+}
+
 // Melee attack — robot charges into player and claws them
 // Ported from: do_ai_robot_hit_attack() in AI.C lines 1249-1277
 // Calls collide_player_and_nasty_robot() via callback
@@ -3628,6 +4700,9 @@ function do_ai_robot_melee_attack( robot, params ) {
 	const obj = robot.obj;
 	const ailp = robot.aiLocal;
 	const d = _getDifficultyLevel !== null ? _getDifficultyLevel() : 1;
+	const n_guns = get_robot_gun_count( obj );
+	if ( n_guns <= 0 ) return - 1;
+	const gun_num = ailp.current_gun % n_guns;
 
 	// Damage scales with difficulty: F1_0 * (Difficulty_level + 1)
 	// Ported from: COLLIDE.C collide_player_and_nasty_robot() line 1665
@@ -3637,13 +4712,6 @@ function do_ai_robot_melee_attack( robot, params ) {
 	if ( _onMeleeAttack !== null ) {
 
 		_onMeleeAttack( damage, params.claw_sound, obj.pos_x, obj.pos_y, obj.pos_z );
-
-	}
-
-	// Play attack sound at robot position (separate from claw_sound)
-	if ( params.attack_sound !== - 1 ) {
-
-		digi_play_sample_3d( params.attack_sound, 0.7, obj.pos_x, obj.pos_y, obj.pos_z );
 
 	}
 
@@ -3662,9 +4730,16 @@ function do_ai_robot_melee_attack( robot, params ) {
 
 	}
 
+	// ai_do_actual_firing_stuff() cycles the gun only after a real attack.
+	ailp.current_gun = ( gun_num + 1 ) % n_guns;
+	return gun_num;
+
 }
 
 // ------- Firing -------
+
+// Player cloak duration. Ported from: PLAYER.H — CLOAK_TIME_MAX (F1_0*30)
+const CLOAK_TIME_MAX = 30.0;
 
 // Fire a laser at the player
 // Ported from: ai_fire_laser_at_player() in AI.C lines 1299-1393
@@ -3673,20 +4748,41 @@ function ai_fire_at_player( robot, robotIndex, dir_x, dir_y, dir_z, params ) {
 	const obj = robot.obj;
 	const ailp = robot.aiLocal;
 
-	// Get gun number for multi-gun robots
-	const model_num = ( obj.rtype !== null ) ? obj.rtype.model_num : - 1;
-	let n_guns = 0;
+	// CT_MORPH deliberately falls through to CT_AI in D1, but the robot's
+	// weapon remains disabled until its polygon model finishes materializing.
+	if ( robot.morphing === true ) return - 1;
 
-	if ( model_num >= 0 ) {
+	// If the player is cloaked, maybe don't fire — depends on how long they have been
+	// cloaked plus randomness. Ported from: ai_fire_laser_at_player() in AI.C:1308-1318.
+	// C compares rand() (uniform in [0, F1_0/2)) against fixdiv(dt, CLOAK_TIME_MAX)/2,
+	// which reduces to Math.random() > dt / CLOAK_TIME_MAX.
+	if ( _isPlayerCloaked !== null && _isPlayerCloaked() === true ) {
 
-		const model = Polygon_models[ model_num ];
-		if ( model !== null && model !== undefined ) {
+		const dt_cloak = GameTime - Ai_cloak_info[ robotIndex % MAX_AI_CLOAK_INFO ].last_time;
+		if ( dt_cloak > CLOAK_TIME_MAX / 4 && Math.random() > dt_cloak / CLOAK_TIME_MAX ) {
 
-			n_guns = model.n_guns;
+			// set_next_fire_time(): delay before the robot may fire again (AI.C:1237-1246).
+			ailp.rapidfire_count ++;
+			if ( params.rapidfire_count > 0 && ailp.rapidfire_count < params.rapidfire_count ) {
+
+				ailp.next_fire = Math.min( 0.125, params.firing_wait * 0.5 );
+
+			} else {
+
+				ailp.rapidfire_count = 0;
+				ailp.next_fire = params.firing_wait;
+
+			}
+
+			return - 1;
 
 		}
 
 	}
+
+	// Get gun number for multi-gun robots
+	const n_guns = get_robot_gun_count( obj );
+	if ( n_guns <= 0 ) return - 1;
 
 	// Determine which gun to fire from
 	let gun_num = 0;
@@ -3699,7 +4795,7 @@ function ai_fire_at_player( robot, robotIndex, dir_x, dir_y, dir_z, params ) {
 
 	// Calculate fire position from gun point
 	// Ported from: calc_gun_point() in ROBOT.C
-	const gp = calc_gun_point( obj, gun_num );
+	const gp = ai_calc_gun_point( obj, gun_num );
 	const fire_x = gp.x;
 	const fire_y = gp.y;
 	const fire_z = gp.z;
@@ -3707,7 +4803,7 @@ function ai_fire_at_player( robot, robotIndex, dir_x, dir_y, dir_z, params ) {
 	// Verify fire point is in a valid segment
 	const fireSeg = find_point_seg( fire_x, fire_y, fire_z, obj.segnum );
 
-	if ( fireSeg === - 1 ) return;
+	if ( fireSeg === - 1 ) return - 1;
 
 	// Compute fire direction with difficulty-based inaccuracy and lead prediction
 	// Ported from: ai_fire_laser_at_player() in AI.C lines 1335-1380
@@ -3795,12 +4891,13 @@ function ai_fire_at_player( robot, robotIndex, dir_x, dir_y, dir_z, params ) {
 
 	}
 
-	Laser_create_new(
+	const firedWeapon = Laser_create_new(
 		fire_dir_x, fire_dir_y, fire_dir_z,
 		fire_x, fire_y, fire_z,
 		fireSeg,
 		PARENT_ROBOT,
-		params.weapon_type
+		params.weapon_type,
+		1.0, undefined, false, undefined, robot.objnum, obj.signature
 	);
 
 	// Create muzzle flash vclip at gun barrel position
@@ -3824,22 +4921,18 @@ function ai_fire_at_player( robot, robotIndex, dir_x, dir_y, dir_z, params ) {
 
 	}
 
-	// Play per-weapon firing sound at robot position (3D)
-	// Ported from: AI.C — uses Weapon_info[weapon_type].flash_sound
-	let fireSound = SOUND_LASER_FIRED;
-	if ( wt >= 0 && wt < Weapon_info.length && Weapon_info[ wt ].flash_sound >= 0 ) {
+	// Laser_create_new() owns this cue in D1, so a missing configured sound or
+	// failed weapon allocation must remain silent.
+	if ( firedWeapon !== - 1 ) {
 
-		fireSound = Weapon_info[ wt ].flash_sound;
+		playWeaponFlashSoundAt( wt, fireSeg, fire_x, fire_y, fire_z );
 
 	}
-
-	digi_play_sample_3d( fireSound, 0.5, fire_x, fire_y, fire_z );
 
 	// Alert nearby robots that a robot fired
 	// Ported from: AI.C line 1393
 	create_awareness_event( obj.segnum, obj.pos_x, obj.pos_y, obj.pos_z, PA_NEARBY_ROBOT_FIRED );
 
-	// Trigger fire animation
-	ailp.goal_state = AIS_FIRE;
+	return gun_num;
 
 }

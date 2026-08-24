@@ -5,6 +5,7 @@ import { pcx_read, pcx_to_canvas } from './pcx.js';
 import { get_title_canvas } from './titles.js';
 import { gr_string, gr_get_string_size } from './font.js';
 import { TITLE_FONT, SUBTITLE_FONT, CURRENT_FONT } from './gamefont.js';
+import { songs_play_song, SONG_CREDITS, SONG_TITLE } from './songs.js';
 
 const ROW_SPACING = 11;
 const SCROLL_SPEED = 15.67; // pixels per second (F1_0 / time_delay where time_delay=4180)
@@ -200,6 +201,9 @@ export async function credits_show( hogFile, gamePalette ) {
 
 	}
 
+	// Start credits music (CREDITS.C line 236: songs_play_song( SONG_CREDITS, 0 ) — no loop)
+	songs_play_song( SONG_CREDITS, false );
+
 	// Pre-allocate working ImageData (Golden Rule #5: no allocations in render loop)
 	const canvasW = titleCanvas.width;
 	const canvasH = titleCanvas.height;
@@ -344,5 +348,9 @@ export async function credits_show( hogFile, gamePalette ) {
 		requestAnimationFrame( frame );
 
 	} );
+
+	// Returning to the title screen — resume the looping title song
+	// (CREDITS.C line 354: songs_play_song( SONG_TITLE, 1 ))
+	songs_play_song( SONG_TITLE, true );
 
 }

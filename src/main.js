@@ -6,14 +6,20 @@ import { PigFile, loadPalette } from './piggy.js';
 import { bm_read_all, bm_build_shareware_texture_table, Sounds } from './bm.js';
 import { loadSharewareModels } from './polyobj.js';
 import { digi_init, digi_set_sounds_table, digi_resume,
-	digi_get_audio_context, digi_get_master_gain } from './digi.js';
-import { songs_init, songs_set_audio_context, songs_play_song, songs_play_level_song, songs_resume, SONG_TITLE } from './songs.js';
+	digi_get_audio_context, digi_get_master_gain, digi_set_digi_volume,
+	digi_set_reverse_stereo, digi_set_max_channels } from './digi.js';
+import { songs_init, songs_set_audio_context, songs_play_song, songs_play_level_song, songs_resume, songs_set_volume, SONG_TITLE } from './songs.js';
 import { show_title_sequence, do_briefing_screens, hide_title_canvas } from './titles.js';
 import { do_main_menu } from './menu.js';
 import { gamefont_init } from './gamefont.js';
 import { gameseq_set_externals, gameseq_get_difficulty, gameseq_set_difficulty,
 	gameseq_get_secondary_ammo, gameseq_set_sound_initialized,
-	loadLevel } from './gameseq.js';
+	loadLevel, quickStartLevel } from './gameseq.js';
+import { mission_get_level_name } from './mission.js';
+import { CONFIG_VOLUME_MAX, config_get_digi_volume, config_get_music_volume,
+	config_get_reverse_stereo, config_on_digi_volume_changed,
+	config_get_sound_channels, config_on_music_volume_changed,
+	config_on_reverse_stereo_changed, config_on_sound_channels_changed } from './config.js';
 
 const status = document.getElementById( 'status' );
 
@@ -100,11 +106,23 @@ async function startGame() {
 		// Registered: HAM data embedded in PIG file
 		if ( pigFile.hamData !== null ) {
 
-			bm_read_all( pigFile.hamData );
+			try {
+
+				bm_read_all( pigFile.hamData, pigFile );
+
+			} catch ( error ) {
+
+				console.error( error );
+				setStatus( 'Error: Invalid registered game data' );
+				return;
+
+			}
 
 		} else {
 
-			console.warn( 'No HAM data found in PIG file' );
+			setStatus( 'Error: This registered PIG has no embedded game data' );
+			console.error( 'Registered Descent 1.0 PIG files require BITMAPS.TBL/BIN loading' );
+			return;
 
 		}
 
@@ -127,21 +145,38 @@ async function startGame() {
 	digi_set_sounds_table( Sounds );
 	songs_init( hogFile );
 
+	const applyDigiVolume = value => digi_set_digi_volume( value / CONFIG_VOLUME_MAX );
+	const applyMusicVolume = value => songs_set_volume( value / CONFIG_VOLUME_MAX );
+	const applyReverseStereo = value => digi_set_reverse_stereo( value );
+	const applySoundChannels = value => digi_set_max_channels( value );
+	config_on_digi_volume_changed( applyDigiVolume );
+	config_on_music_volume_changed( applyMusicVolume );
+	config_on_reverse_stereo_changed( applyReverseStereo );
+	config_on_sound_channels_changed( applySoundChannels );
+	applyDigiVolume( config_get_digi_volume() );
+	applyMusicVolume( config_get_music_volume() );
+	applyReverseStereo( config_get_reverse_stereo() );
+	applySoundChannels( config_get_sound_channels() );
+
 	// Share AudioContext from digi.js with songs.js (avoids multiple contexts)
 	const sharedAudioCtx = digi_get_audio_context();
 	if ( sharedAudioCtx !== null ) {
 
-		songs_set_audio_context( sharedAudioCtx, digi_get_master_gain() );
+		await songs_set_audio_context( sharedAudioCtx, digi_get_master_gain() );
 
 	}
 
-	// Resume audio on first user interaction (browser policy)
-	document.addEventListener( 'click', function () {
+	// Resume audio on the first mouse/touch or keyboard interaction.  The title
+	// and menu flows are fully keyboard-operable, so click-only activation can
+	// otherwise leave the shared AudioContext suspended for the whole session.
+	const resumeAudioFromGesture = function () {
 
 		digi_resume();
 		songs_resume();
 
-	}, { once: true } );
+	};
+	document.addEventListener( 'click', resumeAudioFromGesture, { once: true } );
+	document.addEventListener( 'keydown', resumeAudioFromGesture, { once: true } );
 
 	// Load bitmap fonts from HOG
 	gamefont_init( hogFile, palette );
@@ -175,7 +210,7 @@ async function startGame() {
 	gameseq_get_secondary_ammo()[ 0 ] = 2 + 4 - gameseq_get_difficulty();
 
 	// Show intro briefing screens (level 0 + level 1)
-	await do_briefing_screens( hogFile, 1 );
+	await do_briefing_screens( hogFile, 1, pigFile, palette );
 
 	// Hide title canvas and start gameplay
 	hide_title_canvas();
@@ -184,15 +219,14 @@ async function startGame() {
 	setStatus( 'Loading level 1...' );
 	songs_play_level_song( 1 );
 
-	if ( pigFile.isShareware === true ) {
+	let firstLevelName = mission_get_level_name( 1 );
+	if ( firstLevelName.length <= 0 ) {
 
-		loadLevel( 'level01.sdl' );
-
-	} else {
-
-		loadLevel( 'level01.rdl' );
+		firstLevelName = pigFile.isShareware === true ? 'level01.sdl' : 'level01.rdl';
 
 	}
+
+	loadLevel( firstLevelName );
 
 }
 
@@ -216,13 +250,7 @@ window.quickStart = async function ( levelNum, difficulty ) {
 	hide_title_canvas();
 	digi_resume();
 	songs_resume();
-	songs_play_level_song( levelNum );
-
-	const fileName = pigFile.isShareware === true
-		? 'level0' + levelNum + '.sdl'
-		: 'level0' + levelNum + '.rdl';
-
-	loadLevel( fileName );
+	await quickStartLevel( levelNum );
 
 };
 

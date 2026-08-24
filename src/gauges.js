@@ -7,6 +7,8 @@ import {
 	GAUGE_SHIELDS, GAUGE_INVULNERABLE, GAUGE_ENERGY_LEFT, GAUGE_ENERGY_RIGHT,
 	GAUGE_NUMERICAL, GAUGE_BLUE_KEY, GAUGE_GOLD_KEY, GAUGE_RED_KEY,
 	GAUGE_BLUE_KEY_OFF, GAUGE_GOLD_KEY_OFF, GAUGE_RED_KEY_OFF,
+	SB_GAUGE_BLUE_KEY, SB_GAUGE_GOLD_KEY, SB_GAUGE_RED_KEY,
+	SB_GAUGE_BLUE_KEY_OFF, SB_GAUGE_GOLD_KEY_OFF, SB_GAUGE_RED_KEY_OFF,
 	SB_GAUGE_ENERGY, GAUGE_LIVES, GAUGE_SHIPS,
 	RETICLE_CROSS, RETICLE_PRIMARY, RETICLE_SECONDARY,
 	GAUGE_HOMING_WARNING_ON, GAUGE_HOMING_WARNING_OFF,
@@ -14,13 +16,14 @@ import {
 	Weapon_info, Primary_weapon_to_weapon_info, Secondary_weapon_to_weapon_info
 } from './bm.js';
 import { hud_update_timers, hud_has_messages, hud_draw_messages } from './hud.js';
+import { hostage_get_in_level, hostage_get_level_saved } from './hostage.js';
 
 // --- Constants from GAUGES.C (320x200 coordinate space) ---
 
 // Cockpit modes (from GAME.H)
 const CM_FULL_COCKPIT = 0;
 const CM_REAR_VIEW = 1;
-// const CM_STATUS_BAR = 2;
+const CM_STATUS_BAR = 2;
 const CM_FULL_SCREEN = 3;
 
 let _cockpitMode = CM_FULL_COCKPIT;
@@ -117,6 +120,7 @@ let _shields = 100;
 let _energy = 100;
 let _primaryWeapon = 0;
 let _secondaryWeapon = 0;
+let _missileGun = 0;	// which missile gun fires next (Missile_gun); low bit picks the reticle frame
 let _laserLevel = 0;
 let _vulcanAmmo = 0;
 const _secondaryAmmo = [ 0, 0, 0, 0, 0 ];
@@ -138,6 +142,7 @@ let _paletteBlueAdd = 0;
 
 // White-out flash for mine destruction (0.0 to 1.0)
 let _whiteFlashAlpha = 0;
+let _countdownSecondsLeft = - 1;	// Reactor self-destruct countdown ("T-%d s"), -1 = inactive
 
 // --- Homing missile warning ---
 // Ported from: GAUGES.C lines 809-870
@@ -146,6 +151,7 @@ let _homingObjectDist = - 1;	// Distance of nearest homing weapon (-1 = none)
 let _lastWarningBeepTime = 0;	// GameTime when we last played the warning beep
 let _gameTime = 0;				// Current game time for blinking
 let _playerDead = false;		// Don't show warning when dead
+let _endlevelActive = false;	// End-level flythrough suppresses homing warnings
 let _playerExploded = false;	// True after death explosion starts (for "press any key" message)
 let _digi_play_sample = null;	// Sound callback (injected to avoid circular imports)
 let _SOUND_HOMING_WARNING = - 1;	// Sound ID for homing warning beep
@@ -215,6 +221,7 @@ export function gauges_update( state ) {
 	if ( state.energy !== undefined && state.energy !== _energy ) { _energy = state.energy; _dirty = true; }
 	if ( state.primaryWeapon !== undefined && state.primaryWeapon !== _primaryWeapon ) { _primaryWeapon = state.primaryWeapon; _dirty = true; }
 	if ( state.secondaryWeapon !== undefined && state.secondaryWeapon !== _secondaryWeapon ) { _secondaryWeapon = state.secondaryWeapon; _dirty = true; }
+	if ( state.missileGun !== undefined && state.missileGun !== _missileGun ) { _missileGun = state.missileGun; _dirty = true; }
 	if ( state.laserLevel !== undefined && state.laserLevel !== _laserLevel ) { _laserLevel = state.laserLevel; _dirty = true; }
 	if ( state.vulcanAmmo !== undefined && state.vulcanAmmo !== _vulcanAmmo ) { _vulcanAmmo = state.vulcanAmmo; _dirty = true; }
 
@@ -320,9 +327,44 @@ export function gauges_set_white_flash( alpha ) {
 
 }
 
-export function gauges_draw( dt ) {
+// Reactor self-destruct countdown seconds ("T-%d s" gauge); -1 = inactive.
+// Ported from: render_countdown_gauge() in GAME.C lines 1395-1407
+export function gauges_set_countdown_seconds( secs ) {
+
+	if ( secs !== _countdownSecondsLeft ) {
+
+		_countdownSecondsLeft = secs;
+		_dirty = true;
+
+	}
+
+}
+
+// Draw the reactor self-destruct countdown ("T-%d s") near the top of the screen.
+// Ported from: render_countdown_gauge() in GAME.C lines 1395-1407
+//   gr_set_fontcolor( gr_getcolor( 0, 63, 0 ), -1 ); gr_printf( 0x8000, y, "T-%d s", Fuelcen_seconds_left );
+function drawCountdownGauge( ctx ) {
+
+	if ( _countdownSecondsLeft < 0 || _countdownSecondsLeft >= 127 ) return;
+
+	ctx.fillStyle = '#00fc00';	// gr_getcolor( 0, 63, 0 )
+	ctx.font = 'bold 8px monospace';
+	ctx.textAlign = 'center';
+	ctx.fillText( 'T-' + _countdownSecondsLeft + ' s', COCKPIT_W / 2, 20 );
+	ctx.textAlign = 'left';
+
+}
+
+export function gauges_draw( dt, endlevelActive = false ) {
 
 	if ( _ctx === null ) return;
+
+	if ( endlevelActive !== _endlevelActive ) {
+
+		_endlevelActive = endlevelActive;
+		_dirty = true;
+
+	}
 
 	// --- Always update timers (regardless of dirty state) ---
 
@@ -353,7 +395,7 @@ export function gauges_draw( dt ) {
 
 	// --- Check for animated elements that need redraw ---
 
-	if ( _homingObjectDist >= 0 && _playerDead !== true ) _dirty = true;
+	if ( _homingObjectDist >= 0 && _playerDead !== true && _endlevelActive !== true ) _dirty = true;
 	if ( _cloakTimeRemaining > 0 ) _dirty = true;
 	if ( _invulnerableTimeRemaining > 0 ) _dirty = true;
 	if ( _whiteFlashAlpha > 0 ) _dirty = true;
@@ -404,6 +446,10 @@ export function gauges_draw( dt ) {
 		drawWeaponInfo( ctx, 1 );
 		drawHomingWarning( ctx );
 
+	} else if ( _cockpitMode === CM_STATUS_BAR ) {
+
+		drawStatusBarHUD( ctx );
+
 	} else {
 
 		// Full screen mode: draw compact text-based HUD info instead of cockpit
@@ -429,12 +475,16 @@ export function gauges_draw( dt ) {
 
 	}
 
+	// Draw reactor self-destruct countdown timer ("T-%d s")
+	// Ported from: render_countdown_gauge() in GAME.C lines 1395-1407
+	drawCountdownGauge( ctx );
+
 	// Draw "press any key" message during death
 	// Ported from: player_dead_message() in HUD.C lines 320-332
 	drawPlayerDeadMessage( ctx );
 
 	// Draw HUD messages
-	hud_draw_messages( ctx );
+	hud_draw_messages( ctx, _cockpitMode );
 
 	// Damage flash (palette effect)
 	// Ported from: gr_palette_step_up() — palette add values map to overlay alpha
@@ -572,11 +622,11 @@ function drawFullScreenHUD( ctx ) {
 	const shield = Math.max( 0, Math.floor( _shields ) );
 	const energy = Math.max( 0, Math.floor( _energy ) );
 
-	ctx.fillStyle = shield > 25 ? '#00ff00' : '#ff0000';
+	// C always draws these green (gr_getcolor(0,31,0)); there is no low-value warning color.
+	// Ported from: hud_show_shield()/hud_show_energy() in GAUGES.C:904, 1038
+	ctx.fillStyle = '#00ff00';
 	ctx.textAlign = 'left';
 	ctx.fillText( 'SHIELD: ' + shield, 4, COCKPIT_H - 18 );
-
-	ctx.fillStyle = energy > 25 ? '#00ff00' : '#ff0000';
 	ctx.fillText( 'ENERGY: ' + energy, 4, COCKPIT_H - 8 );
 
 	// Key indicators (bottom-left, above shield/energy)
@@ -584,6 +634,15 @@ function drawFullScreenHUD( ctx ) {
 	if ( _keysBlue === true ) { ctx.fillStyle = '#4444ff'; ctx.fillText( 'BLUE', 4, keyY ); keyY -= 10; }
 	if ( _keysGold === true ) { ctx.fillStyle = '#ffff00'; ctx.fillText( 'GOLD', 4, keyY ); keyY -= 10; }
 	if ( _keysRed === true ) { ctx.fillStyle = '#ff0000'; ctx.fillText( 'RED', 4, keyY ); }
+
+	// Hostage progress for the current level.
+	const levelHostages = hostage_get_in_level();
+	if ( levelHostages > 0 ) {
+
+		ctx.fillStyle = '#00cc00';
+		ctx.fillText( 'HOSTAGES: ' + hostage_get_level_saved() + '/' + levelHostages, 4, keyY - 10 );
+
+	}
 
 	// Primary weapon (bottom-right)
 	// Ported from: GAUGES.C hud_show_weapons_mode() lines 948-954
@@ -610,6 +669,77 @@ function drawFullScreenHUD( ctx ) {
 	ctx.textAlign = 'left';
 
 	// Homing warning still needed
+	drawHomingWarning( ctx );
+
+}
+
+function drawStatusBarHUD( ctx ) {
+
+	// Draw status bar background strip at the bottom of the 320x200 canvas.
+	let barY = COCKPIT_H - 40;
+	const sbCockpitIdx = cockpit_bitmap[ CM_STATUS_BAR ];
+
+	if ( sbCockpitIdx >= 0 ) {
+
+		const bm = getBitmapCanvas( sbCockpitIdx );
+		if ( bm !== null ) {
+
+			barY = COCKPIT_H - bm.height;
+			ctx.drawImage( bm, 0, barY );
+
+		} else {
+
+			ctx.fillStyle = '#000000';
+			ctx.fillRect( 0, barY, COCKPIT_W, 40 );
+
+		}
+
+	} else {
+
+		ctx.fillStyle = '#000000';
+		ctx.fillRect( 0, barY, COCKPIT_W, 40 );
+
+	}
+
+	// Status bar key icons use SB_GAUGE_* assets.
+	const sbBlueIdx = Gauges[ _keysBlue === true ? SB_GAUGE_BLUE_KEY : SB_GAUGE_BLUE_KEY_OFF ];
+	const sbGoldIdx = Gauges[ _keysGold === true ? SB_GAUGE_GOLD_KEY : SB_GAUGE_GOLD_KEY_OFF ];
+	const sbRedIdx = Gauges[ _keysRed === true ? SB_GAUGE_RED_KEY : SB_GAUGE_RED_KEY_OFF ];
+
+	if ( sbBlueIdx >= 0 ) drawBitmapComposited( ctx, sbBlueIdx, 6, barY + 7 );
+	if ( sbGoldIdx >= 0 ) drawBitmapComposited( ctx, sbGoldIdx, 19, barY + 7 );
+	if ( sbRedIdx >= 0 ) drawBitmapComposited( ctx, sbRedIdx, 32, barY + 7 );
+
+	// Optional status bar energy frame bitmap from original gauge table.
+	const sbEnergyIdx = Gauges[ SB_GAUGE_ENERGY ];
+	if ( sbEnergyIdx >= 0 ) drawBitmapComposited( ctx, sbEnergyIdx, 48, barY + 5 );
+
+	ctx.font = '6px monospace';
+	ctx.textBaseline = 'top';
+	ctx.textAlign = 'left';
+	ctx.fillStyle = '#00cc00';
+	ctx.fillText( 'SH ' + Math.max( 0, Math.floor( _shields ) ), 52, barY + 7 );
+	ctx.fillText( 'EN ' + Math.max( 0, Math.floor( _energy ) ), 52, barY + 15 );
+
+	const levelHostages = hostage_get_in_level();
+	if ( levelHostages > 0 ) {
+
+		ctx.fillText( 'HO ' + hostage_get_level_saved() + '/' + levelHostages, 52, barY + 23 );
+
+	}
+
+	// Compact weapon text at right side.
+	let primaryName = PRIMARY_NAMES[ _primaryWeapon ] || 'LASER';
+	if ( _primaryWeapon === 0 && _quadLasers === true ) primaryName = 'QUAD';
+	if ( _primaryWeapon === 1 ) primaryName = 'VUL ' + _vulcanAmmo;
+
+	const secondaryName = ( SECONDARY_NAMES[ _secondaryWeapon ] || 'CONCUSSION' ).replace( '\n', ' ' );
+	const secondaryAmmo = _secondaryAmmo[ _secondaryWeapon ];
+
+	ctx.textAlign = 'right';
+	ctx.fillText( primaryName, COCKPIT_W - 6, barY + 7 );
+	ctx.fillText( secondaryName + ' x' + secondaryAmmo, COCKPIT_W - 6, barY + 15 );
+
 	drawHomingWarning( ctx );
 
 }
@@ -824,8 +954,11 @@ function drawReticle( ctx ) {
 	// Draw reticle at center of game view
 	// Ported from: GAUGES.C show_reticle() lines 1821-1869
 	const cx = COCKPIT_W / 2;
-	// In cockpit mode, 3D viewport is top 70% — center at y=70 in 320x200 space
-	const cy = ( _cockpitMode === CM_FULL_COCKPIT || _cockpitMode === CM_REAR_VIEW ) ? 70 : COCKPIT_H / 2;
+	// In full cockpit mode, 3D viewport is top 70% — center at y=70 in 320x200 space.
+	// In status bar mode, gameplay window is top 160px.
+	let cy = COCKPIT_H / 2;
+	if ( _cockpitMode === CM_FULL_COCKPIT || _cockpitMode === CM_REAR_VIEW ) cy = 70;
+	if ( _cockpitMode === CM_STATUS_BAR ) cy = 80;
 
 	// Determine primary weapon readiness (has energy/ammo)
 	// Ported from: player_has_weapon() — check energy for energy weapons, ammo for vulcan
@@ -873,25 +1006,39 @@ function drawReticle( ctx ) {
 
 		secondaryReady += 3;	// now 3 (not ready) or 4 (ready)
 
+	} else if ( secondaryReady > 0 && ( _missileGun & 1 ) === 0 ) {
+
+		// Concussion/Homing: show the alternate reticle frame for the gun that fires next.
+		// Ported from: GAUGES.C:1846 — else if (secondary_bm_num && !(Missile_gun&1)) secondary_bm_num++;
+		secondaryReady ++;
+
 	}
 
 	// Cross is lit if either primary or secondary is ready
 	// Ported from: GAUGES.C line 1848
 	const crossReady = ( primaryReady > 0 || secondaryReady > 0 ) ? 1 : 0;
 
-	// Use the big reticle bitmaps
-	const crossIdx = Gauges[ RETICLE_CROSS + crossReady ];
+	// Status bar mode uses the small reticle assets.
+	const useSmallReticle = ( _cockpitMode === CM_STATUS_BAR );
+	const crossBase = useSmallReticle === true ? SML_RETICLE_CROSS : RETICLE_CROSS;
+	const primaryBase = useSmallReticle === true ? SML_RETICLE_PRIMARY : RETICLE_PRIMARY;
+	const secondaryBase = useSmallReticle === true ? SML_RETICLE_SECONDARY : RETICLE_SECONDARY;
+
+	const crossIdx = Gauges[ crossBase + crossReady ];
 	if ( crossIdx >= 0 ) drawBitmapComposited( ctx, crossIdx, cx - 4, cy - 2 );
 
-	const priIdx = Gauges[ RETICLE_PRIMARY + primaryReady ];
+	const priIdx = Gauges[ primaryBase + primaryReady ];
 	if ( priIdx >= 0 ) drawBitmapComposited( ctx, priIdx, cx - 15, cy + 6 );
 
-	const secIdx = Gauges[ RETICLE_SECONDARY + secondaryReady ];
+	const secIdx = Gauges[ secondaryBase + secondaryReady ];
 	if ( secIdx >= 0 ) drawBitmapComposited( ctx, secIdx, cx - 12, cy + 1 );
 
 }
 
 function drawScoreLives( ctx ) {
+
+	// Status bar has its own compact bottom strip info.
+	if ( _cockpitMode === CM_STATUS_BAR ) return;
 
 	// Score (top right)
 	ctx.font = '7px monospace';
@@ -934,9 +1081,8 @@ function drawCloakInvulnIndicators( ctx ) {
 	if ( _cloakTimeRemaining > 0 ) {
 
 		// Show solid if > 3 seconds remaining, blink if <= 3 seconds
-		// Blink: use GameTime bit pattern (toggle every ~0.25s)
-		// Ported from: GAUGES.C line 1020 — (GameTime & 0x8000)
-		const show = ( _cloakTimeRemaining > 3.0 ) || ( ( Math.floor( _gameTime * 4 ) & 1 ) === 0 );
+		// Blink toggles every 0.5s (1 Hz). Ported from: GAUGES.C line 1020 — (GameTime & 0x8000)
+		const show = ( _cloakTimeRemaining > 3.0 ) || ( ( Math.floor( _gameTime * 2 ) & 1 ) === 0 );
 
 		if ( show === true ) {
 
@@ -951,8 +1097,8 @@ function drawCloakInvulnIndicators( ctx ) {
 	if ( _invulnerableTimeRemaining > 0 ) {
 
 		// Show solid if > 4 seconds remaining, blink if <= 4 seconds
-		// Ported from: GAUGES.C line 1031
-		const show = ( _invulnerableTimeRemaining > 4.0 ) || ( ( Math.floor( _gameTime * 4 ) & 1 ) === 0 );
+		// Blink toggles every 0.5s (1 Hz). Ported from: GAUGES.C line 1031 — (GameTime & 0x8000)
+		const show = ( _invulnerableTimeRemaining > 4.0 ) || ( ( Math.floor( _gameTime * 2 ) & 1 ) === 0 );
 
 		if ( show === true ) {
 
@@ -1018,7 +1164,7 @@ const HOMING_WARNING_Y = 171;
 
 function drawHomingWarning( ctx ) {
 
-	if ( _playerDead === true ) return;
+	if ( _playerDead === true || _endlevelActive === true ) return;
 
 	if ( _homingObjectDist >= 0 ) {
 
@@ -1026,11 +1172,13 @@ function drawHomingWarning( ctx ) {
 		// In C: GameTime is F1_0 per second (65536), bit 0x4000 toggles ~2 Hz
 		// In JS: _gameTime is seconds, so toggle every 0.25s
 		const blink = ( Math.floor( _gameTime * 4 ) & 1 ) === 0;
+		const warningY = ( _cockpitMode === CM_STATUS_BAR ) ? ( COCKPIT_H - 26 ) : HOMING_WARNING_Y;
+		const lockY = ( _cockpitMode === CM_STATUS_BAR ) ? ( COCKPIT_H - 32 ) : ( COCKPIT_H - 75 );
 
 		if ( blink === true ) {
 
 			// Draw "ON" warning bitmap at cockpit position
-			drawBitmap( ctx, Gauges[ GAUGE_HOMING_WARNING_ON ], HOMING_WARNING_X, HOMING_WARNING_Y );
+			drawBitmap( ctx, Gauges[ GAUGE_HOMING_WARNING_ON ], HOMING_WARNING_X, warningY );
 
 			// Draw "LOCK" text at bottom center of view
 			// Ported from: hud_show_homing_warning() in GAUGES.C line 871
@@ -1038,13 +1186,13 @@ function drawHomingWarning( ctx ) {
 			ctx.font = '7px monospace';
 			ctx.fillStyle = '#00ff00';
 			ctx.textAlign = 'center';
-			ctx.fillText( 'LOCK', COCKPIT_W / 2, COCKPIT_H - 75 );
+			ctx.fillText( 'LOCK', COCKPIT_W / 2, lockY );
 			ctx.restore();
 
 		} else {
 
 			// Draw "OFF" warning bitmap (blank indicator)
-			drawBitmap( ctx, Gauges[ GAUGE_HOMING_WARNING_OFF ], HOMING_WARNING_X, HOMING_WARNING_Y );
+			drawBitmap( ctx, Gauges[ GAUGE_HOMING_WARNING_OFF ], HOMING_WARNING_X, warningY );
 
 		}
 
@@ -1056,7 +1204,7 @@ function drawHomingWarning( ctx ) {
 // Ported from: play_homing_warning() in GAUGES.C lines 809-830
 function playHomingWarningBeep() {
 
-	if ( _playerDead === true ) return;
+	if ( _endlevelActive === true || _playerDead === true ) return;
 	if ( _homingObjectDist < 0 ) return;
 	if ( _digi_play_sample === null ) return;
 
@@ -1069,7 +1217,7 @@ function playHomingWarningBeep() {
 	// Play beep every beepDelay/2 seconds
 	if ( _gameTime - _lastWarningBeepTime > beepDelay / 2.0 ) {
 
-		_digi_play_sample( _SOUND_HOMING_WARNING, 0.6 );
+		_digi_play_sample( _SOUND_HOMING_WARNING, 1.0 );
 		_lastWarningBeepTime = _gameTime;
 
 	}

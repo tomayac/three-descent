@@ -70,6 +70,7 @@ export const OF_ATTACHED = 16;
 export const MAX_OBJECTS = 350;
 const MAX_AI_FLAGS = 11;
 const MAX_SUBMODELS = 10;
+const FIXANG_TO_RADIANS = 2 * Math.PI / 65536;
 
 export class PhysicsInfo {
 
@@ -201,6 +202,7 @@ export class GameObject {
 		this.contains_type = 0;
 		this.contains_id = 0;
 		this.contains_count = 0;
+		this.matcen_creator = 0;
 
 		this.lifeleft = 0;
 
@@ -243,9 +245,9 @@ function readMatrix( fp ) {
 function readAngVec( fp ) {
 
 	return {
-		p: fp.readShort(),
-		b: fp.readShort(),
-		h: fp.readShort()
+		p: fp.readShort() * FIXANG_TO_RADIANS,
+		b: fp.readShort() * FIXANG_TO_RADIANS,
+		h: fp.readShort() * FIXANG_TO_RADIANS
 	};
 
 }
@@ -331,7 +333,7 @@ export function read_object( fp, version ) {
 			phys.rotthrust_y = rotthrust.y;
 			phys.rotthrust_z = rotthrust.z;
 
-			phys.turnroll = fp.readShort();
+			phys.turnroll = fp.readShort() * FIXANG_TO_RADIANS;
 			phys.flags = fp.readUShort();
 
 			obj.mtype = phys;
@@ -584,6 +586,7 @@ function reset_object( obj ) {
 	obj.contains_type = 0;
 	obj.contains_id = 0;
 	obj.contains_count = 0;
+	obj.matcen_creator = 0;
 
 	obj.lifeleft = 0;
 
@@ -800,6 +803,10 @@ export function obj_create( type, id, segnum, pos_x, pos_y, pos_z,
 
 		obj.ctype = { count: 1 };
 
+	} else if ( ctype === CT_AI ) {
+
+		obj.ctype = new AIInfo();
+
 	}
 
 	// Init polyobj tmap_override
@@ -807,6 +814,11 @@ export function obj_create( type, id, segnum, pos_x, pos_y, pos_z,
 
 		obj.rtype = new PolyObjInfo();
 		obj.rtype.tmap_override = - 1;
+
+	} else if ( rtype === RT_WEAPON_VCLIP || rtype === RT_HOSTAGE ||
+		rtype === RT_POWERUP || rtype === RT_FIREBALL ) {
+
+		obj.rtype = new VClipInfo();
 
 	}
 
@@ -883,6 +895,11 @@ export function reset_objects( n_objs ) {
 		}
 
 	}
+
+	// GAMESAVE.C assigns one monotonically increasing signature to each loaded
+	// object before rebuilding the free list.  Continue after that range so a
+	// runtime-created object cannot alias a loaded object's signature.
+	Object_next_signature = n_objs;
 
 	console.log( 'OBJECT: reset_objects — ' + num_objects + ' active, highest=' + Highest_object_index );
 

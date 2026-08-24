@@ -16,9 +16,14 @@ import {
 	N_robot_types,
 	ObjType, ObjId, ObjStrength, MAX_OBJTYPE,
 	OL_PLAYER, OL_ROBOT, OL_CONTROL_CENTER, OL_CLUTTER, OL_EXIT,
-	Num_total_object_types, set_Num_total_object_types
+	Num_total_object_types, set_Num_total_object_types,
+	ObjBitmaps, ObjBitmapPtrs, MAX_OBJ_BITMAPS,
+	set_N_ObjBitmaps, set_N_ObjBitmapPtrs,
+	Dead_modelnums, Dying_modelnums, Player_ship,
+	set_First_multi_bitmap_num, set_exit_modelnums
 } from './bm.js';
-import { SHAREWARE_MODEL_TABLE } from './polyobj.js';
+import { polyobj_set_shareware_model_descriptors } from './polyobj.js';
+import { BM_FLAG_NO_LIGHTING } from './piggy.js';
 
 // Decode XOR/rotate-encrypted bitmaps.bin text
 // Mirrors decode_text_line() in BMREAD.C
@@ -29,6 +34,14 @@ function decodeBitmapsBin( data ) {
 	for ( let i = 0; i < data.length; i ++ ) {
 
 		let b = data[ i ];
+		// cfgets() left each physical line's LF outside BMREAD.C's decode loop.
+		// Retain it so a leading @ remains a property of that source line.
+		if ( b === 10 || b === 13 ) {
+
+			decoded[ i ] = b;
+			continue;
+
+		}
 
 		// rotate left
 		const bit7a = ( b & 0x80 ) !== 0 ? 1 : 0;
@@ -54,6 +67,402 @@ function decodeBitmapsBin( data ) {
 	}
 
 	return text;
+
+}
+
+function sharewareModelBitmapIndex( token, pigFile ) {
+
+	const name = token.replace( /\.bbm$/i, '' );
+	const bitmapIndex = pigFile.findBitmapIndexByName( name );
+	if ( bitmapIndex < 0 ) throw new Error( 'Missing shareware object bitmap: ' + token );
+	return bitmapIndex;
+
+}
+
+// Reproduce the two object-bitmap counters and polygon-model load calls made by
+// BMREAD.C while walking BITMAPS.BIN.  Parsing these declarations by category
+// loses their shared allocation order, which is part of the on-disk model ABI.
+export function bm_build_shareware_object_table( text, pigFile ) {
+
+	ObjBitmaps.fill( - 1 );
+	ObjBitmapPtrs.fill( 0 );
+	Dead_modelnums.fill( - 1 );
+	Dying_modelnums.fill( - 1 );
+	set_N_ObjBitmaps( 0 );
+	set_N_ObjBitmapPtrs( 0 );
+	set_First_multi_bitmap_num( - 1 );
+	set_exit_modelnums( - 1, - 1 );
+	Player_ship.model_num = - 1;
+	Player_ship.expl_vclip_num = - 1;
+	Player_ship.mass = 0;
+	Player_ship.drag = 0;
+	Player_ship.max_thrust = 0;
+	Player_ship.reverse_thrust = 0;
+	Player_ship.brakes = 0;
+	Player_ship.wiggle = 0;
+	Player_ship.max_rotthrust = 0;
+	Player_ship.loaded = false;
+
+	for ( let i = 0; i < Effects.length; i ++ ) {
+
+		Effects[ i ].changing_object_texture = - 1;
+
+	}
+
+	let nObjBitmaps = 0;
+	let nObjBitmapPtrs = 0;
+	const descriptors = [];
+	const robotModelNums = [];
+	const weaponModelNums = [];
+	const objectModelNums = [];
+	let robotId = 0;
+	let weaponId = 0;
+	let pendingObjectEclip = null;
+	let playerModels = null;
+
+	function allocateObjectBitmap( bitmapIndex ) {
+
+		if ( nObjBitmaps >= MAX_OBJ_BITMAPS ) throw new Error( 'Too many shareware object bitmaps' );
+		const slot = nObjBitmaps ++;
+		ObjBitmaps[ slot ] = bitmapIndex;
+		return slot;
+
+	}
+
+	function appendObjectBitmapPtr( slot ) {
+
+		if ( nObjBitmapPtrs >= MAX_OBJ_BITMAPS ) throw new Error( 'Too many shareware object bitmap pointers' );
+		ObjBitmapPtrs[ nObjBitmapPtrs ++ ] = slot;
+
+	}
+
+	function addTextureToken( token, lighted ) {
+
+		const effectMatch = token.match( /^%(\d+)$/ );
+		if ( effectMatch !== null ) {
+
+			const effectNum = parseInt( effectMatch[ 1 ], 10 );
+			if ( effectNum < 0 || effectNum >= Effects.length ) {
+
+				throw new Error( 'Invalid shareware object eclip: ' + token );
+
+			}
+
+			let slot = Effects[ effectNum ].changing_object_texture;
+			if ( slot < 0 ) {
+
+				slot = allocateObjectBitmap( - 1 );
+				Effects[ effectNum ].changing_object_texture = slot;
+
+			}
+			appendObjectBitmapPtr( slot );
+			return true;
+
+		}
+
+		if ( /\.bbm$/i.test( token ) !== true || token.indexOf( '=' ) !== - 1 ) return false;
+
+		const bitmapIndex = sharewareModelBitmapIndex( token, pigFile );
+		if ( lighted !== true ) pigFile.setBitmapFlag( bitmapIndex, BM_FLAG_NO_LIGHTING, true );
+		appendObjectBitmapPtr( allocateObjectBitmap( bitmapIndex ) );
+		return true;
+
+	}
+
+	function addDescriptor( filename, firstTexture, endTexture ) {
+
+		if ( endTexture < firstTexture ) throw new Error( 'Invalid shareware model texture range' );
+		const descriptor = {
+			filename: filename,
+			first_texture: firstTexture,
+			n_textures: endTexture - firstTexture,
+			simpler_model: 0,
+			textureObjectBitmapSlots: Array.from( ObjBitmapPtrs.subarray( firstTexture, endTexture ) )
+		};
+		const modelNum = descriptors.length;
+		descriptors.push( descriptor );
+		return modelNum;
+
+	}
+
+	function addVariants( variants, finalTexture ) {
+
+		const modelNums = [];
+		for ( let i = 0; i < variants.length; i ++ ) {
+
+			const endTexture = i + 1 < variants.length ? variants[ i + 1 ].firstTexture : finalTexture;
+			modelNums.push( addDescriptor( variants[ i ].filename, variants[ i ].firstTexture, endTexture ) );
+
+		}
+		for ( let i = 0; i + 1 < modelNums.length; i ++ ) {
+
+			descriptors[ modelNums[ i ] ].simpler_model = modelNums[ i + 1 ] + 1;
+
+		}
+		return modelNums;
+
+	}
+
+	const lines = text.split( /\r?\n/ );
+	for ( let lineNum = 0; lineNum < lines.length; lineNum ++ ) {
+
+		let line = lines[ lineNum ];
+		const comment = line.indexOf( ';' );
+		if ( comment !== - 1 ) line = line.substring( 0, comment );
+		line = line.trim();
+		if ( line.length === 0 ) continue;
+
+		const registeredOnly = line.charAt( 0 ) === '@';
+		if ( registeredOnly === true ) line = line.substring( 1 );
+		const tokens = line.trim().split( /\s+/ );
+		const directive = tokens[ 0 ];
+
+		if ( directive.charAt( 0 ) === '$' ) pendingObjectEclip = null;
+
+		if ( directive === '$ROBOT' ) {
+
+			const thisRobot = robotId ++;
+			if ( registeredOnly === true ) {
+
+				robotModelNums[ thisRobot ] = - 1;
+				continue;
+
+			}
+
+			const variants = [ { filename: tokens[ 1 ], firstTexture: nObjBitmapPtrs } ];
+			for ( let i = 2; i < tokens.length; i ++ ) {
+
+				const token = tokens[ i ];
+				if ( token.startsWith( 'simple_model=' ) ) {
+
+					variants.push( { filename: token.substring( 13 ), firstTexture: nObjBitmapPtrs } );
+
+				} else {
+
+					addTextureToken( token, true );
+
+				}
+
+			}
+			const modelNums = addVariants( variants, nObjBitmapPtrs );
+			robotModelNums[ thisRobot ] = modelNums[ 0 ];
+
+		} else if ( directive === '$OBJECT' ) {
+
+			const firstTexture = nObjBitmapPtrs;
+			let deadFilename = null;
+			let deadFirstTexture = - 1;
+			let objectType = '';
+
+			for ( let i = 2; i < tokens.length; i ++ ) {
+
+				const token = tokens[ i ];
+				if ( token.startsWith( 'dead_pof=' ) ) {
+
+					deadFilename = token.substring( 9 );
+					deadFirstTexture = nObjBitmapPtrs;
+
+				} else if ( token.startsWith( 'type=' ) ) {
+
+					objectType = token.substring( 5 ).toLowerCase();
+
+				} else {
+
+					addTextureToken( token, true );
+
+				}
+
+			}
+
+			const mainEnd = deadFilename !== null ? deadFirstTexture : nObjBitmapPtrs;
+			const mainModel = addDescriptor( tokens[ 1 ], firstTexture, mainEnd );
+			const deadModel = deadFilename !== null
+				? addDescriptor( deadFilename, deadFirstTexture, nObjBitmapPtrs ) : - 1;
+			Dead_modelnums[ mainModel ] = deadModel;
+			objectModelNums.push( { model_num: mainModel, dead_model_num: deadModel } );
+			if ( objectType === 'exit' ) set_exit_modelnums( mainModel, deadModel );
+
+		} else if ( directive === '$PLAYER_SHIP' ) {
+
+			const variants = [];
+			let dyingFilename = null;
+			let multiTexture = - 1;
+			let playerMetadataValid = true;
+
+			for ( let i = 1; i < tokens.length; i ++ ) {
+
+				const token = tokens[ i ];
+				if ( token.startsWith( 'model=' ) ) {
+
+					variants.push( { filename: token.substring( 6 ), firstTexture: nObjBitmapPtrs } );
+
+				} else if ( token.startsWith( 'simple_model=' ) ) {
+
+					variants.push( { filename: token.substring( 13 ), firstTexture: nObjBitmapPtrs } );
+
+				} else if ( token.startsWith( 'dying_pof=' ) ) {
+
+					dyingFilename = token.substring( 10 );
+
+				} else if ( token.startsWith( 'expl_vclip_num=' ) ) {
+
+					const value = Number( token.substring( 15 ) );
+					if ( Number.isInteger( value ) !== true ) playerMetadataValid = false;
+					else Player_ship.expl_vclip_num = value;
+
+				} else if ( token.startsWith( 'mass=' ) || token.startsWith( 'drag=' ) ||
+					token.startsWith( 'max_thrust=' ) || token.startsWith( 'reverse_thrust=' ) ||
+					token.startsWith( 'brakes=' ) || token.startsWith( 'wiggle=' ) ||
+					token.startsWith( 'max_rotthrust=' ) ) {
+
+					const separator = token.indexOf( '=' );
+					const key = token.substring( 0, separator );
+					const value = Number( token.substring( separator + 1 ) );
+					if ( Number.isFinite( value ) !== true ) {
+
+						playerMetadataValid = false;
+
+					} else {
+
+						Player_ship[ key ] = value;
+
+					}
+
+				} else if ( token === 'multi_textures' ) {
+
+					multiTexture = nObjBitmapPtrs;
+					set_First_multi_bitmap_num( multiTexture );
+
+				} else {
+
+					addTextureToken( token, true );
+
+				}
+
+			}
+
+			if ( variants.length === 0 ) throw new Error( 'Shareware player ship has no model' );
+			const modelEnd = multiTexture >= 0 ? multiTexture : nObjBitmapPtrs;
+			const modelNums = addVariants( variants, modelEnd );
+			const mainDescriptor = descriptors[ modelNums[ 0 ] ];
+			const dyingModel = dyingFilename !== null
+				? addDescriptor(
+					dyingFilename,
+					mainDescriptor.first_texture,
+					mainDescriptor.first_texture + mainDescriptor.n_textures
+				) : - 1;
+			Dying_modelnums[ modelNums[ 0 ] ] = dyingModel;
+			Player_ship.model_num = modelNums[ 0 ];
+			if ( playerMetadataValid !== true ) {
+
+				throw new Error( 'Invalid shareware player ship metadata' );
+
+			}
+			Player_ship.loaded = true;
+			playerModels = { model_num: modelNums[ 0 ], dying_model_num: dyingModel };
+
+		} else if ( directive === '$WEAPON' || directive === '$WEAPON_UNUSED' ) {
+
+			const thisWeapon = weaponId ++;
+			const assignment = { model_num: - 1, model_num_inner: - 1 };
+			weaponModelNums[ thisWeapon ] = assignment;
+			if ( registeredOnly === true || directive === '$WEAPON_UNUSED' ) continue;
+
+			const variants = [];
+			let innerFilename = null;
+			let lighted = true;
+
+			for ( let i = 1; i < tokens.length; i ++ ) {
+
+				const token = tokens[ i ];
+				if ( token.startsWith( 'weapon_pof_inner=' ) ) {
+
+					innerFilename = token.substring( 17 );
+
+				} else if ( token.startsWith( 'weapon_pof=' ) ) {
+
+					variants.push( { filename: token.substring( 11 ), firstTexture: nObjBitmapPtrs } );
+
+				} else if ( token.startsWith( 'simple_model=' ) ) {
+
+					variants.push( { filename: token.substring( 13 ), firstTexture: nObjBitmapPtrs } );
+
+				} else if ( token.startsWith( 'lighted=' ) ) {
+
+					lighted = parseInt( token.substring( 8 ), 10 ) !== 0;
+
+				} else if ( addTextureToken( token, lighted ) === true ) {
+
+					lighted = true;
+
+				}
+
+			}
+
+			if ( variants.length > 0 ) {
+
+				const modelNums = addVariants( variants, nObjBitmapPtrs );
+				assignment.model_num = modelNums[ 0 ];
+				if ( innerFilename !== null ) {
+
+					const mainDescriptor = descriptors[ modelNums[ 0 ] ];
+					assignment.model_num_inner = addDescriptor(
+						innerFilename,
+						mainDescriptor.first_texture,
+						mainDescriptor.first_texture + mainDescriptor.n_textures
+					);
+
+				}
+
+			}
+
+		} else if ( directive === '$ECLIP' ) {
+
+			const clipNumToken = tokens.find( token => token.startsWith( 'clip_num=' ) );
+			const objectToken = tokens.find( token => token.startsWith( 'obj_eclip=' ) );
+			if ( clipNumToken !== undefined && objectToken !== undefined &&
+				parseInt( objectToken.substring( 10 ), 10 ) !== 0 ) {
+
+				pendingObjectEclip = parseInt( clipNumToken.substring( 9 ), 10 );
+
+			}
+
+		} else if ( pendingObjectEclip !== null && /\.abm$/i.test( directive ) ) {
+
+			const effectNum = pendingObjectEclip;
+			if ( effectNum < 0 || effectNum >= Effects.length ) {
+
+				throw new Error( 'Invalid shareware object eclip definition: ' + effectNum );
+
+			}
+			let slot = Effects[ effectNum ].changing_object_texture;
+			if ( slot < 0 ) {
+
+				slot = allocateObjectBitmap( - 1 );
+				Effects[ effectNum ].changing_object_texture = slot;
+
+			}
+			let bitmapIndex = 0;
+			if ( registeredOnly !== true && Effects[ effectNum ].vc_num_frames > 0 ) {
+
+				bitmapIndex = Effects[ effectNum ].vc_frames[ 0 ];
+
+			}
+			ObjBitmaps[ slot ] = bitmapIndex;
+			pendingObjectEclip = null;
+
+		}
+
+	}
+
+	set_N_ObjBitmaps( nObjBitmaps );
+	set_N_ObjBitmapPtrs( nObjBitmapPtrs );
+	polyobj_set_shareware_model_descriptors( descriptors );
+
+	console.log( 'BM: Built shareware object table: ' + nObjBitmaps + ' bitmaps, ' +
+		nObjBitmapPtrs + ' pointers, ' + descriptors.length + ' model entries' );
+
+	return { robotModelNums, weaponModelNums, objectModelNums, playerModels };
 
 }
 
@@ -294,6 +703,7 @@ export function bm_build_shareware_texture_table( hogFile, pigFile ) {
 	// Must come BEFORE wclips — in original code, eclips allocate Textures[] slots
 	// between the regular textures and the door frame textures
 	const eclipTextureCount = bm_parse_shareware_eclips( text, pigFile );
+	const objectTable = bm_build_shareware_object_table( text, pigFile );
 
 	// Parse wall animation clips from bitmaps.bin
 	// Door frame textures come after eclip textures
@@ -309,7 +719,7 @@ export function bm_build_shareware_texture_table( hogFile, pigFile ) {
 	set_Num_total_object_types( 1 );
 
 	// Parse robot data from bitmaps.bin
-	bm_parse_shareware_robots( text );
+	bm_parse_shareware_robots( text, objectTable.robotModelNums );
 	bm_parse_shareware_robot_ai( text );
 
 	// Add robot entries to ObjType table
@@ -317,14 +727,14 @@ export function bm_build_shareware_texture_table( hogFile, pigFile ) {
 	bm_populate_robot_obj_types();
 
 	// Parse weapon data from bitmaps.bin
-	bm_parse_shareware_weapons( text, pigFile, hogFile );
+	bm_parse_shareware_weapons( text, pigFile, objectTable.weaponModelNums );
 
 	// Parse powerup data from bitmaps.bin
 	bm_parse_shareware_powerups( text );
 
 	// Parse object data (reactors, exit models, clutter) from bitmaps.bin
 	// Ported from: bm_read_object() in BMREAD.C lines 1268-1359
-	bm_parse_shareware_objects( text );
+	bm_parse_shareware_objects( text, objectTable.objectModelNums );
 
 	// Parse cockpit and gauge bitmap data from bitmaps.bin
 	bm_parse_shareware_cockpit( text, pigFile );
@@ -352,42 +762,50 @@ function bm_parse_shareware_wclips( text, pigFile, startTextureCount ) {
 		if ( idx === - 1 ) break;
 
 		pos = idx + 6;
+		let entryEnd = text.length;
+		const nextDollar = text.indexOf( '$', pos );
+		if ( nextDollar !== - 1 ) entryEnd = nextDollar;
+		const entry = text.substring( pos, entryEnd );
 
 		// Parse clip_num (format: clip_num=N or clip_num N)
-		const clipNumMatch = text.substring( pos, pos + 60 ).match( /clip_num[=\s]+(\d+)/ );
+		const clipNumMatch = entry.match( /clip_num[=\s]+(\d+)/ );
 		if ( clipNumMatch === null ) continue;
 
 		const clipNum = parseInt( clipNumMatch[ 1 ] );
 		if ( clipNum >= MAX_WALL_ANIMS ) continue;
 
 		// Parse time (format: time=N or time N)
-		const timeMatch = text.substring( pos, pos + 200 ).match( /time[=\s]+([\d.]+)/ );
+		const timeMatch = entry.match( /time[=\s]+([\d.]+)/ );
 		const playTime = timeMatch !== null ? parseFloat( timeMatch[ 1 ] ) : 1.0;
 
+		// Parse vlighting.  BMREAD.C applies its sign to every bitmap frame.
+		const lightMatch = entry.match( /vlighting[=\s]+(-?[\d.]+)/ );
+		const lightValue = lightMatch !== null ? parseFloat( lightMatch[ 1 ] ) : 0;
+
 		// Parse open_sound
-		const openSoundMatch = text.substring( pos, pos + 200 ).match( /open_sound[=\s]+(-?\d+)/ );
+		const openSoundMatch = entry.match( /open_sound[=\s]+(-?\d+)/ );
 		const openSound = openSoundMatch !== null ? parseInt( openSoundMatch[ 1 ] ) : - 1;
 
 		// Parse close_sound
-		const closeSoundMatch = text.substring( pos, pos + 200 ).match( /close_sound[=\s]+(-?\d+)/ );
+		const closeSoundMatch = entry.match( /close_sound[=\s]+(-?\d+)/ );
 		const closeSound = closeSoundMatch !== null ? parseInt( closeSoundMatch[ 1 ] ) : - 1;
 
 		// Parse flags
 		let flags = 0;
-		const tmap1Match = text.substring( pos, pos + 200 ).match( /tmap1_flag[=\s]+(\d+)/ );
+		const tmap1Match = entry.match( /tmap1_flag[=\s]+(\d+)/ );
 		if ( tmap1Match !== null && parseInt( tmap1Match[ 1 ] ) !== 0 ) flags |= WCF_TMAP1;
 
-		const blastableMatch = text.substring( pos, pos + 200 ).match( /blastable[=\s]+(\d+)/ );
+		const blastableMatch = entry.match( /blastable[=\s]+(\d+)/ );
 		if ( blastableMatch !== null && parseInt( blastableMatch[ 1 ] ) !== 0 ) flags |= WCF_BLASTABLE;
 
-		const explodesMatch = text.substring( pos, pos + 200 ).match( /explodes[=\s]+(\d+)/ );
+		const explodesMatch = entry.match( /explodes[=\s]+(\d+)/ );
 		if ( explodesMatch !== null && parseInt( explodesMatch[ 1 ] ) !== 0 ) flags |= WCF_EXPLODES;
 
-		const hiddenMatch = text.substring( pos, pos + 200 ).match( /hidden[=\s]+(\d+)/ );
+		const hiddenMatch = entry.match( /hidden[=\s]+(\d+)/ );
 		if ( hiddenMatch !== null && parseInt( hiddenMatch[ 1 ] ) !== 0 ) flags |= WCF_HIDDEN;
 
 		// Find the .abm filename
-		const abmMatch = text.substring( pos, pos + 300 ).match( /([a-zA-Z][a-zA-Z0-9]*)\.abm/ );
+		const abmMatch = entry.match( /([a-zA-Z][a-zA-Z0-9]*)\.abm/ );
 		if ( abmMatch === null ) continue;
 
 		const baseName = abmMatch[ 1 ];
@@ -399,6 +817,8 @@ function bm_parse_shareware_wclips( text, pigFile, startTextureCount ) {
 			const frameName = baseName + '#' + f;
 			const bmIdx = pigFile.findBitmapIndexByName( frameName );
 			if ( bmIdx < 0 ) break;
+
+			pigFile.setBitmapFlag( bmIdx, BM_FLAG_NO_LIGHTING, lightValue < 0 );
 
 			// Add as new texture entry
 			if ( texture_count < MAX_TEXTURES ) {
@@ -549,6 +969,14 @@ function bm_parse_shareware_eclips( text, pigFile ) {
 			const bmIdx = pigFile.findBitmapIndexByName( frameName );
 			if ( bmIdx < 0 ) break;
 			frames.push( bmIdx );
+
+		}
+
+		// BMREAD.C set_lighting_flag(): all frames of a clip share the current
+		// vlighting value.  Update the persisted copy used by pageIn(), too.
+		for ( let i = 0; i < frames.length; i ++ ) {
+
+			pigFile.setBitmapFlag( frames[ i ], BM_FLAG_NO_LIGHTING, lightValue < 0 );
 
 		}
 
@@ -1049,21 +1477,7 @@ function bm_populate_robot_obj_types() {
 // Parse $OBJECT entries from decoded bitmaps.bin text
 // Each entry defines a non-robot polygon object (reactor, exit, clutter)
 // Ported from: bm_read_object() in BMREAD.C lines 1268-1359
-function bm_parse_shareware_objects( text ) {
-
-	// Build POF filename -> model index lookup from SHAREWARE_MODEL_TABLE
-	const pofNameToIndex = new Map();
-	for ( let i = 0; i < SHAREWARE_MODEL_TABLE.length; i ++ ) {
-
-		const name = SHAREWARE_MODEL_TABLE[ i ].toLowerCase();
-		// Only store first occurrence (some models are reused with different indices)
-		if ( pofNameToIndex.has( name ) !== true ) {
-
-			pofNameToIndex.set( name, i );
-
-		}
-
-	}
+function bm_parse_shareware_objects( text, objectModelNums ) {
 
 	let count = 0;
 	let pos = 0;
@@ -1086,11 +1500,11 @@ function bm_parse_shareware_objects( text ) {
 
 		const modelName = modelMatch[ 1 ].toLowerCase();
 
-		// Look up model index from our model table
-		const modelIndex = pofNameToIndex.get( modelName );
-		if ( modelIndex === undefined ) {
+		const assignment = objectModelNums[ count ];
+		const modelIndex = assignment !== undefined ? assignment.model_num : - 1;
+		if ( modelIndex < 0 ) {
 
-			console.warn( 'BM: $OBJECT model not found: ' + modelName );
+			console.warn( 'BM: $OBJECT model has no shareware descriptor: ' + modelName );
 			continue;
 
 		}

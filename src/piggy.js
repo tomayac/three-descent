@@ -282,6 +282,47 @@ export class PigFile {
 
 	}
 
+	// Set or clear a persisted bitmap flag and keep an already-registered
+	// GameBitmap in sync.  bitmapFlags[] is authoritative when pageIn() replaces
+	// BM_FLAG_PAGED_OUT, so table-driven flags must update both copies.
+	setBitmapFlag( bitmapIndex, flag, enabled ) {
+
+		if ( bitmapIndex < 0 || bitmapIndex >= this.bitmaps.length ) return false;
+
+		let flags = this.bitmapFlags[ bitmapIndex ];
+		if ( flags === undefined ) return false;
+
+		if ( enabled === true ) {
+
+			flags |= flag;
+
+		} else {
+
+			flags &= ~flag;
+
+		}
+
+		this.bitmapFlags[ bitmapIndex ] = flags;
+
+		const bm = this.bitmaps[ bitmapIndex ];
+		if ( bm !== undefined ) {
+
+			if ( enabled === true ) {
+
+				bm.flags |= flag;
+
+			} else {
+
+				bm.flags &= ~flag;
+
+			}
+
+		}
+
+		return true;
+
+	}
+
 	// Page in a bitmap by index - read its pixel data from the PIG file
 	// Mirrors piggy_bitmap_page_in() in PIGGY.C
 	pageIn( bitmapIndex ) {
@@ -584,7 +625,7 @@ export class PigFile {
 }
 
 // Load and parse palette from HOG file
-// Palette is 768 bytes: 256 entries of 3 bytes (R,G,B), each 0-63 (VGA 6-bit DAC)
+// Palette is 768 bytes followed by D1's 34 x 256 palette fade table.
 export function loadPalette( hogFile ) {
 
 	// Try common palette file names
@@ -612,6 +653,22 @@ export function loadPalette( hogFile ) {
 		// VGA DACs use 6-bit values (0-63), scale to 8-bit (0-255)
 		const val = cf.readUByte();
 		palette[ i ] = ( val << 2 ) | ( val >> 4 );
+
+	}
+
+	const fadeTableSize = 34 * 256;
+	if ( cf.length() - cf.tell() >= fadeTableSize ) {
+
+		// Keep the lookup alongside the palette without changing the existing
+		// Uint8Array API used throughout the renderer.
+		palette.fadeTable = cf.readBytes( fadeTableSize );
+		for ( let level = 0; level < 34; level ++ ) {
+
+			// gr_use_palette_table() preserves the transparency index through
+			// every lighting/fade row even if a custom table does not.
+			palette.fadeTable[ level * 256 + 255 ] = 255;
+
+		}
 
 	}
 

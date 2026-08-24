@@ -13,31 +13,43 @@ import { find_point_seg } from './gameseg.js';
 import { wall_frame_process } from './wall.js';
 import { do_special_effects } from './effects.js';
 import { triggers_frame_process } from './switch.js';
-import { Laser_player_fire, Laser_player_fire_secondary, Laser_create_new, PARENT_PLAYER, FLARE_ID, Flare_create, laser_do_weapon_sequence, set_primary_weapon, set_secondary_weapon, Primary_weapon, Secondary_weapon, WEAPON_SELECT_CHANGED, WEAPON_SELECT_ALREADY, WEAPON_SELECT_UNAVAILABLE, get_player_laser_weapon_info_index } from './laser.js';
-import { Weapon_info, Primary_weapon_to_weapon_info, Secondary_weapon_to_weapon_info } from './bm.js';
+import { Laser_player_fire, Laser_player_fire_secondary, Laser_create_new, PARENT_PLAYER, Flare_create, laser_do_weapon_sequence, set_primary_weapon, set_secondary_weapon, Primary_weapon, Secondary_weapon, WEAPON_SELECT_UNAVAILABLE, get_player_laser_weapon_info_index, play_player_weapon_fire_sound } from './laser.js';
+import { Primary_weapon_to_weapon_info, Player_ship } from './bm.js';
 import { fireball_process } from './fireball.js';
 import { ai_do_frame } from './ai.js';
-import { digi_play_sample, digi_update_listener, SOUND_LASER_FIRED, SOUND_FUSION_WARMUP, SOUND_WEAPON_HIT_BLASTABLE,
-	SOUND_GOOD_SELECTION_PRIMARY, SOUND_GOOD_SELECTION_SECONDARY, SOUND_ALREADY_SELECTED, SOUND_BAD_SELECTION } from './digi.js';
+import { digi_play_sample, digi_play_sample_once, digi_update_listener, digi_pause_all, digi_resume_all,
+	SOUND_FUSION_WARMUP, SOUND_WEAPON_HIT_BLASTABLE,
+	SOUND_BAD_SELECTION, SOUND_DROP_BOMB } from './digi.js';
+import { songs_pause, songs_resume_playback, songs_stop_if_silent } from './songs.js';
 import { Polygon_models, polyobj_calc_gun_points } from './polyobj.js';
 import { automap_enter, automap_exit, automap_frame, automap_set_externals, automap_reset, getIsAutomap } from './automap.js';
 import { updateMineVisibility } from './render.js';
 import { lighting_add_muzzle_flash } from './lighting.js';
 import { controls_init, controls_set_resize_refs, controls_set_key_action_callback,
 	controls_get_keys, controls_consume_mouse, controls_consume_wheel, controls_is_pointer_locked,
-	controls_is_fire_down, controls_is_secondary_fire_down, controls_set_secondary_fire_down } from './controls.js';
+	controls_is_fire_down, controls_is_secondary_fire_down,
+	controls_is_action_down, controls_event_matches_action,
+	controls_get_bindable_actions, controls_get_action_primary_code, controls_set_action_primary_code } from './controls.js';
 import { PLAYER_MASS, PLAYER_DRAG, PLAYER_MAX_THRUST, PLAYER_MAX_ROTTHRUST, PLAYER_WIGGLE, PLAYER_RADIUS,
 	do_physics_sim_rot, do_physics_sim, do_physics_move, physics_reset,
 	set_object_turnroll, getTurnroll, phys_apply_force_to_player, phys_apply_rot,
-	do_physics_align_object } from './physics.js';
+	do_physics_align_object, physics_set_player_forward } from './physics.js';
 import { gauges_get_canvas_ctx, gauges_mark_dirty, gauges_needs_upload, gauges_get_hud_scene, gauges_get_hud_camera } from './gauges.js';
 import { gr_string } from './font.js';
 import { NORMAL_FONT, CURRENT_FONT, SUBTITLE_FONT, GAME_FONT } from './gamefont.js';
 import { config_get_invert_mouse_y, config_set_invert_mouse_y,
-	config_get_texture_filtering, config_set_texture_filtering } from './config.js';
+	config_get_texture_filtering, config_set_texture_filtering,
+	config_get_digi_volume, config_set_digi_volume,
+	config_get_music_volume, config_set_music_volume,
+	config_get_reverse_stereo, config_set_reverse_stereo,
+	config_get_sound_channels, config_set_sound_channels,
+	CONFIG_VOLUME_MAX, CONFIG_SOUND_CHANNEL_COUNTS } from './config.js';
+import { obj_relink } from './object.js';
 
 const GAME_ASPECT = 320 / 200;
 const COCKPIT_WINDOW_ASPECT = 320 / 140;
+const STATUSBAR_WINDOW_ASPECT = 320 / 160;
+const STATUSBAR_HEIGHT_FRAC = 40 / 200;
 
 let renderer = null;
 let scene = null;
@@ -48,6 +60,7 @@ let lastTime = 0;
 
 // Pause state
 let isPaused = false;
+let transitionSuspended = false;
 let _onQuitToMenu = null;	// callback for quit to main menu
 let _onCockpitModeChanged = null;	// callback when cockpit mode changes (F3/H)
 let _onSaveGame = null;		// callback for save game
@@ -61,9 +74,12 @@ let _pauseWrapper = null;
 let _pauseSelectedIndex = 0;
 let _pauseStatusText = null;	// temporary status message ("GAME SAVED!", etc.)
 let _pauseStatusTimer = 0;
-let _pauseState = 'menu';	// 'menu' or 'settings'
+let _pauseState = 'menu';	// 'menu', 'settings', or 'bindings'
 let _settingsSelectedIndex = 0;
 let _settingsItemYPositions = [];
+let _bindingsSelectedIndex = 0;
+let _bindingsItemYPositions = [];
+let _bindingCaptureAction = null;
 
 const PAUSE_W = 320;
 const PAUSE_H = 200;
@@ -86,10 +102,17 @@ export function game_set_palette( palette ) {
 
 // Frame callback (set by main.js for powerup collection, reactor, etc.)
 let _frameCallback = null;
+let _preAIFrameCallback = null;
 
 export function game_set_frame_callback( cb ) {
 
 	_frameCallback = cb;
+
+}
+
+export function game_set_pre_ai_frame_callback( cb ) {
+
+	_preAIFrameCallback = cb;
 
 }
 
@@ -117,6 +140,10 @@ const mouseSpeed = 0.02;
 
 // Player segment tracking for collision
 let playerSegnum = 0;
+let playerObject = null;
+let playerObjnum = - 1;
+let playerPoseExternallyDriven = false;
+let viewerSegnumOverride = - 1;
 
 // Fusion cannon charge state
 // Ported from: GAME.C lines 492-494
@@ -167,7 +194,7 @@ function drawCruiseSpeed() {
 }
 
 // Missile gun alternation (ported from LASER.C)
-let Missile_gun = 0;
+export let Missile_gun = 0;
 
 // Player ship gun points — loaded from pship1.pof (model 25) with submodel offsets accumulated
 // Ported from: BMREAD.C lines 1485-1498 (Player_ship->gun_points setup)
@@ -181,10 +208,23 @@ const _fireDir = { x: 0, y: 0, z: 1 };
 
 // Player dead flag — blocks movement and weapon input
 let playerDead = false;
+let playerControlsEnabled = true;
 
 export function game_set_player_dead( dead ) {
 
 	playerDead = dead;
+
+}
+
+export function game_set_controls_enabled( enabled ) {
+
+	playerControlsEnabled = ( enabled === true );
+
+}
+
+export function game_get_controls_enabled() {
+
+	return playerControlsEnabled;
 
 }
 
@@ -254,7 +294,8 @@ export function game_init() {
 	);
 
 	// Load player ship gun points from POF model (ported from BMREAD.C)
-	const playerModel = Polygon_models[ PLAYER_SHIP_MODEL_NUM ];
+	const playerModelNum = Player_ship.loaded === true ? Player_ship.model_num : PLAYER_SHIP_MODEL_NUM;
+	const playerModel = Polygon_models[ playerModelNum ];
 	if ( playerModel !== undefined && playerModel.n_guns > 0 ) {
 
 		Player_gun_points = polyobj_calc_gun_points( playerModel );
@@ -285,9 +326,10 @@ export function game_init() {
 	// (browser consumes Escape key to exit pointer lock, so keydown may not fire)
 	document.addEventListener( 'pointerlockchange', () => {
 
-		if ( document.pointerLockElement === null && isPaused !== true && getIsAutomap() !== true ) {
+		if ( document.pointerLockElement === null && isPaused !== true && playerDead !== true &&
+			transitionSuspended !== true && getIsAutomap() !== true ) {
 
-			isPaused = true;
+			setUserPauseState( true );
 			showPauseMenu();
 
 		}
@@ -335,9 +377,18 @@ function positionCameraAtSegment( segnum ) {
 
 // Set player start position and orientation from level data
 // playerObj is a GameObject with pos_x/y/z and orient_rvec/uvec/fvec
-export function game_set_player_start( playerObj ) {
+export function game_set_player_start( playerObj, objnum ) {
 
 	if ( camera === null ) return;
+
+	if ( objnum !== undefined && objnum >= 0 ) {
+
+		playerObject = playerObj;
+		playerObjnum = objnum;
+
+	}
+	playerPoseExternallyDriven = false;
+	viewerSegnumOverride = - 1;
 
 	// Convert Descent coordinates to Three.js (negate Z)
 	camera.position.set(
@@ -361,6 +412,7 @@ export function game_set_player_start( playerObj ) {
 
 	// Track player segment for collision
 	playerSegnum = playerObj.segnum;
+	sync_player_object();
 
 	console.log( 'Player start: pos=(' +
 		playerObj.pos_x.toFixed( 1 ) + ', ' +
@@ -386,10 +438,31 @@ export function game_set_mine( group ) {
 
 }
 
+export function game_set_mine_visible( visible ) {
+
+	if ( mineGroup !== null ) mineGroup.visible = ( visible === true );
+
+}
+
 // Main render loop
 export function game_loop( time ) {
 
 	requestAnimationFrame( game_loop );
+
+	// Blocking title/score/briefing flows freeze the old world's clock as well
+	// as its subsystems.  Keep lastTime current so resuming cannot produce a
+	// large catch-up frame.
+	if ( transitionSuspended === true || isPaused === true ) {
+
+		lastTime = time;
+		updateMineVisibility(
+			viewerSegnumOverride >= 0 ? viewerSegnumOverride : playerSegnum,
+			camera
+		);
+		renderFrame();
+		return;
+
+	}
 
 	// Frame timing
 	if ( lastTime === 0 ) lastTime = time;
@@ -401,26 +474,40 @@ export function game_loop( time ) {
 	set_GameTime( GameTime + dt );
 	set_FrameCount( FrameCount + 1 );
 
-	// When paused, only render (no physics/AI/weapons)
-	if ( isPaused === true ) {
+	// Update free-fly camera
+	updateCamera( dt );
 
-		updateMineVisibility( playerSegnum, camera );
+	// A secret exit can begin a blocking transition from inside the movement
+	// collision/trigger path.  Do not run the rest of this old-world frame after
+	// its teardown has already stopped every sound owner.
+	if ( transitionSuspended === true ) {
+
+		updateMineVisibility(
+			viewerSegnumOverride >= 0 ? viewerSegnumOverride : playerSegnum,
+			camera
+		);
 		renderFrame();
 		return;
 
 	}
 
-	// Update free-fly camera
-	updateCamera( dt );
+	// D1 keeps sound at the player while the automap uses a separate camera.
+	if ( getIsAutomap() === true && playerObject !== null ) {
 
-	// Update audio listener position/orientation (Descent coordinates)
-	// _forward and _up were computed in updateCamera()
-	if ( camera !== null ) {
+		digi_update_listener(
+			playerObject.pos_x, playerObject.pos_y, playerObject.pos_z,
+			playerObject.segnum,
+			playerObject.orient_rvec_x,
+			playerObject.orient_rvec_y,
+			playerObject.orient_rvec_z
+		);
+
+	} else if ( camera !== null ) {
 
 		digi_update_listener(
 			camera.position.x, camera.position.y, - camera.position.z,
-			_forward.x, _forward.y, - _forward.z,
-			_up.x, _up.y, - _up.z
+			viewerSegnumOverride >= 0 ? viewerSegnumOverride : playerSegnum,
+			_right.x, _right.y, - _right.z
 		);
 
 	}
@@ -434,6 +521,10 @@ export function game_loop( time ) {
 	// Process animated textures (eclips)
 	do_special_effects();
 
+	// CT_MORPH objects advance their shell before falling through to robot AI
+	// and physics in D1's object_move_one().
+	if ( _preAIFrameCallback !== null ) _preAIFrameCallback( dt );
+
 	// Process robot AI
 	ai_do_frame( dt );
 
@@ -446,12 +537,24 @@ export function game_loop( time ) {
 	fireball_process( dt );
 
 	// Update portal visibility before frame callback (needed by dynamic lighting)
-	updateMineVisibility( playerSegnum, camera );
+	updateMineVisibility(
+		viewerSegnumOverride >= 0 ? viewerSegnumOverride : playerSegnum,
+		camera
+	);
 
 	// Frame callback (powerup collection, reactor check, dynamic lighting, etc.)
 	if ( _frameCallback !== null ) {
 
 		_frameCallback( dt );
+
+	}
+
+	// Endlevel movement is performed by the frame callback rather than
+	// updateCamera().  Keep the canonical player object on that camera too, but
+	// never copy the automap camera back into the gameplay object.
+	if ( getIsAutomap() !== true && playerPoseExternallyDriven !== true ) {
+
+		sync_player_object( false );
 
 	}
 
@@ -487,6 +590,7 @@ function renderFrame() {
 	const isRear = ( Rear_view === true && camera !== null );
 	const isAutomap = ( getIsAutomap() === true );
 	const useCockpitViewport = ( ( Cockpit_mode === CM_FULL_COCKPIT || Cockpit_mode === CM_REAR_VIEW ) && isAutomap !== true );
+	const useStatusbarViewport = ( Cockpit_mode === CM_STATUS_BAR && isAutomap !== true );
 
 	// Rear view: rotate camera 180°
 	if ( isRear ) {
@@ -496,7 +600,7 @@ function renderFrame() {
 
 	}
 
-	if ( useCockpitViewport ) {
+	if ( useCockpitViewport || useStatusbarViewport ) {
 
 		// Two-pass: 3D in cockpit window, then full-screen HUD overlay
 		renderer.getSize( _rendererSize );
@@ -506,14 +610,16 @@ function renderFrame() {
 		renderer.autoClear = false;
 		renderer.clear();
 
-		// Scissor to top 70% of viewport (cockpit window area)
-		const scissorY = Math.floor( rh * 0.3 );
+		// Scissor to top gameplay viewport area.
+		const scissorY = useStatusbarViewport === true
+			? Math.floor( rh * STATUSBAR_HEIGHT_FRAC )
+			: Math.floor( rh * 0.3 );
 		const scissorH = rh - scissorY;
 
 		renderer.setScissorTest( true );
 		renderer.setScissor( 0, scissorY, rw, scissorH );
 		renderer.setViewport( 0, scissorY, rw, scissorH );
-		camera.aspect = COCKPIT_WINDOW_ASPECT;
+		camera.aspect = useStatusbarViewport === true ? STATUSBAR_WINDOW_ASPECT : COCKPIT_WINDOW_ASPECT;
 		camera.updateProjectionMatrix();
 
 		renderer.render( scene, camera );
@@ -577,6 +683,7 @@ function updateCamera( dt ) {
 		// Extract forward/up for audio listener (keep audio positioned at player)
 		// Use camera's current orientation (set by automap_frame)
 		_forward.set( 0, 0, - 1 ).applyQuaternion( camera.quaternion );
+		_right.set( 1, 0, 0 ).applyQuaternion( camera.quaternion );
 		_up.set( 0, 1, 0 ).applyQuaternion( camera.quaternion );
 		return;
 
@@ -586,6 +693,19 @@ function updateCamera( dt ) {
 
 		// Still extract forward/up vectors for audio listener, but skip movement
 		camera.getWorldDirection( _forward );
+		_right.set( 1, 0, 0 ).applyQuaternion( camera.quaternion );
+		_up.set( 0, 1, 0 ).applyQuaternion( camera.quaternion );
+		return;
+
+	}
+
+	if ( playerControlsEnabled !== true ) {
+
+		// Keep input deltas from accumulating while controls are disabled (cutscenes/endlevel).
+		controls_consume_mouse();
+		controls_consume_wheel();
+		camera.getWorldDirection( _forward );
+		_right.set( 1, 0, 0 ).applyQuaternion( camera.quaternion );
 		_up.set( 0, 1, 0 ).applyQuaternion( camera.quaternion );
 		return;
 
@@ -612,11 +732,11 @@ function updateCamera( dt ) {
 
 	}
 
-	const keys = controls_get_keys();
+	const manualRollActive = ( controls_is_action_down( 'roll_left' ) === true || controls_is_action_down( 'roll_right' ) === true );
 
 	// Keyboard roll (Q/E)
-	if ( keys[ 'KeyQ' ] ) rotThrust_z += PLAYER_MAX_ROTTHRUST;
-	if ( keys[ 'KeyE' ] ) rotThrust_z -= PLAYER_MAX_ROTTHRUST;
+	if ( controls_is_action_down( 'roll_left' ) === true ) rotThrust_z += PLAYER_MAX_ROTTHRUST;
+	if ( controls_is_action_down( 'roll_right' ) === true ) rotThrust_z -= PLAYER_MAX_ROTTHRUST;
 
 	// Apply rotational drag + thrust (ported from do_physics_sim_rot in PHYSICS.C)
 	const playerRotVel = do_physics_sim_rot( rotThrust_x, rotThrust_y, rotThrust_z, dt );
@@ -635,9 +755,13 @@ function updateCamera( dt ) {
 	set_object_turnroll( dt );
 	camera.rotateZ( getTurnroll() );
 
-	// Auto-level the ship toward world-up (ported from PHYSICS.C line 1049)
-	// PF_LEVELLING gradually rotates the ship back to upright when not actively rolling
-	do_physics_align_object( camera, dt );
+	// Auto-level the ship toward current segment orientation (ported from PHYSICS.C line 1049).
+	// Manual roll input (Q/E) takes precedence so auto-level doesn't counter-steer in the same frame.
+	if ( manualRollActive !== true ) {
+
+		do_physics_align_object( camera, playerSegnum, dt );
+
+	}
 
 	// --- Linear physics (ported from do_physics_sim + read_flying_controls) ---
 
@@ -655,6 +779,7 @@ function updateCamera( dt ) {
 	const fwd_dx = _forward.x, fwd_dy = _forward.y, fwd_dz = - _forward.z;
 	const rgt_dx = _right.x, rgt_dy = _right.y, rgt_dz = - _right.z;
 	const up_dx = _up.x, up_dy = _up.y, up_dz = - _up.z;
+	physics_set_player_forward( fwd_dx, fwd_dy, fwd_dz );
 
 	// Store fire direction for weapon firing (parallel to forward vector)
 	_fireDir.x = fwd_dx;
@@ -663,14 +788,14 @@ function updateCamera( dt ) {
 
 	// Cruise control: R to increase, T to decrease cruise speed
 	// Ported from: KCONFIG.C lines 2064-2080 — "stupid-cruise-control-type of throttle"
-	if ( keys[ 'KeyR' ] ) {
+	if ( controls_is_action_down( 'cruise_faster' ) === true ) {
 
 		Cruise_speed += 200 * dt;	// ramp up at ~200%/sec
 		if ( Cruise_speed > 100 ) Cruise_speed = 100;
 
 	}
 
-	if ( keys[ 'KeyT' ] ) {
+	if ( controls_is_action_down( 'cruise_slower' ) === true ) {
 
 		Cruise_speed -= 200 * dt;	// ramp down at ~200%/sec
 		if ( Cruise_speed < 0 ) Cruise_speed = 0;
@@ -678,8 +803,8 @@ function updateCamera( dt ) {
 	}
 
 	// WASD = thrust along ship axes
-	const forwardPressed = ( keys[ 'KeyW' ] || keys[ 'ArrowUp' ] );
-	const backwardPressed = ( keys[ 'KeyS' ] || keys[ 'ArrowDown' ] );
+	const forwardPressed = controls_is_action_down( 'thrust_forward' ) === true;
+	const backwardPressed = controls_is_action_down( 'thrust_backward' ) === true;
 
 	if ( forwardPressed ) {
 
@@ -708,7 +833,7 @@ function updateCamera( dt ) {
 
 	}
 
-	if ( keys[ 'KeyA' ] || keys[ 'ArrowLeft' ] ) {
+	if ( controls_is_action_down( 'thrust_left' ) === true ) {
 
 		thrust_x -= rgt_dx * PLAYER_MAX_THRUST;
 		thrust_y -= rgt_dy * PLAYER_MAX_THRUST;
@@ -716,7 +841,7 @@ function updateCamera( dt ) {
 
 	}
 
-	if ( keys[ 'KeyD' ] || keys[ 'ArrowRight' ] ) {
+	if ( controls_is_action_down( 'thrust_right' ) === true ) {
 
 		thrust_x += rgt_dx * PLAYER_MAX_THRUST;
 		thrust_y += rgt_dy * PLAYER_MAX_THRUST;
@@ -724,7 +849,7 @@ function updateCamera( dt ) {
 
 	}
 
-	if ( keys[ 'Space' ] ) {
+	if ( controls_is_action_down( 'thrust_up' ) === true ) {
 
 		thrust_x += up_dx * PLAYER_MAX_THRUST;
 		thrust_y += up_dy * PLAYER_MAX_THRUST;
@@ -732,7 +857,7 @@ function updateCamera( dt ) {
 
 	}
 
-	if ( keys[ 'ShiftLeft' ] || keys[ 'ShiftRight' ] ) {
+	if ( controls_is_action_down( 'thrust_down' ) === true ) {
 
 		thrust_x -= up_dx * PLAYER_MAX_THRUST;
 		thrust_y -= up_dy * PLAYER_MAX_THRUST;
@@ -748,13 +873,16 @@ function updateCamera( dt ) {
 	const p0_y = camera.position.y;
 	const p0_z = - camera.position.z;
 
-	const moveResult = do_physics_move( p0_x, p0_y, p0_z, frame.x, frame.y, frame.z, playerSegnum, dt );
+	const moveResult = do_physics_move( p0_x, p0_y, p0_z, frame.x, frame.y, frame.z, playerSegnum, dt, playerObjnum );
 
 	// Apply result: convert back to Three.js coordinates
 	camera.position.x = moveResult.x;
 	camera.position.y = moveResult.y;
 	camera.position.z = - moveResult.z;
 	playerSegnum = moveResult.segnum;
+	// do_physics_move snapshots last_pos at the frame start and advances the
+	// canonical player to each accepted contact. Preserve that one-frame history.
+	sync_player_object( false );
 
 	// Mark current segment as visited for automap
 	// Ported from: RENDER.C line 981 — Automap_visited[segnum] = 1
@@ -798,6 +926,7 @@ function getGunWorldPos( gun_num ) {
 function processWeapons() {
 
 	if ( playerDead === true ) return;
+	if ( playerControlsEnabled !== true ) return;
 	if ( camera === null ) return;
 
 	// --- Fusion cannon charge mechanic ---
@@ -832,41 +961,19 @@ function processWeapons() {
 	const spawnSeg = find_point_seg( gp0.x, gp0.y, gp0.z, playerSegnum );
 	if ( spawnSeg === - 1 ) return;
 
-	// Vulcan spread: apply random spread to fire direction
-	// Ported from: LASER.C line 1146 — rand()/8 - 32767/16 in fixed-point
-	// Converts to ±0.031 in float (spread along right and up vectors)
-	let fire_x = _fireDir.x;
-	let fire_y = _fireDir.y;
-	let fire_z = _fireDir.z;
-
-	if ( Primary_weapon === 1 ) {
-
-		// Use _right and _up in Descent coordinates (negate Z from Three.js)
-		const spreadR = ( Math.random() - 0.5 ) * 0.063;
-		const spreadU = ( Math.random() - 0.5 ) * 0.063;
-		fire_x += _right.x * spreadR + _up.x * spreadU;
-		fire_y += _right.y * spreadR + _up.y * spreadU;
-		fire_z += ( - _right.z ) * spreadR + ( - _up.z ) * spreadU;
-
-	}
-
 	// Quad laser check
 	// Ported from: LASER.C do_laser_firing() — PLAYER_FLAGS_QUAD_LASERS fires 4 bolts with 0.75x damage
 	const hasQuad = ( isLaser && _getPlayerQuadLasers !== null && _getPlayerQuadLasers() === true );
 	const quadMultiplier = hasQuad ? 0.75 : 1.0;
+	const laserOffset = 2.0 * ( Math.floor( Math.random() * 10 ) / 10.0 );	// LASER.C Laser_offset
 
 	// Fire through laser.js (handles fire rate, weapon type, energy/ammo)
 	// Parallel fire direction along player's forward vector (original Descent behavior)
-	const fired = Laser_player_fire( fire_x, fire_y, fire_z, gp0.x, gp0.y, gp0.z, spawnSeg, GameTime, quadMultiplier );
+	const fired = Laser_player_fire( _fireDir.x, _fireDir.y, _fireDir.z, gp0.x, gp0.y, gp0.z, spawnSeg, GameTime, quadMultiplier, laserOffset );
 	if ( fired === true ) {
 
-		// Per-weapon fire sound from Weapon_info[].flash_sound
-		// Use laser-level-aware weapon_info_index for correct sound
+		// Use the laser-level-aware weapon_info index for paired bolts.
 		const laserWiIndex = get_player_laser_weapon_info_index();
-		const wi = Weapon_info[ laserWiIndex ];
-		const fireSound = ( wi !== undefined && wi.flash_sound >= 0 ) ? wi.flash_sound : SOUND_LASER_FIRED;
-		digi_play_sample( fireSound, 0.5 );
-
 		// For laser and plasma, also fire from the second gun (gun 1) — dual fire
 		// Ported from: LASER.C do_laser_firing() LASER_INDEX and PLASMA_INDEX cases
 		if ( isLaser || isPlasma ) {
@@ -876,7 +983,7 @@ function processWeapons() {
 			if ( seg1 !== - 1 ) {
 
 				// Use laser-level-aware weapon_info_index
-				Laser_create_new( _fireDir.x, _fireDir.y, _fireDir.z, gp1.x, gp1.y, gp1.z, seg1, PARENT_PLAYER, laserWiIndex, quadMultiplier );
+				Laser_create_new( _fireDir.x, _fireDir.y, _fireDir.z, gp1.x, gp1.y, gp1.z, seg1, PARENT_PLAYER, laserWiIndex, quadMultiplier, laserOffset, true );
 
 			}
 
@@ -888,7 +995,7 @@ function processWeapons() {
 				const seg2 = find_point_seg( gp2.x, gp2.y, gp2.z, playerSegnum );
 				if ( seg2 !== - 1 ) {
 
-					Laser_create_new( _fireDir.x, _fireDir.y, _fireDir.z, gp2.x, gp2.y, gp2.z, seg2, PARENT_PLAYER, laserWiIndex, quadMultiplier );
+					Laser_create_new( _fireDir.x, _fireDir.y, _fireDir.z, gp2.x, gp2.y, gp2.z, seg2, PARENT_PLAYER, laserWiIndex, quadMultiplier, laserOffset, true );
 
 				}
 
@@ -896,7 +1003,7 @@ function processWeapons() {
 				const seg3 = find_point_seg( gp3.x, gp3.y, gp3.z, playerSegnum );
 				if ( seg3 !== - 1 ) {
 
-					Laser_create_new( _fireDir.x, _fireDir.y, _fireDir.z, gp3.x, gp3.y, gp3.z, seg3, PARENT_PLAYER, laserWiIndex, quadMultiplier );
+					Laser_create_new( _fireDir.x, _fireDir.y, _fireDir.z, gp3.x, gp3.y, gp3.z, seg3, PARENT_PLAYER, laserWiIndex, quadMultiplier, laserOffset, true );
 
 				}
 
@@ -974,7 +1081,8 @@ function processFusionCharge() {
 	Fusion_charge += dt;
 
 	// Continuous energy drain while charging
-	const newEnergy = _getPlayerEnergy() - dt * 4.0;
+	// Ported from: GAME.C line 4058 — Players[Player_num].energy -= FrameTime;
+	const newEnergy = _getPlayerEnergy() - dt;
 	_setPlayerEnergy( Math.max( newEnergy, 0 ) );
 	if ( _updateHUD !== null ) _updateHUD();
 
@@ -997,7 +1105,7 @@ function processFusionCharge() {
 		if ( Fusion_charge > 2.0 ) {
 
 			// Fully charged: explosion sound + self-damage
-			digi_play_sample( SOUND_WEAPON_HIT_BLASTABLE, 0.8 );
+			digi_play_sample( SOUND_WEAPON_HIT_BLASTABLE, 1.0 );
 
 			if ( _applyPlayerDamage !== null ) {
 
@@ -1008,11 +1116,14 @@ function processFusionCharge() {
 		} else {
 
 			// Charging: warmup sound
-			digi_play_sample( SOUND_FUSION_WARMUP, 0.8 );
+			digi_play_sample( SOUND_FUSION_WARMUP, 1.0 );
 
 		}
 
-		Fusion_next_sound_time = GameTime + 0.125 + Math.random() * 0.25;
+		// D1 rand() is 0..32767 in half-fix units; rand()/4 therefore adds
+		// 0..just-under-1/8 second, not a quarter second.
+		Fusion_next_sound_time = GameTime + 0.125 +
+			Math.floor( Math.random() * 32768 ) / 262144;
 
 	}
 
@@ -1042,22 +1153,30 @@ function fireFusionShot() {
 
 	}
 
+	// Ported from: LASER.C do_laser_firing() — dual fusion bolts share one Laser_offset.
+	const laserOffset = 2.0 * ( Math.floor( Math.random() * 10 ) / 10.0 );
+
 	// First bolt (parallel fire direction)
-	Laser_create_new( _fireDir.x, _fireDir.y, _fireDir.z, gp0.x, gp0.y, gp0.z, seg0, PARENT_PLAYER, weapon_info_index, multiplier );
+	const firstBolt = Laser_create_new(
+		_fireDir.x, _fireDir.y, _fireDir.z,
+		gp0.x, gp0.y, gp0.z, seg0,
+		PARENT_PLAYER, weapon_info_index, multiplier, laserOffset
+	);
+	if ( firstBolt !== - 1 ) play_player_weapon_fire_sound( weapon_info_index );
 
 	// Second bolt from gun 1
 	const gp1 = getGunWorldPos( 1 );
 	const seg1 = find_point_seg( gp1.x, gp1.y, gp1.z, playerSegnum );
 	if ( seg1 !== - 1 ) {
 
-		Laser_create_new( _fireDir.x, _fireDir.y, _fireDir.z, gp1.x, gp1.y, gp1.z, seg1, PARENT_PLAYER, weapon_info_index, multiplier );
+		const secondBolt = Laser_create_new(
+			_fireDir.x, _fireDir.y, _fireDir.z,
+			gp1.x, gp1.y, gp1.z, seg1,
+			PARENT_PLAYER, weapon_info_index, multiplier, laserOffset
+		);
+		if ( secondBolt !== - 1 ) play_player_weapon_fire_sound( weapon_info_index );
 
 	}
-
-	// Per-weapon fire sound for fusion
-	const fusionWi = Weapon_info[ weapon_info_index ];
-	const fusionFireSound = ( fusionWi !== undefined && fusionWi.flash_sound >= 0 ) ? fusionWi.flash_sound : SOUND_LASER_FIRED;
-	digi_play_sample( fusionFireSound, 0.7 );
 
 	lighting_add_muzzle_flash( gp0.x, gp0.y, gp0.z, seg0 );
 
@@ -1081,10 +1200,13 @@ function fireFusionShot() {
 function processSecondaryWeapons() {
 
 	if ( playerDead === true ) return;
+	if ( playerControlsEnabled !== true ) return;
 	if ( controls_is_secondary_fire_down() !== true ) return;
 	if ( camera === null ) return;
 
-	controls_set_secondary_fire_down( false );	// Single-shot per click
+	// Fire continuously while the button is held; Laser_player_fire_secondary
+	// rate-limits via Next_missile_fire_time. Ported from do_missile_firing(),
+	// which fires on (Controls.fire_secondary_state || fire_secondary_down_count). (GAME.C:2939)
 
 	// Gun selection per secondary weapon type (ported from do_missile_firing)
 	// Concussion/Homing: alternate guns 4,5; Proximity/Smart/Mega: gun 7
@@ -1094,7 +1216,6 @@ function processSecondaryWeapons() {
 
 		// Concussion or Homing: alternate between guns 4 and 5
 		gun_num = 4 + ( Missile_gun & 1 );
-		Missile_gun ++;
 
 	}
 
@@ -1106,10 +1227,8 @@ function processSecondaryWeapons() {
 	const fired = Laser_player_fire_secondary( _fireDir.x, _fireDir.y, _fireDir.z, gp.x, gp.y, gp.z, spawnSeg, GameTime );
 	if ( fired === true ) {
 
-		// Per-weapon fire sound from Weapon_info[].flash_sound
-		const secWi = Weapon_info[ Secondary_weapon_to_weapon_info[ Secondary_weapon ] ];
-		const secFireSound = ( secWi !== undefined && secWi.flash_sound >= 0 ) ? secWi.flash_sound : SOUND_LASER_FIRED;
-		digi_play_sample( secFireSound, 0.6 );
+		// Advance the alternating missile gun only on an actual shot (do_missile_firing: Missile_gun++)
+		if ( Secondary_weapon === 0 || Secondary_weapon === 1 ) Missile_gun ++;
 
 	}
 
@@ -1122,6 +1241,55 @@ function handleKeyAction( e ) {
 	// When paused, only handle pause-related keys
 	if ( isPaused === true ) {
 
+		if ( _pauseState === 'bindings' ) {
+
+			e.preventDefault();
+
+			if ( _bindingCaptureAction !== null ) {
+
+				if ( e.code === 'Escape' ) {
+
+					_bindingCaptureAction = null;
+					renderPauseMenu();
+					return;
+
+				}
+
+				controls_set_action_primary_code( _bindingCaptureAction, e.code );
+				_bindingCaptureAction = null;
+				renderPauseMenu();
+				return;
+
+			}
+
+			if ( e.key === 'Escape' ) {
+
+				_pauseState = 'settings';
+				renderPauseMenu();
+
+			} else if ( e.key === 'ArrowUp' ) {
+
+				_bindingsSelectedIndex --;
+				if ( _bindingsSelectedIndex < 0 ) _bindingsSelectedIndex = PAUSE_BINDING_ITEMS.length - 1;
+				renderPauseMenu();
+
+			} else if ( e.key === 'ArrowDown' ) {
+
+				_bindingsSelectedIndex ++;
+				if ( _bindingsSelectedIndex >= PAUSE_BINDING_ITEMS.length ) _bindingsSelectedIndex = 0;
+				renderPauseMenu();
+
+			} else if ( e.key === 'Enter' ) {
+
+				_bindingCaptureAction = PAUSE_BINDING_ITEMS[ _bindingsSelectedIndex ].id;
+				renderPauseMenu();
+
+			}
+
+			return;
+
+		}
+
 		// Settings sub-screen has its own key handling
 		if ( _pauseState === 'settings' ) {
 
@@ -1129,6 +1297,7 @@ function handleKeyAction( e ) {
 
 			if ( e.key === 'Escape' ) {
 
+				songs_stop_if_silent();
 				_pauseState = 'menu';
 				renderPauseMenu();
 
@@ -1144,6 +1313,16 @@ function handleKeyAction( e ) {
 				if ( _settingsSelectedIndex >= PAUSE_SETTINGS_ITEMS.length ) _settingsSelectedIndex = 0;
 				renderPauseMenu();
 
+			} else if ( e.key === 'ArrowLeft' ) {
+
+				adjustPauseSetting( PAUSE_SETTINGS_ITEMS[ _settingsSelectedIndex ].id, - 1 );
+				renderPauseMenu();
+
+			} else if ( e.key === 'ArrowRight' ) {
+
+				adjustPauseSetting( PAUSE_SETTINGS_ITEMS[ _settingsSelectedIndex ].id, 1 );
+				renderPauseMenu();
+
 			} else if ( e.key === 'Enter' ) {
 
 				togglePauseSetting( PAUSE_SETTINGS_ITEMS[ _settingsSelectedIndex ].id );
@@ -1155,7 +1334,7 @@ function handleKeyAction( e ) {
 
 		}
 
-		if ( e.code === 'KeyP' || e.code === 'Escape' ) {
+		if ( controls_event_matches_action( e, 'pause_game' ) === true ) {
 
 			e.preventDefault();
 			// Escape/P while paused: do nothing — user must click RESUME
@@ -1188,6 +1367,14 @@ function handleKeyAction( e ) {
 
 	}
 
+	// Title, score, ending, and briefing screens own input while gameplay is
+	// suspended for a transition.  A failed save load deliberately retains the
+	// pause menu, so its retry/quit controls are handled above.
+	if ( transitionSuspended === true ) return;
+	// The death sequence consumes the next key after the ship explodes.  Do not
+	// also select a weapon, open the automap, or pause on that same input.
+	if ( playerDead === true ) return;
+
 	// Weapon selection: 1-5 for primary weapons
 	// waitForRearm=true adds 1s delay before firing (ported from select_weapon in WEAPON.C)
 	{
@@ -1199,9 +1386,7 @@ function handleKeyAction( e ) {
 		if ( e.code === 'Digit4' ) primaryResult = set_primary_weapon( 3, true );
 		if ( e.code === 'Digit5' ) primaryResult = set_primary_weapon( 4, true );
 
-		if ( primaryResult === WEAPON_SELECT_CHANGED ) digi_play_sample( SOUND_GOOD_SELECTION_PRIMARY, 0.7 );
-		else if ( primaryResult === WEAPON_SELECT_ALREADY ) digi_play_sample( SOUND_ALREADY_SELECTED, 0.7 );
-		else if ( primaryResult === WEAPON_SELECT_UNAVAILABLE ) digi_play_sample( SOUND_BAD_SELECTION, 0.7 );
+		if ( primaryResult === WEAPON_SELECT_UNAVAILABLE ) digi_play_sample( SOUND_BAD_SELECTION, 1.0 );
 
 	}
 
@@ -1215,15 +1400,13 @@ function handleKeyAction( e ) {
 		if ( e.code === 'Digit9' ) secondaryResult = set_secondary_weapon( 3, true );
 		if ( e.code === 'Digit0' ) secondaryResult = set_secondary_weapon( 4, true );
 
-		if ( secondaryResult === WEAPON_SELECT_CHANGED ) digi_play_sample( SOUND_GOOD_SELECTION_SECONDARY, 0.7 );
-		else if ( secondaryResult === WEAPON_SELECT_ALREADY ) digi_play_sample( SOUND_ALREADY_SELECTED, 0.7 );
-		else if ( secondaryResult === WEAPON_SELECT_UNAVAILABLE ) digi_play_sample( SOUND_BAD_SELECTION, 0.7 );
+		if ( secondaryResult === WEAPON_SELECT_UNAVAILABLE ) digi_play_sample( SOUND_BAD_SELECTION, 1.0 );
 
 	}
 
 	// F key to fire flare
 	// Ported from: Flare_create() in LASER.C lines 857-887
-	if ( e.code === 'KeyF' && playerDead !== true && camera !== null ) {
+	if ( controls_event_matches_action( e, 'fire_flare' ) === true && playerDead !== true && camera !== null ) {
 
 		// Fire from gun 6 (center gun)
 		const gp = getGunWorldPos( 6 );
@@ -1231,34 +1414,33 @@ function handleKeyAction( e ) {
 
 		if ( spawnSeg !== - 1 ) {
 
-			const fired = Flare_create( _fireDir.x, _fireDir.y, _fireDir.z, gp.x, gp.y, gp.z, spawnSeg );
-			if ( fired === true ) {
-
-				digi_play_sample( SOUND_LASER_FIRED, 0.4 );
-
-			}
+			Flare_create( _fireDir.x, _fireDir.y, _fireDir.z, gp.x, gp.y, gp.z, spawnSeg );
 
 		}
 
 	}
 
 	// Tab to toggle automap
-	if ( e.code === 'Tab' ) {
+	if ( controls_event_matches_action( e, 'toggle_automap' ) === true ) {
 
 		e.preventDefault();
 		toggleAutomap();
 
 	}
 
-	// F3 to cycle cockpit modes (full cockpit → full screen → full cockpit)
-	// Ported from: toggle_cockpit() in GAME.C lines 772-801
-	if ( e.code === 'F3' ) {
+	// F3 cockpit cycle.
+	// Ported from: toggle_cockpit() in GAME.C; includes status bar mode.
+	if ( controls_event_matches_action( e, 'toggle_cockpit' ) === true ) {
 
 		e.preventDefault();
 
 		if ( Rear_view !== true && getIsAutomap() !== true ) {
 
 			if ( Cockpit_mode === CM_FULL_COCKPIT ) {
+
+				Cockpit_mode = CM_STATUS_BAR;
+
+			} else if ( Cockpit_mode === CM_STATUS_BAR ) {
 
 				Cockpit_mode = CM_FULL_SCREEN;
 
@@ -1280,7 +1462,7 @@ function handleKeyAction( e ) {
 
 	// Backspace to reset cruise speed
 	// Ported from: KCONFIG.C lines 2075-2078 — cruise off key
-	if ( e.code === 'Backspace' ) {
+	if ( controls_event_matches_action( e, 'reset_cruise' ) === true ) {
 
 		Cruise_speed = 0;
 
@@ -1288,7 +1470,7 @@ function handleKeyAction( e ) {
 
 	// H to toggle rear view
 	// Ported from: GAME.C lines 2517-2558 rear view handling
-	if ( e.code === 'KeyH' ) {
+	if ( controls_event_matches_action( e, 'toggle_rear_view' ) === true ) {
 
 		if ( playerDead !== true && getIsAutomap() !== true ) {
 
@@ -1319,7 +1501,7 @@ function handleKeyAction( e ) {
 
 	// P or Escape to open pause menu
 	// Ported from: GAME.C — game pause functionality
-	if ( e.code === 'KeyP' || e.code === 'Escape' ) {
+	if ( controls_event_matches_action( e, 'pause_game' ) === true ) {
 
 		e.preventDefault();
 		togglePause();
@@ -1332,8 +1514,102 @@ export function getRenderer() { return renderer; }
 export function getScene() { return scene; }
 export function getCamera() { return camera; }
 export function getAmbientLight() { return null; }
-export function setPlayerSegnum( s ) { playerSegnum = s; }
+export function game_set_player_pose_driven( driven ) {
+
+	playerPoseExternallyDriven = ( driven === true );
+	if ( playerPoseExternallyDriven !== true ) viewerSegnumOverride = - 1;
+
+}
+
+export function game_set_viewer_segnum( segnum ) {
+
+	viewerSegnumOverride = Number.isInteger( segnum ) === true && segnum >= 0
+		? segnum : - 1;
+
+}
+
+// ENDLEVEL.C keeps ConsoleObject moving after Viewer becomes a separate
+// camera.  Mirror that player pose into the canonical object without moving
+// the Three.js camera back onto it.
+export function game_set_external_player_pose( posX, posY, posZ, quaternion, segnum ) {
+
+	if ( Number.isInteger( segnum ) === true && segnum >= 0 ) setPlayerSegnum( segnum );
+	if ( playerObject === null || quaternion === null || quaternion === undefined ) return;
+
+	playerObject.last_pos_x = playerObject.pos_x;
+	playerObject.last_pos_y = playerObject.pos_y;
+	playerObject.last_pos_z = playerObject.pos_z;
+	playerObject.pos_x = posX;
+	playerObject.pos_y = posY;
+	playerObject.pos_z = posZ;
+
+	_forward.set( 0, 0, - 1 ).applyQuaternion( quaternion );
+	_right.set( 1, 0, 0 ).applyQuaternion( quaternion );
+	_up.set( 0, 1, 0 ).applyQuaternion( quaternion );
+	playerObject.orient_fvec_x = _forward.x;
+	playerObject.orient_fvec_y = _forward.y;
+	playerObject.orient_fvec_z = - _forward.z;
+	physics_set_player_forward(
+		playerObject.orient_fvec_x,
+		playerObject.orient_fvec_y,
+		playerObject.orient_fvec_z
+	);
+	playerObject.orient_rvec_x = _right.x;
+	playerObject.orient_rvec_y = _right.y;
+	playerObject.orient_rvec_z = - _right.z;
+	playerObject.orient_uvec_x = _up.x;
+	playerObject.orient_uvec_y = _up.y;
+	playerObject.orient_uvec_z = - _up.z;
+
+}
+
+export function setPlayerSegnum( s ) {
+
+	playerSegnum = s;
+	if ( playerObject !== null && playerObjnum >= 0 &&
+		playerObject.segnum !== s && playerObject.segnum >= 0 && s >= 0 ) {
+
+		obj_relink( playerObjnum, s );
+
+	}
+
+}
 export function getPlayerSegnum() { return playerSegnum; }
+export function game_get_player_object() { return playerObject; }
+
+// Refresh the sound listener from the canonical player object before a level's
+// permanent sound sources are linked.  The regular frame update has not run at
+// that point, so digi.js may still hold the previous level's listener state.
+export function game_update_audio_listener_from_player() {
+
+	if ( playerObject === null || playerObject.segnum < 0 ) return false;
+
+	digi_update_listener(
+		playerObject.pos_x, playerObject.pos_y, playerObject.pos_z,
+		playerObject.segnum,
+		playerObject.orient_rvec_x,
+		playerObject.orient_rvec_y,
+		playerObject.orient_rvec_z
+	);
+	return true;
+
+}
+
+// Synchronize an externally restored camera pose into the canonical player.
+// Save restoration moves the camera directly, outside updateCamera().
+export function game_sync_player_object( resetLastPosition = false ) {
+
+	sync_player_object( false );
+
+	if ( resetLastPosition === true && playerObject !== null ) {
+
+		playerObject.last_pos_x = playerObject.pos_x;
+		playerObject.last_pos_y = playerObject.pos_y;
+		playerObject.last_pos_z = playerObject.pos_z;
+
+	}
+
+}
 
 // Get player position in Descent coordinates (negate Z from Three.js)
 // Pre-allocated result object (Golden Rule #5: no allocations in render loop)
@@ -1341,6 +1617,14 @@ const _playerPos = { x: 0, y: 0, z: 0 };
 
 export function getPlayerPos() {
 
+	if ( playerPoseExternallyDriven === true && playerObject !== null ) {
+
+		_playerPos.x = playerObject.pos_x;
+		_playerPos.y = playerObject.pos_y;
+		_playerPos.z = playerObject.pos_z;
+		return _playerPos;
+
+	}
 	if ( camera === null ) return _playerPos;
 
 	_playerPos.x = camera.position.x;
@@ -1351,16 +1635,67 @@ export function getPlayerPos() {
 
 }
 
+// Mirror the camera-backed player into the canonical Objects[] slot used by
+// segment lists, door obstruction, and FVI.
+function sync_player_object( updateLastPosition = true ) {
+
+	if ( camera === null || playerObject === null || playerObjnum < 0 ) return;
+
+	if ( updateLastPosition === true ) {
+
+		playerObject.last_pos_x = playerObject.pos_x;
+		playerObject.last_pos_y = playerObject.pos_y;
+		playerObject.last_pos_z = playerObject.pos_z;
+
+	}
+	playerObject.pos_x = camera.position.x;
+	playerObject.pos_y = camera.position.y;
+	playerObject.pos_z = - camera.position.z;
+
+	_forward.set( 0, 0, - 1 ).applyQuaternion( camera.quaternion );
+	_right.set( 1, 0, 0 ).applyQuaternion( camera.quaternion );
+	_up.set( 0, 1, 0 ).applyQuaternion( camera.quaternion );
+
+	playerObject.orient_fvec_x = _forward.x;
+	playerObject.orient_fvec_y = _forward.y;
+	playerObject.orient_fvec_z = - _forward.z;
+	physics_set_player_forward(
+		playerObject.orient_fvec_x,
+		playerObject.orient_fvec_y,
+		playerObject.orient_fvec_z
+	);
+	playerObject.orient_rvec_x = _right.x;
+	playerObject.orient_rvec_y = _right.y;
+	playerObject.orient_rvec_z = - _right.z;
+	playerObject.orient_uvec_x = _up.x;
+	playerObject.orient_uvec_y = _up.y;
+	playerObject.orient_uvec_z = - _up.z;
+
+	if ( playerObject.segnum !== playerSegnum ) {
+
+		if ( playerObject.segnum >= 0 && playerSegnum >= 0 ) {
+
+			obj_relink( playerObjnum, playerSegnum );
+
+		} else {
+
+			playerObject.segnum = playerSegnum;
+
+		}
+
+	}
+
+}
+
 // --- Automap ---
 
 export function game_set_automap() {
 
-	// Reset automap, pause, and cockpit mode on level change
+	// Reset automap and cockpit mode on level change.  A save loaded from the
+	// pause menu keeps user-pause ownership until the load has fully succeeded.
 	automap_reset();
-	isPaused = false;
 	Cockpit_mode = CM_FULL_COCKPIT;
 	Rear_view = false;
-	hidePauseMenu();
 
 	// Ensure mine is visible
 	if ( mineGroup !== null ) mineGroup.visible = true;
@@ -1439,6 +1774,13 @@ function renderPauseMenu() {
 
 	}
 
+	if ( _pauseState === 'bindings' ) {
+
+		renderPauseBindings();
+		return;
+
+	}
+
 	const normalFont = NORMAL_FONT();
 	const currentFont = CURRENT_FONT();
 	const subtitleFont = SUBTITLE_FONT();
@@ -1500,15 +1842,46 @@ function renderPauseMenu() {
 // --- Pause settings sub-screen ---
 
 const PAUSE_SETTINGS_ITEMS = [
+	{ label: 'SOUND VOLUME', id: 'digi_volume' },
+	{ label: 'MUSIC VOLUME', id: 'music_volume' },
+	{ label: 'REVERSE STEREO', id: 'reverse_stereo' },
+	{ label: 'SOUND CHANNELS', id: 'sound_channels' },
 	{ label: 'INVERT MOUSE', id: 'invert_mouse' },
 	{ label: 'TEXTURE FILTERING', id: 'texture_filtering' },
+	{ label: 'CONFIGURE KEYS', id: 'configure_keys' },
 ];
 
+const PAUSE_BINDING_ITEMS = controls_get_bindable_actions();
+
 function getPauseSettingValue( id ) {
+
+	if ( id === 'digi_volume' ) {
+
+		return config_get_digi_volume() + '/' + CONFIG_VOLUME_MAX;
+
+	}
+
+	if ( id === 'music_volume' ) {
+
+		return config_get_music_volume() + '/' + CONFIG_VOLUME_MAX;
+
+	}
 
 	if ( id === 'invert_mouse' ) {
 
 		return config_get_invert_mouse_y() === true ? 'YES' : 'NO';
+
+	}
+
+	if ( id === 'reverse_stereo' ) {
+
+		return config_get_reverse_stereo() === true ? 'YES' : 'NO';
+
+	}
+
+	if ( id === 'sound_channels' ) {
+
+		return String( config_get_sound_channels() );
 
 	}
 
@@ -1518,15 +1891,66 @@ function getPauseSettingValue( id ) {
 
 	}
 
+	if ( id === 'configure_keys' ) {
+
+		return 'OPEN';
+
+	}
+
 	return '';
+
+}
+
+function setPauseDigiVolumeWithPreview( value ) {
+
+	const previous = config_get_digi_volume();
+	if ( config_set_digi_volume( value ) !== true ||
+		config_get_digi_volume() === previous ) return;
+
+	// MENU.C joydef_menuset(): preview the new effects volume with the
+	// drop-bomb cue, replacing any prior preview instance.
+	digi_play_sample_once( SOUND_DROP_BOMB, 1.0 );
 
 }
 
 function togglePauseSetting( id ) {
 
+	if ( id === 'digi_volume' ) {
+
+		setPauseDigiVolumeWithPreview(
+			( config_get_digi_volume() + 1 ) % ( CONFIG_VOLUME_MAX + 1 )
+		);
+	}
+
+	if ( id === 'music_volume' ) {
+
+		config_set_music_volume(
+			( config_get_music_volume() + 1 ) % ( CONFIG_VOLUME_MAX + 1 )
+		);
+	}
+
 	if ( id === 'invert_mouse' ) {
 
 		config_set_invert_mouse_y( config_get_invert_mouse_y() !== true );
+
+	}
+
+	if ( id === 'reverse_stereo' ) {
+
+		config_set_reverse_stereo( config_get_reverse_stereo() !== true );
+
+	}
+
+	if ( id === 'sound_channels' ) {
+
+		const currentIndex = CONFIG_SOUND_CHANNEL_COUNTS.indexOf(
+			config_get_sound_channels()
+		);
+		config_set_sound_channels(
+			CONFIG_SOUND_CHANNEL_COUNTS[
+				( currentIndex + 1 ) % CONFIG_SOUND_CHANNEL_COUNTS.length
+			]
+		);
 
 	}
 
@@ -1535,6 +1959,43 @@ function togglePauseSetting( id ) {
 		config_set_texture_filtering(
 			config_get_texture_filtering() === 'linear' ? 'nearest' : 'linear'
 		);
+
+	}
+
+	if ( id === 'configure_keys' ) {
+
+		_pauseState = 'bindings';
+		_bindingsSelectedIndex = 0;
+		_bindingCaptureAction = null;
+
+	}
+
+}
+
+function adjustPauseSetting( id, delta ) {
+
+	if ( id === 'digi_volume' ) {
+
+		setPauseDigiVolumeWithPreview( config_get_digi_volume() + delta );
+
+	}
+
+	if ( id === 'music_volume' ) {
+
+		config_set_music_volume( config_get_music_volume() + delta );
+
+	}
+
+	if ( id === 'sound_channels' ) {
+
+		const currentIndex = CONFIG_SOUND_CHANNEL_COUNTS.indexOf(
+			config_get_sound_channels()
+		);
+		const nextIndex = Math.max( 0, Math.min(
+			CONFIG_SOUND_CHANNEL_COUNTS.length - 1,
+			currentIndex + delta
+		) );
+		config_set_sound_channels( CONFIG_SOUND_CHANNEL_COUNTS[ nextIndex ] );
 
 	}
 
@@ -1580,7 +2041,78 @@ function renderPauseSettings() {
 	if ( smallFont !== null ) {
 
 		const hintY = itemsStartY + PAUSE_SETTINGS_ITEMS.length * itemHeight + 10;
-		gr_string( imageData, smallFont, 0x8000, hintY, 'ENTER TO TOGGLE  ESC TO BACK', _gamePalette );
+		gr_string( imageData, smallFont, 0x8000, hintY, 'LEFT/RIGHT ADJUST  ENTER CHANGE  ESC BACK', _gamePalette );
+
+	}
+
+	_pauseCtx.putImageData( imageData, 0, 0 );
+
+}
+
+function formatBindingCode( code ) {
+
+	if ( code === '' ) return 'UNBOUND';
+	if ( code === 'Space' ) return 'SPACE';
+	if ( code === 'Escape' ) return 'ESC';
+	if ( code === 'Backspace' ) return 'BKSP';
+	if ( code === 'ShiftLeft' || code === 'ShiftRight' ) return 'SHIFT';
+	if ( code.substring( 0, 3 ) === 'Key' ) return code.substring( 3 );
+	if ( code.substring( 0, 5 ) === 'Digit' ) return code.substring( 5 );
+	if ( code.substring( 0, 5 ) === 'Arrow' ) return code.substring( 5 ).toUpperCase();
+	return code.toUpperCase();
+
+}
+
+function renderPauseBindings() {
+
+	if ( _pauseCtx === null ) return;
+
+	const normalFont = NORMAL_FONT();
+	const currentFont = CURRENT_FONT();
+	const subtitleFont = SUBTITLE_FONT();
+	const smallFont = GAME_FONT();
+
+	_pauseCtx.clearRect( 0, 0, PAUSE_W, PAUSE_H );
+	const imageData = _pauseCtx.createImageData( PAUSE_W, PAUSE_H );
+
+	_bindingsItemYPositions = [];
+
+	if ( normalFont === null || currentFont === null ) return;
+
+	const titleFont = subtitleFont !== null ? subtitleFont : normalFont;
+	const titleY = 42;
+	gr_string( imageData, titleFont, 0x8000, titleY, 'KEY BINDINGS', _gamePalette );
+
+	const itemHeight = normalFont.ft_h + 2;
+	const itemsStartY = titleY + titleFont.ft_h + 10;
+
+	for ( let i = 0; i < PAUSE_BINDING_ITEMS.length; i ++ ) {
+
+		const item = PAUSE_BINDING_ITEMS[ i ];
+		const isSelected = ( i === _bindingsSelectedIndex );
+		const font = isSelected ? currentFont : normalFont;
+		const y = itemsStartY + i * itemHeight;
+		_bindingsItemYPositions.push( { y: y, h: itemHeight } );
+
+		const code = controls_get_action_primary_code( item.id );
+		const text = item.label + ': ' + formatBindingCode( code );
+		gr_string( imageData, font, 0x8000, y, text, _gamePalette );
+
+	}
+
+	if ( smallFont !== null ) {
+
+		const hintY = itemsStartY + PAUSE_BINDING_ITEMS.length * itemHeight + 8;
+
+		if ( _bindingCaptureAction !== null ) {
+
+			gr_string( imageData, smallFont, 0x8000, hintY, 'PRESS A KEY  ESC TO CANCEL', _gamePalette );
+
+		} else {
+
+			gr_string( imageData, smallFont, 0x8000, hintY, 'ENTER TO REBIND  ESC TO BACK', _gamePalette );
+
+		}
 
 	}
 
@@ -1634,11 +2166,44 @@ function findSettingsItemAtY( y200 ) {
 
 }
 
+function findBindingsItemAtY( y200 ) {
+
+	for ( let i = 0; i < _bindingsItemYPositions.length; i ++ ) {
+
+		const item = _bindingsItemYPositions[ i ];
+
+		if ( y200 >= item.y && y200 < item.y + item.h ) {
+
+			return i;
+
+		}
+
+	}
+
+	return - 1;
+
+}
+
 function onPauseMouseMove( e ) {
 
 	if ( _pauseCanvas === null ) return;
 
 	const pos = pauseViewportTo320x200( e.clientX, e.clientY );
+
+	if ( _pauseState === 'bindings' ) {
+
+		const idx = findBindingsItemAtY( pos.y );
+
+		if ( idx !== - 1 && idx !== _bindingsSelectedIndex ) {
+
+			_bindingsSelectedIndex = idx;
+			renderPauseMenu();
+
+		}
+
+		return;
+
+	}
 
 	if ( _pauseState === 'settings' ) {
 
@@ -1672,6 +2237,22 @@ function onPauseMouseClick( e ) {
 
 	const pos = pauseViewportTo320x200( e.clientX, e.clientY );
 
+	if ( _pauseState === 'bindings' ) {
+
+		const idx = findBindingsItemAtY( pos.y );
+
+		if ( idx !== - 1 ) {
+
+			_bindingsSelectedIndex = idx;
+			_bindingCaptureAction = PAUSE_BINDING_ITEMS[ idx ].id;
+			renderPauseMenu();
+
+		}
+
+		return;
+
+	}
+
 	if ( _pauseState === 'settings' ) {
 
 		const idx = findSettingsItemAtY( pos.y );
@@ -1700,6 +2281,7 @@ function onPauseMouseClick( e ) {
 function onPauseMenuSelect( idx ) {
 
 	const id = PAUSE_MENU_ITEMS[ idx ].id;
+	if ( transitionSuspended === true && id !== 'load' && id !== 'quit' ) return;
 
 	if ( id === 'resume' ) {
 
@@ -1730,21 +2312,25 @@ function onPauseMenuSelect( idx ) {
 
 			if ( result !== true ) {
 
-				_pauseStatusText = 'NO SAVE FOUND';
+				_pauseStatusText = transitionSuspended === true
+					? 'LOAD FAILED - QUIT TO MENU'
+					: 'NO SAVE FOUND';
 				renderPauseMenu();
-				clearTimeout( _pauseStatusTimer );
-				_pauseStatusTimer = setTimeout( function () {
+				if ( transitionSuspended !== true ) {
 
-					_pauseStatusText = null;
-					renderPauseMenu();
+					clearTimeout( _pauseStatusTimer );
+					_pauseStatusTimer = setTimeout( function () {
 
-				}, 2000 );
+						_pauseStatusText = null;
+						renderPauseMenu();
+
+					}, 2000 );
+
+				}
 
 			} else {
 
-				isPaused = false;
-				hidePauseMenu();
-				lastTime = 0;
+				resumeGame();
 
 			}
 
@@ -1758,9 +2344,12 @@ function onPauseMenuSelect( idx ) {
 
 	} else if ( id === 'quit' ) {
 
-		isPaused = false;
 		hidePauseMenu();
 		if ( _onQuitToMenu !== null ) _onQuitToMenu();
+		// restartGame() synchronously suspends and tears down the old world before
+		// returning its menu promise.  Release the user-pause owner only after
+		// that transfer, so no old linked loop can restart transiently.
+		setUserPauseState( false );
 
 	}
 
@@ -1771,6 +2360,8 @@ function showPauseMenu() {
 	ensurePauseCanvas();
 	_pauseSelectedIndex = 0;
 	_pauseState = 'menu';
+	_bindingsSelectedIndex = 0;
+	_bindingCaptureAction = null;
 	_pauseStatusText = null;
 	clearTimeout( _pauseStatusTimer );
 	renderPauseMenu();
@@ -1790,9 +2381,12 @@ function hidePauseMenu() {
 
 function resumeGame() {
 
-	isPaused = false;
+	// A malformed level can fail after the old world has already been torn down.
+	// Keep that fail-closed transition frozen; Quit remains available to recover.
+	if ( transitionSuspended === true ) return;
+
+	setUserPauseState( false );
 	hidePauseMenu();
-	lastTime = 0;
 
 	// Re-lock pointer for gameplay
 	if ( renderer !== null ) {
@@ -1812,7 +2406,7 @@ function togglePause() {
 
 	}
 
-	isPaused = true;
+	setUserPauseState( true );
 	showPauseMenu();
 
 	// Release pointer lock so mouse can interact with menu
@@ -1824,9 +2418,47 @@ function togglePause() {
 
 }
 
+function setUserPauseState( paused ) {
+
+	const nextPaused = ( paused === true );
+	if ( isPaused === nextPaused ) return;
+
+	isPaused = nextPaused;
+	if ( nextPaused === true ) {
+
+		digi_pause_all();
+		songs_pause();
+
+	} else {
+
+		digi_resume_all();
+		songs_resume_playback();
+		lastTime = 0;
+
+	}
+
+}
+
 export function game_set_quit_callback( cb ) {
 
 	_onQuitToMenu = cb;
+
+}
+
+export function game_set_transition_suspended( suspended ) {
+
+	transitionSuspended = ( suspended === true );
+	if ( transitionSuspended === true ) {
+
+		// Blocking title/score/menu UI must receive pointer events.  The
+		// pointerlockchange handler ignores this deliberate transition exit.
+		if ( document.pointerLockElement !== null ) document.exitPointerLock();
+
+	} else {
+
+		lastTime = 0;
+
+	}
 
 }
 
@@ -1863,4 +2495,3 @@ function toggleAutomap() {
 	}
 
 }
-

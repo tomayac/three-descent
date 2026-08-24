@@ -4,9 +4,10 @@
 import { find_point_seg } from './gameseg.js';
 import { find_vector_intersection, HIT_WALL } from './fvi.js';
 import { Laser_create_new, PARENT_ROBOT } from './laser.js';
-import { digi_play_sample, digi_play_sample_3d,
-	SOUND_LASER_FIRED, SOUND_CONTROL_CENTER_WARNING_SIREN, SOUND_MINE_BLEW_UP,
-	SOUND_COUNTDOWN_0_SECS, SOUND_COUNTDOWN_13_SECS, SOUND_COUNTDOWN_29_SECS } from './digi.js';
+import { digi_play_sample, digi_play_sample_world,
+	SOUND_CONTROL_CENTER_WARNING_SIREN, SOUND_MINE_BLEW_UP,
+	SOUND_COUNTDOWN_0_SECS, SOUND_COUNTDOWN_13_SECS, SOUND_COUNTDOWN_29_SECS,
+	SOUND_EXPLODING_WALL } from './digi.js';
 import { Weapon_info } from './weapon.js';
 import { object_create_explosion } from './fireball.js';
 import { effects_set_reactor_destroyed } from './effects.js';
@@ -15,6 +16,16 @@ import { Polygon_models } from './polyobj.js';
 
 // Difficulty levels
 const NDL = 5;
+const CONTROLCEN_WEAPON_NUM = 6;
+
+function playControlCenterWeaponSound( segnum, pos_x, pos_y, pos_z ) {
+
+	if ( CONTROLCEN_WEAPON_NUM >= Weapon_info.length ) return;
+	const sound = Weapon_info[ CONTROLCEN_WEAPON_NUM ].flash_sound;
+	if ( sound < 0 ) return;
+	digi_play_sample_world( sound, 1.0, segnum, pos_x, pos_y, pos_z );
+
+}
 
 // Reactor state
 let liveReactor = null;
@@ -34,6 +45,7 @@ let selfDestructSirenTimer = 0;
 let selfDestructTotalTime = 0;
 let selfDestructReactorTimer = 0;
 let selfDestructWhiteFlash = 0;
+let controlCenterDestroyed = false;
 
 // Countdown voice tracking — which second thresholds have been spoken
 let countdownVoicePlayed = new Set();
@@ -71,6 +83,7 @@ export function cntrlcen_set_externals( ext ) {
 	if ( ext.controlCenterTriggers !== undefined ) _controlCenterTriggers = ext.controlCenterTriggers;
 	if ( ext.wallToggle !== undefined ) _wallToggle = ext.wallToggle;
 	if ( ext.isPlayerCloaked !== undefined ) _isPlayerCloaked = ext.isPlayerCloaked;
+	if ( ext.getBelievedPlayerPos !== undefined ) _getBelievedPlayerPos = ext.getBelievedPlayerPos;
 
 }
 
@@ -106,6 +119,81 @@ export function cntrlcen_get_self_destruct_timer() {
 export function cntrlcen_is_self_destruct_active() {
 
 	return selfDestructTimer > 0 || selfDestructWhiteFlash > 0;
+
+}
+
+// Fuelcen_control_center_destroyed remains set after the countdown and
+// white-out finish.  D1 uses that persistent state to route a mine-death to
+// the end-of-level flow instead of respawning the player in the destroyed mine.
+export function cntrlcen_is_destroyed() {
+
+	return controlCenterDestroyed;
+
+}
+
+// STATE.C persists both Fuelcen_control_center_destroyed and the countdown
+// state.  Keep the JS-specific fractional timers so a save resumes at the
+// same point without replaying do_controlcen_destroyed_stuff() (which would
+// toggle the exit doors a second time).
+export function cntrlcen_get_save_state() {
+
+	return {
+		destroyed: controlCenterDestroyed,
+		timer: selfDestructTimer,
+		totalTime: selfDestructTotalTime,
+		warningTimer: selfDestructWarningTimer,
+		sirenTimer: selfDestructSirenTimer,
+		reactorTimer: selfDestructReactorTimer,
+		whiteFlash: selfDestructWhiteFlash,
+		countdownVoicePlayed: Array.from( countdownVoicePlayed )
+	};
+
+}
+
+export function cntrlcen_restore_save_state( state ) {
+
+	if ( state === null || state === undefined || typeof state !== 'object' ||
+		typeof state.destroyed !== 'boolean' ) return false;
+
+	controlCenterDestroyed = state.destroyed === true;
+	if ( controlCenterDestroyed !== true ) {
+
+		selfDestructTimer = 0;
+		selfDestructTotalTime = 0;
+		selfDestructWarningTimer = 0;
+		selfDestructSirenTimer = 0;
+		selfDestructReactorTimer = 0;
+		selfDestructWhiteFlash = 0;
+		countdownVoicePlayed.clear();
+		effects_set_reactor_destroyed( false );
+		return true;
+
+	}
+
+	selfDestructTimer = Number.isFinite( state.timer ) ? Math.max( state.timer, 0 ) : 0;
+	selfDestructTotalTime = Number.isFinite( state.totalTime )
+		? Math.max( state.totalTime, selfDestructTimer ) : selfDestructTimer;
+	selfDestructWarningTimer = Number.isFinite( state.warningTimer )
+		? state.warningTimer : 0;
+	selfDestructSirenTimer = Number.isFinite( state.sirenTimer ) ? state.sirenTimer : 0;
+	selfDestructReactorTimer = Number.isFinite( state.reactorTimer )
+		? state.reactorTimer : 0;
+	selfDestructWhiteFlash = Number.isFinite( state.whiteFlash )
+		? Math.max( state.whiteFlash, 0 ) : 0;
+	countdownVoicePlayed.clear();
+	if ( Array.isArray( state.countdownVoicePlayed ) ) {
+
+		for ( let i = 0; i < state.countdownVoicePlayed.length; i ++ ) {
+
+			const second = state.countdownVoicePlayed[ i ];
+			if ( Number.isInteger( second ) && second >= 0 ) countdownVoicePlayed.add( second );
+
+		}
+
+	}
+
+	effects_set_reactor_destroyed( controlCenterDestroyed );
+	return true;
 
 }
 
@@ -154,6 +242,8 @@ export function init_controlcen_for_level( obj ) {
 // Ported from: do_controlcen_destroyed_stuff() in CNTRLCEN.C + controlcen_proc() in FUELCEN.C
 export function startSelfDestruct() {
 
+	controlCenterDestroyed = true;
+
 	// Toggle exit doors via ControlCenterTriggers
 	// Ported from: do_controlcen_destroyed_stuff() in CNTRLCEN.C lines 211-216
 	if ( _controlCenterTriggers !== null && _wallToggle !== null ) {
@@ -183,7 +273,6 @@ export function startSelfDestruct() {
 	countdownVoicePlayed.clear();
 
 	if ( _showMessage !== null ) _showMessage( 'REACTOR DESTROYED! ESCAPE NOW!' );
-	digi_play_sample( SOUND_CONTROL_CENTER_WARNING_SIREN, 1.0 );
 
 	// Freeze critical eclips (monitors/screens that depend on reactor power)
 	effects_set_reactor_destroyed( true );
@@ -194,6 +283,7 @@ export function startSelfDestruct() {
 export function cntrlcen_reset() {
 
 	liveReactor = null;
+	controlCenterDestroyed = false;
 	selfDestructTimer = 0;
 	selfDestructWarningTimer = 0;
 	selfDestructSirenTimer = 0;
@@ -216,12 +306,49 @@ export function do_controlcen_frame( dt ) {
 	if ( liveReactor === null || liveReactor.alive !== true ) return;
 	if ( _isPlayerDead !== null && _isPlayerDead() === true ) return;
 	if ( selfDestructTimer > 0 ) return;
-	// Reactor only fires after being hit at least once
-	// Ported from: CNTRLCEN.C do_controlcen_frame() — if (!Control_center_been_hit) return;
-	if ( Control_center_been_hit !== true ) return;
 
 	const pp = _getPlayerPos !== null ? _getPlayerPos() : null;
 	if ( pp === null ) return;
+
+	// Ported from: CNTRLCEN.C do_controlcen_frame() lines 249-284
+	// Reactor starts firing after either being hit OR seeing the player.
+	// While neither is true, periodically probe visibility within 200 units.
+	if ( Control_center_been_hit !== true && reactorPlayerSeen !== true ) {
+
+		reactorCheckTimer -= dt;
+
+		if ( reactorCheckTimer <= 0 ) {
+
+			reactorCheckTimer = 0.133; // every ~8 frames at 60fps
+
+			const qx = pp.x - liveReactor.obj.pos_x;
+			const qy = pp.y - liveReactor.obj.pos_y;
+			const qz = pp.z - liveReactor.obj.pos_z;
+			const qdist = Math.sqrt( qx * qx + qy * qy + qz * qz );
+
+			if ( qdist < 200.0 ) {
+
+				const losResult = find_vector_intersection(
+					liveReactor.obj.pos_x, liveReactor.obj.pos_y, liveReactor.obj.pos_z,
+					pp.x, pp.y, pp.z,
+					liveReactor.obj.segnum, 0.0,
+					- 1, 0
+				);
+
+				if ( losResult.hit_type !== HIT_WALL ) {
+
+					reactorPlayerSeen = true;
+					reactorFireTimer = 0;
+
+				}
+
+			}
+
+		}
+
+		return;
+
+	}
 
 	// Cloaked player: reactor fires at inaccurate "believed" position
 	// Ported from: CNTRLCEN.C lines 287-303 — uses Believed_player_pos when cloaked
@@ -232,46 +359,23 @@ export function do_controlcen_frame( dt ) {
 
 	if ( isCloaked === true ) {
 
-		// Add significant random offset to simulate drifting believed position
-		target_x += ( Math.random() - 0.5 ) * 60.0;
-		target_y += ( Math.random() - 0.5 ) * 60.0;
-		target_z += ( Math.random() - 0.5 ) * 60.0;
+		const bp = _getBelievedPlayerPos !== null ? _getBelievedPlayerPos() : null;
+		if ( bp !== null ) {
 
-	}
-
-	reactorCheckTimer -= dt;
-
-	// Every 8 frames (~0.133s), check if player is visible
-	if ( reactorCheckTimer <= 0 ) {
-
-		reactorCheckTimer = 0.133;
-
-		const dx = target_x - liveReactor.obj.pos_x;
-		const dy = target_y - liveReactor.obj.pos_y;
-		const dz = target_z - liveReactor.obj.pos_z;
-		const dist = Math.sqrt( dx * dx + dy * dy + dz * dz );
-
-		// Ported from: CNTRLCEN.C lines 249-284 — check distance AND line-of-sight
-		if ( dist < 300.0 ) {
-
-			const losResult = find_vector_intersection(
-				liveReactor.obj.pos_x, liveReactor.obj.pos_y, liveReactor.obj.pos_z,
-				target_x, target_y, target_z,
-				liveReactor.obj.segnum, 0.0,
-				- 1, 0
-			);
-			reactorPlayerSeen = ( losResult.hit_type !== HIT_WALL );
+			target_x = bp.x;
+			target_y = bp.y;
+			target_z = bp.z;
 
 		} else {
 
-			reactorPlayerSeen = false;
+			// Fallback when AI believed-position provider is unavailable
+			target_x += ( Math.random() - 0.5 ) * 60.0;
+			target_y += ( Math.random() - 0.5 ) * 60.0;
+			target_z += ( Math.random() - 0.5 ) * 60.0;
 
 		}
 
 	}
-
-	// Fire at player when seen
-	if ( reactorPlayerSeen !== true ) return;
 
 	reactorFireTimer -= dt;
 	if ( reactorFireTimer > 0 ) return;
@@ -328,7 +432,15 @@ export function do_controlcen_frame( dt ) {
 	let dz = target_z - fire_z;
 	const dist = Math.sqrt( dx * dx + dy * dy + dz * dz );
 
-	if ( dist > 0.001 && dist < 300.0 ) {
+	if ( dist > 300.0 ) {
+
+		Control_center_been_hit = false;
+		reactorPlayerSeen = false;
+		return;
+
+	}
+
+	if ( dist > 0.001 ) {
 
 		dx /= dist;
 		dy /= dist;
@@ -341,15 +453,19 @@ export function do_controlcen_frame( dt ) {
 		// Ported from: CNTRLCEN.C do_controlcen_frame() visibility check
 		const losResult = find_vector_intersection(
 			fire_x, fire_y, fire_z,
-			pp.x, pp.y, pp.z,
+			target_x, target_y, target_z,
 			seg, 0.0,
 			- 1, 0
 		);
 
 		if ( losResult.hit_type === HIT_WALL ) return;
 
-		// Fire at player (weapon_type 6 = CONTROLCEN_WEAPON_NUM)
-		Laser_create_new( dx, dy, dz, fire_x, fire_y, fire_z, seg, PARENT_ROBOT, 6 );
+		// Fire at player
+		const firstShot = Laser_create_new(
+			dx, dy, dz, fire_x, fire_y, fire_z, seg, PARENT_ROBOT, CONTROLCEN_WEAPON_NUM,
+			1.0, undefined, false, undefined, liveReactor.objnum, liveReactor.obj.signature
+		);
+		if ( firstShot !== - 1 ) playControlCenterWeaponSound( seg, fire_x, fire_y, fire_z );
 
 		// 25% chance of additional random-aimed shot
 		if ( Math.random() < 0.25 ) {
@@ -360,23 +476,18 @@ export function do_controlcen_frame( dt ) {
 			const rmag = Math.sqrt( rx * rx + ry * ry + rz * rz );
 			if ( rmag > 0.001 ) {
 
-				Laser_create_new( rx / rmag, ry / rmag, rz / rmag,
-					fire_x, fire_y, fire_z, seg, PARENT_ROBOT, 6 );
+				const secondShot = Laser_create_new( rx / rmag, ry / rmag, rz / rmag,
+					fire_x, fire_y, fire_z, seg, PARENT_ROBOT, CONTROLCEN_WEAPON_NUM,
+					1.0, undefined, false, undefined, liveReactor.objnum, liveReactor.obj.signature );
+				if ( secondShot !== - 1 ) {
+
+					playControlCenterWeaponSound( seg, fire_x, fire_y, fire_z );
+
+				}
 
 			}
 
 		}
-
-		// Per-weapon fire sound: CONTROLCEN_WEAPON_NUM=6
-		const ccWeaponType = 6;
-		let ccFireSound = SOUND_LASER_FIRED;
-		if ( ccWeaponType < Weapon_info.length && Weapon_info[ ccWeaponType ].flash_sound >= 0 ) {
-
-			ccFireSound = Weapon_info[ ccWeaponType ].flash_sound;
-
-		}
-
-		digi_play_sample_3d( ccFireSound, 0.4, fire_x, fire_y, fire_z );
 
 		// Fire rate: (NDL - Difficulty_level) * 0.25 seconds
 		const Difficulty_level = _getDifficultyLevel !== null ? _getDifficultyLevel() : 1;
@@ -394,11 +505,12 @@ export function do_controlcen_destroyed_frame( dt, playerPos ) {
 	// --- Self-destruct countdown ---
 	if ( selfDestructTimer > 0 ) {
 
+		const oldTimer = selfDestructTimer;
 		selfDestructTimer -= dt;
 		selfDestructWarningTimer -= dt;
-		selfDestructSirenTimer -= dt;
 
 		const elapsed = selfDestructTotalTime - selfDestructTimer;
+		const oldElapsed = selfDestructTotalTime - oldTimer;
 
 		// Ship rocking — random camera rotation during countdown
 		// Ported from: FUELCEN.C lines 801-805
@@ -425,71 +537,94 @@ export function do_controlcen_destroyed_frame( dt, playerPos ) {
 				const rx = liveReactor.obj.pos_x + ( Math.random() - 0.5 ) * 8;
 				const ry = liveReactor.obj.pos_y + ( Math.random() - 0.5 ) * 8;
 				const rz = liveReactor.obj.pos_z + ( Math.random() - 0.5 ) * 8;
-				object_create_explosion( rx, ry, rz, 2.0 + Math.random() * 2.0 );
+				const explosion = object_create_explosion(
+					rx, ry, rz, 2.0 + Math.random() * 2.0
+				);
+
+				// create_small_fireball_on_object() gives non-robot destruction
+				// fireballs a one-in-four, half-volume crackle at the owning object.
+				// Ported from: OBJECT.C lines 783-793.
+				if ( explosion !== null && Math.random() < 0.25 ) {
+
+					digi_play_sample_world(
+						SOUND_EXPLODING_WALL, 0.5, liveReactor.obj.segnum,
+						liveReactor.obj.pos_x,
+						liveReactor.obj.pos_y,
+						liveReactor.obj.pos_z
+					);
+
+				}
 
 			}
 
 		}
 
-		// Escalating explosions at reactor center with siren
+		// Escalating explosions at control-center segment center + siren.
 		// Ported from: FUELCEN.C lines 821-832
-		if ( selfDestructSirenTimer <= 0 && elapsed > 5.0 ) {
+		if ( elapsed > 5.0 && liveReactor !== null ) {
 
-			const interval = Math.max( 0.5, 2.0 - elapsed * 0.04 );
-			selfDestructSirenTimer = interval;
-			digi_play_sample( SOUND_CONTROL_CENTER_WARNING_SIREN, 0.8 );
+			const size = elapsed / 0.65;
+			const oldSize = oldElapsed / 0.65;
+			if ( Math.floor( size ) !== Math.floor( oldSize ) ) {
 
-			// Explosion at random segment
-			const numSegs = Num_segments;
-			const randomSeg = Math.floor( Math.random() * numSegs );
-			if ( randomSeg < numSegs ) {
+				const segnum = liveReactor.obj.segnum;
+				if ( segnum >= 0 && segnum < Num_segments ) {
 
-				const s = Segments[ randomSeg ];
-				let cx = 0, cy = 0, cz = 0;
-				for ( let v = 0; v < 8; v ++ ) {
+					const s = Segments[ segnum ];
+					let cx = 0, cy = 0, cz = 0;
+					for ( let v = 0; v < 8; v ++ ) {
 
-					const vi = s.verts[ v ];
-					cx += Vertices[ vi * 3 + 0 ];
-					cy += Vertices[ vi * 3 + 1 ];
-					cz += Vertices[ vi * 3 + 2 ];
+						const vi = s.verts[ v ];
+						cx += Vertices[ vi * 3 + 0 ];
+						cy += Vertices[ vi * 3 + 1 ];
+						cz += Vertices[ vi * 3 + 2 ];
+
+					}
+
+					object_create_explosion( cx / 8, cy / 8, cz / 8, size * 10.0 );
 
 				}
 
-				const explosionSize = 3.0 + ( elapsed / selfDestructTotalTime ) * 12.0;
-				object_create_explosion( cx / 8, cy / 8, cz / 8, explosionSize );
+				digi_play_sample( SOUND_CONTROL_CENTER_WARNING_SIREN, 3.0 );
 
 			}
-
-		} else if ( selfDestructSirenTimer <= 0 ) {
-
-			selfDestructSirenTimer = 2.0;
-			digi_play_sample( SOUND_CONTROL_CENTER_WARNING_SIREN, 0.8 );
 
 		}
 
 		// Flash warning text every 1 second
 		if ( selfDestructWarningTimer <= 0 ) {
 
-			const secs = Math.ceil( selfDestructTimer );
+			const secs = Math.max( 0, Math.ceil( selfDestructTimer ) );
 			if ( _showMessage !== null ) _showMessage( 'SELF DESTRUCT IN ' + secs + 's — ESCAPE!' );
 			selfDestructWarningTimer = 1.0;
 
-			// Countdown voice sounds (ported from CNTRLCEN.C / FUELCEN.C)
-			// Voices for: T-29, T-13 through T-0
-			if ( countdownVoicePlayed.has( secs ) !== true ) {
+		}
 
-				countdownVoicePlayed.add( secs );
+		// Countdown voice sounds
+		// Ported from: FUELCEN.C lines 811-819
+		const countdown13At = selfDestructTotalTime - 12.75;
+		if ( oldElapsed < countdown13At && elapsed >= countdown13At ) {
 
-				if ( secs >= 0 && secs <= 13 ) {
+			digi_play_sample( SOUND_COUNTDOWN_13_SECS, 3.0 );
 
-					// SOUND_COUNTDOWN_0_SECS (100) through SOUND_COUNTDOWN_13_SECS (113)
-					digi_play_sample( SOUND_COUNTDOWN_0_SECS + secs, 1.0 );
+		}
 
-				} else if ( secs === 29 ) {
+		if ( Math.floor( oldElapsed ) !== Math.floor( elapsed ) ) {
 
-					digi_play_sample( SOUND_COUNTDOWN_29_SECS, 1.0 );
+			const totalSecs = Math.floor( selfDestructTotalTime );
+			// D1 derives this from the integer part of elapsed time.  Flooring
+			// the fractional time remaining instead skips the first spoken
+			// second (29 on Insane) as soon as the timer crosses 1.0.
+			const secsLeft = totalSecs - Math.floor( elapsed );
+			if ( secsLeft >= 0 && secsLeft < 10 ) {
 
-				}
+				digi_play_sample( SOUND_COUNTDOWN_0_SECS + secsLeft, 3.0 );
+
+			}
+
+			if ( secsLeft === totalSecs - 1 ) {
+
+				digi_play_sample( SOUND_COUNTDOWN_29_SECS, 3.0 );
 
 			}
 
@@ -500,7 +635,7 @@ export function do_controlcen_destroyed_frame( dt, playerPos ) {
 			// Start white-out phase
 			// Ported from: FUELCEN.C lines 833-852
 			selfDestructTimer = 0;
-			selfDestructWhiteFlash = 2.0;
+			selfDestructWhiteFlash = 4.0;
 			digi_play_sample( SOUND_MINE_BLEW_UP, 1.0 );
 			if ( _showMessage !== null ) _showMessage( 'MINE DESTROYED!' );
 
@@ -529,7 +664,7 @@ export function do_controlcen_destroyed_frame( dt, playerPos ) {
 
 		selfDestructWhiteFlash -= dt;
 
-		const flashAlpha = 1.0 - ( selfDestructWhiteFlash / 2.0 );
+		const flashAlpha = 1.0 - ( selfDestructWhiteFlash / 4.0 );
 		if ( _gauges_set_white_flash !== null ) _gauges_set_white_flash( flashAlpha );
 
 		// Continue ship rocking during white-out

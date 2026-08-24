@@ -2,10 +2,15 @@
 // Player physics simulation: linear and rotational sub-stepping with drag
 
 import { find_point_seg, find_connect_side } from './gameseg.js';
-import { find_vector_intersection, HIT_NONE, HIT_WALL, HIT_BAD_P0 } from './fvi.js';
+import {
+	find_vector_intersection, HIT_NONE, HIT_WALL, HIT_OBJECT, HIT_BAD_P0,
+	FQ_CHECK_OBJS, FQ_GET_SEGLIST, MAX_FVI_SEGS, fvi_set_ignore_obj_list
+} from './fvi.js';
 import { wall_hit_process as fvi_wall_hit_process } from './wall.js';
 import { check_trigger as fvi_check_trigger } from './switch.js';
-import { GameTime } from './mglobal.js';
+import { GameTime, Segments, Num_segments, Objects } from './mglobal.js';
+import { SIDE_IS_TRI_02, SIDE_IS_TRI_13 } from './segment.js';
+import { OBJ_PLAYER, OF_SHOULD_BE_DEAD, PF_PERSISTENT, obj_relink } from './object.js';
 
 // --- Player ship physics constants (ported from bitmaps.bin $PLAYER_SHIP) ---
 export const PLAYER_MASS = 4.0;
@@ -14,7 +19,7 @@ export const PLAYER_MAX_THRUST = 7.8;
 export const PLAYER_MAX_ROTTHRUST = 0.14;
 export const PLAYER_WIGGLE = 0.5;
 export const PHYSICS_FT = 1.0 / 64.0;	// Sub-step time (F1_0/64)
-export const PLAYER_RADIUS = 2.5;	// Collision radius in Descent units
+export const PLAYER_RADIUS = 2.5;	// Fallback radius before a canonical player model is registered
 
 // Wall-hit damage constants (from COLLIDE.C lines 650-652)
 const DAMAGE_SCALE = 128.0;
@@ -23,6 +28,7 @@ const WALL_LOUDNESS_SCALE = 20.0;
 
 // Callback for wall-hit damage — injected by gameseq.js
 let _onPlayerWallHit = null;
+let _onPlayerObjectHit = null;
 
 export function physics_set_wall_hit_callback( fn ) {
 
@@ -30,26 +36,61 @@ export function physics_set_wall_hit_callback( fn ) {
 
 }
 
-// Turn banking constants (converted from fixed-point to float)
+export function physics_set_object_hit_callback( fn ) {
+
+	_onPlayerObjectHit = fn;
+
+}
+
+// Turn banking constants (converted from fixed-angle units to radians)
 // Ported from: PHYSICS.C lines 269-272
-// TURNROLL_SCALE = (0x4ec4/2) in fixang, converts to ~0.154 in our float system
-// ROLL_RATE = 0x2000 fixang/sec = 0.785 rad/s (~45°/sec max interpolation rate)
-const TURNROLL_SCALE = 0.154;
-const ROLL_RATE = 0.785;
+const FIXANG_TO_RAD = ( Math.PI * 2.0 ) / 65536.0;
+const TURNROLL_SCALE = 0.154;	// (0x4ec4/2)/65536
+const ROLL_RATE = 0x2000 * FIXANG_TO_RAD;	// ~0.785 rad/s (45°/s)
 
 // Auto-level constants (from PHYSICS.C do_physics_align_object)
-// DAMP_ANG = 0x400 fixang = 0x400/65536 radians ≈ 0.0156 radians (~0.9°)
-const DAMP_ANG = 0.0156;
+// DAMP_ANG = 0x400 fixang -> ~0.098 rad (~5.6°)
+const DAMP_ANG = 0x400 * FIXANG_TO_RAD;
 
 // Player velocity in Descent coordinates (persistent across frames)
 const playerVelocity = { x: 0, y: 0, z: 0 };
 // Player rotational velocity (pitch, heading, bank) in radians/sec
 const playerRotVel = { x: 0, y: 0, z: 0 };
+// Current player forward vector in Descent coordinates.  phys_apply_rot() is
+// called from collision and weapon code which deliberately knows nothing about
+// the Three.js camera, so game.js keeps this canonical direction synchronized.
+const playerForward = { x: 0, y: 0, z: 1 };
 // Turn banking angle (visual bank during yaw rotation)
 let turnroll = 0;
 
 export function getPlayerVelocity() { return playerVelocity; }
+export function getPlayerRotVelocity() { return playerRotVel; }
 export function getTurnroll() { return turnroll; }
+
+export function physics_set_player_forward( x, y, z ) {
+
+	if ( Number.isFinite( x ) !== true || Number.isFinite( y ) !== true ||
+		Number.isFinite( z ) !== true ) return false;
+	const magnitude = Math.sqrt( x * x + y * y + z * z );
+	if ( magnitude <= 1e-12 ) return false;
+	const inverse = 1.0 / magnitude;
+	playerForward.x = x * inverse;
+	playerForward.y = y * inverse;
+	playerForward.z = z * inverse;
+	return true;
+
+}
+
+export function physics_set_player_rot_velocity( pitch, heading, bank ) {
+
+	if ( Number.isFinite( pitch ) !== true || Number.isFinite( heading ) !== true ||
+		Number.isFinite( bank ) !== true ) return false;
+	playerRotVel.x = pitch;
+	playerRotVel.y = heading;
+	playerRotVel.z = bank;
+	return true;
+
+}
 
 // Compute turn banking angle from yaw rotational velocity
 // Ported from: set_object_turnroll() in PHYSICS.C lines 404-426
@@ -81,19 +122,18 @@ export function set_object_turnroll( dt ) {
 
 // Auto-level the player ship: gradually rotate toward "upright" orientation
 // Ported from: do_physics_align_object() in PHYSICS.C lines 312-402
-// The original finds the segment side whose normal is most aligned with the player's
-// up vector, then gradually banks the ship toward that normal. For our Three.js port,
-// we use world-up (0,1,0) as the desired up vector (equivalent to floor_levelling mode
-// in the original) and compute roll correction in Descent coordinates.
+// Finds segment side normal most aligned with current up vector, then rolls toward it.
 //
 // camera = THREE.PerspectiveCamera (has .quaternion for orientation)
+// playerSegnum = player's current segment (used to derive desired up from segment normals)
 // dt = frame delta time in seconds
 //
 // Pre-allocated working vectors (Golden Rule #5)
 const _alignForward = { x: 0, y: 0, z: 0 };
 const _alignUp = { x: 0, y: 0, z: 0 };
+const _alignDesired = { x: 0, y: 0, z: 0 };
 
-export function do_physics_align_object( camera, dt ) {
+export function do_physics_align_object( camera, playerSegnum, dt ) {
 
 	if ( camera === null ) return;
 
@@ -126,10 +166,67 @@ export function do_physics_align_object( camera, dt ) {
 	_alignUp.y = uy_three;
 	_alignUp.z = - uz_three;
 
-	// Desired up vector: world Y-up (0, 1, 0)
-	const desired_x = 0;
-	const desired_y = 1;
-	const desired_z = 0;
+	let segnum = playerSegnum;
+	if ( segnum < 0 || segnum >= Num_segments ) {
+
+		segnum = find_point_seg( camera.position.x, camera.position.y, - camera.position.z, playerSegnum );
+
+	}
+
+	if ( segnum < 0 || segnum >= Num_segments ) return;
+
+	const seg = Segments[ segnum ];
+
+	// Find side normal most aligned with current up vector.
+	// Ported from: PHYSICS.C lines 324-336
+	let largest_d = - 1e9;
+	let best_side = - 1;
+
+	for ( let i = 0; i < 6; i ++ ) {
+
+		const n0 = seg.sides[ i ].normals[ 0 ];
+		const d = n0.x * _alignUp.x + n0.y * _alignUp.y + n0.z * _alignUp.z;
+		if ( d > largest_d ) {
+
+			largest_d = d;
+			best_side = i;
+
+		}
+
+	}
+
+	if ( best_side < 0 ) return;
+
+	const best = seg.sides[ best_side ];
+
+	// For triangulated sides use average of both face normals, otherwise face 0 normal.
+	// Ported from: PHYSICS.C lines 349-373
+	if ( best.type === SIDE_IS_TRI_02 || best.type === SIDE_IS_TRI_13 ) {
+
+		_alignDesired.x = best.normals[ 0 ].x + best.normals[ 1 ].x;
+		_alignDesired.y = best.normals[ 0 ].y + best.normals[ 1 ].y;
+		_alignDesired.z = best.normals[ 0 ].z + best.normals[ 1 ].z;
+		const dm = Math.sqrt(
+			_alignDesired.x * _alignDesired.x +
+			_alignDesired.y * _alignDesired.y +
+			_alignDesired.z * _alignDesired.z
+		);
+		if ( dm < 0.0001 ) return;
+		_alignDesired.x /= dm;
+		_alignDesired.y /= dm;
+		_alignDesired.z /= dm;
+
+	} else {
+
+		_alignDesired.x = best.normals[ 0 ].x;
+		_alignDesired.y = best.normals[ 0 ].y;
+		_alignDesired.z = best.normals[ 0 ].z;
+
+	}
+
+	const desired_x = _alignDesired.x;
+	const desired_y = _alignDesired.y;
+	const desired_z = _alignDesired.z;
 
 	// Check that desired up is not nearly parallel to forward
 	// (dot product of desired_up and forward should be < 0.5)
@@ -218,14 +315,17 @@ export function physics_reset() {
 	playerRotVel.x = 0;
 	playerRotVel.y = 0;
 	playerRotVel.z = 0;
+	playerForward.x = 0;
+	playerForward.y = 0;
+	playerForward.z = 1;
 	turnroll = 0;
 
 }
 
 // Apply an instantaneous force to an object, changing its velocity
 // Ported from: phys_apply_force() in PHYSICS.C lines 1163-1173
-// obj must have mtype.mass and aiLocal.vel_x/vel_y/vel_z (for robots)
-// or playerVelocity (for player)
+// obj may be a canonical object or a live robot wrapper with obj + aiLocal.
+// A null obj targets playerVelocity.
 export function phys_apply_force( obj, force_x, force_y, force_z ) {
 
 	// For player object — modify playerVelocity directly
@@ -245,9 +345,11 @@ export function phys_apply_force( obj, force_x, force_y, force_z ) {
 
 	}
 
-	// For objects with physics info (robots, etc.)
-	// Robot mass comes from mtype.mass (if available) or a default
-	const mass = ( obj.mtype != null && obj.mtype.mass > 0 ) ? obj.mtype.mass : 4.0;
+	// Live robot wrappers keep the canonical physics data under obj.obj while AI
+	// integrates velocity from the wrapper's aiLocal state.
+	const physicsObject = obj.obj !== undefined && obj.obj !== null ? obj.obj : obj;
+	const mass = ( physicsObject.mtype !== null && physicsObject.mtype !== undefined &&
+		physicsObject.mtype.mass > 0 ) ? physicsObject.mtype.mass : 4.0;
 	const invMass = 1.0 / mass;
 
 	// Robots store velocity in aiLocal, not mtype.phys_info
@@ -257,11 +359,11 @@ export function phys_apply_force( obj, force_x, force_y, force_z ) {
 		obj.aiLocal.vel_y += force_y * invMass;
 		obj.aiLocal.vel_z += force_z * invMass;
 
-	} else if ( obj.mtype !== null ) {
+	} else if ( physicsObject.mtype !== null && physicsObject.mtype !== undefined ) {
 
-		obj.mtype.velocity_x += force_x * invMass;
-		obj.mtype.velocity_y += force_y * invMass;
-		obj.mtype.velocity_z += force_z * invMass;
+		physicsObject.mtype.velocity_x += force_x * invMass;
+		physicsObject.mtype.velocity_y += force_y * invMass;
+		physicsObject.mtype.velocity_z += force_z * invMass;
 
 	}
 
@@ -274,17 +376,80 @@ export function phys_apply_force_to_player( force_x, force_y, force_z ) {
 
 }
 
-// Apply rotational force to player (makes camera spin on impacts)
-// Ported from: phys_apply_rot() in PHYSICS.C lines 1239-1267
-// Force direction causes rotation proportional to force magnitude / mass
+function wrap_rotation_delta( angle ) {
+
+	if ( angle > Math.PI ) return angle - Math.PI * 2.0;
+	if ( angle < - Math.PI ) return angle + Math.PI * 2.0;
+	return angle;
+
+}
+
+function set_rotvel_and_saturate( current, delta ) {
+
+	// PHYSICS.C does not add torque here.  It replaces the angular rate, with a
+	// small reversal damped to one quarter so an impact cannot instantly flip a
+	// ship already rotating in the opposite direction.
+	if ( current * delta < 0 && Math.abs( delta ) < Math.PI / 4.0 ) {
+
+		return delta / 4.0;
+
+	}
+	return delta;
+
+}
+
+// Apply rotational force to the player.
+// Ported from: physics_turn_towards_vector() + phys_apply_rot() in PHYSICS.C.
+// The force is a world-space direction and magnitude.  D1 converts it to a
+// desired pitch/heading rate; it does not add its XYZ components as Euler rates.
 export function phys_apply_rot( force_x, force_y, force_z ) {
 
 	if ( PLAYER_MASS <= 0 ) return;
+	if ( Number.isFinite( force_x ) !== true || Number.isFinite( force_y ) !== true ||
+		Number.isFinite( force_z ) !== true ) return;
 
-	const invMass = 1.0 / PLAYER_MASS;
-	playerRotVel.x += force_x * invMass;
-	playerRotVel.y += force_y * invMass;
-	playerRotVel.z += force_z * invMass;
+	const forceMagnitude = Math.sqrt(
+		force_x * force_x + force_y * force_y + force_z * force_z
+	);
+	if ( forceMagnitude <= 1e-12 ) return;
+
+	// Source vecmag is |force|/8.  Tiny forces use a four-second turn rate;
+	// stronger forces use mass/vecmag, clamped to half a second for non-robots.
+	const scaledMagnitude = forceMagnitude / 8.0;
+	let rate;
+	if ( scaledMagnitude < 1.0 / 256.0 ||
+		scaledMagnitude < PLAYER_MASS / 16384.0 ) {
+
+		rate = 4.0;
+
+	} else {
+
+		rate = PLAYER_MASS / scaledMagnitude;
+		if ( rate < 0.5 ) rate = 0.5;
+
+	}
+
+	const inverseForce = 1.0 / forceMagnitude;
+	const goal_x = force_x * inverseForce;
+	const goal_y = force_y * inverseForce;
+	const goal_z = force_z * inverseForce;
+	const goalPitch = Math.asin( Math.max( - 1.0, Math.min( 1.0, - goal_y ) ) );
+	const goalHeading = Math.atan2( goal_x, goal_z );
+	const currentPitch = Math.asin(
+		Math.max( - 1.0, Math.min( 1.0, - playerForward.y ) )
+	);
+	const currentHeading = Math.atan2( playerForward.x, playerForward.z );
+
+	let deltaPitch = wrap_rotation_delta( goalPitch - currentPitch ) / rate;
+	let deltaHeading = wrap_rotation_delta( goalHeading - currentHeading ) / rate;
+
+	// Source boosts small angular rates so modest glancing forces remain visible.
+	if ( Math.abs( deltaPitch ) < Math.PI / 8.0 ) deltaPitch *= 4.0;
+	if ( Math.abs( deltaHeading ) < Math.PI / 8.0 ) deltaHeading *= 4.0;
+
+	playerRotVel.x = set_rotvel_and_saturate( playerRotVel.x, deltaPitch );
+	playerRotVel.y = set_rotvel_and_saturate( playerRotVel.y, deltaHeading );
+	playerRotVel.z = 0;
 
 }
 
@@ -407,11 +572,29 @@ const _moveResult = { x: 0, y: 0, z: 0, segnum: 0 };
 
 // Pre-allocated segment list for trigger checking (Golden Rule #5)
 // Ported from: phys_seglist[] / n_phys_segs in PHYSICS.C line 429
-const MAX_PHYS_SEGS = 20;
+const MAX_PHYS_SEGS = MAX_FVI_SEGS;
 const _phys_seglist = new Int16Array( MAX_PHYS_SEGS );
 let _n_phys_segs = 0;
+const MAX_IGNORE_OBJS = 100;
+const _phys_ignore_obj_list = new Int16Array( MAX_IGNORE_OBJS );
+let _n_phys_ignore_objs = 0;
 
-export function do_physics_move( p0_x, p0_y, p0_z, frame_x, frame_y, frame_z, playerSegnum, dt ) {
+export function do_physics_move( p0_x, p0_y, p0_z, frame_x, frame_y, frame_z, playerSegnum, dt, playerObjnum = - 1 ) {
+
+	const checkObjects = playerObjnum >= 0 && playerObjnum < Objects.length &&
+		Objects[ playerObjnum ].type === OBJ_PLAYER;
+	const playerObject = checkObjects === true ? Objects[ playerObjnum ] : null;
+	const playerRadius = playerObject !== null && playerObject.size > 0 ? playerObject.size : PLAYER_RADIUS;
+
+	// OBJECT.C snapshots last_pos once at the beginning of an object's move.
+	// Collision callbacks may advance the canonical pose several times afterward.
+	if ( playerObject !== null ) {
+
+		playerObject.last_pos_x = p0_x;
+		playerObject.last_pos_y = p0_y;
+		playerObject.last_pos_z = p0_z;
+
+	}
 
 	if ( frame_x === 0 && frame_y === 0 && frame_z === 0 ) {
 
@@ -428,90 +611,193 @@ export function do_physics_move( p0_x, p0_y, p0_z, frame_x, frame_y, frame_z, pl
 	let p1_z = p0_z + frame_z;
 
 	let curSeg = playerSegnum;
-	const MAX_FVI_ITERS = 4;
+	let simTime = dt;
+	const MAX_FVI_ITERS = 8;
 
 	// Track segments traversed for trigger checking
 	// Ported from: phys_seglist[] / n_phys_segs in PHYSICS.C line 429
 	_n_phys_segs = 0;
-	_phys_seglist[ _n_phys_segs ++ ] = playerSegnum;
+	_n_phys_ignore_objs = 0;
 
 	for ( let iter = 0; iter < MAX_FVI_ITERS; iter ++ ) {
 
-		const hit = find_vector_intersection(
-			p0_x, p0_y, p0_z,
-			p1_x, p1_y, p1_z,
-			curSeg, PLAYER_RADIUS,
-			- 1, 0
+		const attemptStart_x = p0_x;
+		const attemptStart_y = p0_y;
+		const attemptStart_z = p0_z;
+		const attemptSeg = curSeg;
+		const frameVec_x = p1_x - p0_x;
+		const frameVec_y = p1_y - p0_y;
+		const frameVec_z = p1_z - p0_z;
+		const attemptedDist = Math.sqrt(
+			frameVec_x * frameVec_x + frameVec_y * frameVec_y + frameVec_z * frameVec_z
 		);
 
-		if ( hit.hit_type === HIT_NONE ) {
+		if ( ! ( attemptedDist > 0 ) ) break;
+
+		let hit;
+		fvi_set_ignore_obj_list( _phys_ignore_obj_list, _n_phys_ignore_objs );
+		try {
+
+			hit = find_vector_intersection(
+				p0_x, p0_y, p0_z,
+				p1_x, p1_y, p1_z,
+				curSeg, playerRadius,
+				playerObjnum, ( checkObjects === true ? FQ_CHECK_OBJS : 0 ) | FQ_GET_SEGLIST
+			);
+
+		} finally {
+
+			// The original query carries its own ignore list. Never leak the outer
+			// movement query's list into callbacks or another FVI invocation.
+			fvi_set_ignore_obj_list( null, 0 );
+
+		}
+
+		// Preserve this query's complete portal path before any collision callback
+		// can issue a nested FVI call and overwrite the shared result object.
+		if ( hit.n_segs > 0 ) {
+
+			if ( _n_phys_segs > 0 && _phys_seglist[ _n_phys_segs - 1 ] === hit.seglist[ 0 ] ) {
+
+				_n_phys_segs --;
+
+			}
+
+			for ( let i = 0; i < hit.n_segs && _n_phys_segs < MAX_PHYS_SEGS - 1; i ++ ) {
+
+				_phys_seglist[ _n_phys_segs ++ ] = hit.seglist[ i ];
+
+			}
+
+		}
+
+		const hitType = hit.hit_type;
+		const hitPnt_x = hit.hit_pnt_x;
+		const hitPnt_y = hit.hit_pnt_y;
+		const hitPnt_z = hit.hit_pnt_z;
+		const hitSeg = hit.hit_seg;
+		const hitSide = hit.hit_side;
+		const hitSideSeg = hit.hit_side_seg;
+		const hitObject = hit.hit_object;
+		const hitNorm_x = hit.hit_wallnorm_x;
+		const hitNorm_y = hit.hit_wallnorm_y;
+		const hitNorm_z = hit.hit_wallnorm_z;
+
+		if ( hitType === HIT_NONE ) {
 
 			// Moved unobstructed
-			p0_x = hit.hit_pnt_x;
-			p0_y = hit.hit_pnt_y;
-			p0_z = hit.hit_pnt_z;
+			p0_x = hitPnt_x;
+			p0_y = hitPnt_y;
+			p0_z = hitPnt_z;
 
-			if ( hit.hit_seg !== - 1 ) {
+			if ( hitSeg !== - 1 ) {
 
-				// Record segment transition for trigger checking
-				if ( hit.hit_seg !== curSeg && _n_phys_segs < MAX_PHYS_SEGS ) {
+				curSeg = hitSeg;
 
-					_phys_seglist[ _n_phys_segs ++ ] = hit.hit_seg;
+			}
 
-				}
+			// Keep the canonical player at the accepted endpoint.
+			if ( playerObject !== null ) {
 
-				curSeg = hit.hit_seg;
+				playerObject.pos_x = p0_x;
+				playerObject.pos_y = p0_y;
+				playerObject.pos_z = p0_z;
+				if ( curSeg !== playerObject.segnum ) obj_relink( playerObjnum, curSeg );
 
 			}
 
 			break;
 
-		} else if ( hit.hit_type === HIT_WALL ) {
+		} else if ( hitType === HIT_WALL ) {
 
 			// Move to hit point
-			p0_x = hit.hit_pnt_x;
-			p0_y = hit.hit_pnt_y;
-			p0_z = hit.hit_pnt_z;
+			p0_x = hitPnt_x;
+			p0_y = hitPnt_y;
+			p0_z = hitPnt_z;
 
-			if ( hit.hit_seg !== - 1 ) {
+			// Consume only the fraction of this attempt that was actually travelled.
+			// Ported from: PHYSICS.C attempted_dist/actual_dist sim_time update.
+			const moved_x = p0_x - attemptStart_x;
+			const moved_y = p0_y - attemptStart_y;
+			const moved_z = p0_z - attemptStart_z;
+			const actualDist = Math.sqrt( moved_x * moved_x + moved_y * moved_y + moved_z * moved_z );
+			const movedDot = moved_x * frameVec_x + moved_y * frameVec_y + moved_z * frameVec_z;
+			let movedBackwards = false;
+			let movedTime = 0;
 
-				// Record segment transition for trigger checking
-				if ( hit.hit_seg !== curSeg && _n_phys_segs < MAX_PHYS_SEGS ) {
+			if ( actualDist > 0 && movedDot < 0 ) {
 
-					_phys_seglist[ _n_phys_segs ++ ] = hit.hit_seg;
+				// FVI occasionally reports a wall point behind the attempt start. The
+				// original restores the position/segment and retries the full time.
+				p0_x = attemptStart_x;
+				p0_y = attemptStart_y;
+				p0_z = attemptStart_z;
+				curSeg = attemptSeg;
+				movedBackwards = true;
+
+			} else {
+
+				const oldSimTime = simTime;
+				const newSimTime = oldSimTime * ( attemptedDist - actualDist ) / attemptedDist;
+
+				if ( Number.isFinite( newSimTime ) && newSimTime >= 0 && newSimTime <= oldSimTime ) {
+
+					simTime = newSimTime;
+					movedTime = oldSimTime - newSimTime;
+
+				} else {
+
+					// Preserve the old time budget for a bogus FVI distance, matching
+					// PHYSICS.C's guard against negative or increasing sim_time.
+					simTime = oldSimTime;
 
 				}
 
-				curSeg = hit.hit_seg;
+			}
+
+			if ( movedBackwards !== true && hitSeg !== - 1 ) {
+
+				curSeg = hitSeg;
 
 			}
 
-			// Process wall hit (triggers, doors)
-			if ( hit.hit_side_seg !== - 1 && hit.hit_side !== - 1 ) {
+			// The original advances and relinks the object before wall callbacks.
+			if ( playerObject !== null ) {
 
-				fvi_wall_hit_process( hit.hit_side_seg, hit.hit_side );
-				fvi_check_trigger( hit.hit_side_seg, hit.hit_side );
+				playerObject.pos_x = p0_x;
+				playerObject.pos_y = p0_y;
+				playerObject.pos_z = p0_z;
+				if ( curSeg !== playerObject.segnum ) obj_relink( playerObjnum, curSeg );
+
+			}
+
+			// Process contact with a wall/door. Triggers are dispatched only for
+			// portals actually crossed, after all FVI attempts are concatenated.
+			if ( hitSideSeg !== - 1 && hitSide !== - 1 ) {
+
+				fvi_wall_hit_process( hitSideSeg, hitSide );
 
 			}
 
 			// Wall sliding: remove velocity component along wall normal
-			const nx = hit.hit_wallnorm_x;
-			const ny = hit.hit_wallnorm_y;
-			const nz = hit.hit_wallnorm_z;
+			const nx = hitNorm_x;
+			const ny = hitNorm_y;
+			const nz = hitNorm_z;
 			const wall_part = playerVelocity.x * nx + playerVelocity.y * ny + playerVelocity.z * nz;
+			const moved_wall_part = moved_x * nx + moved_y * ny + moved_z * nz;
 
 			// Player wall-hit damage
 			// Ported from: collide_player_and_wall() in COLLIDE.C lines 654-693
-			if ( _onPlayerWallHit !== null && wall_part < 0 ) {
+			if ( _onPlayerWallHit !== null && movedTime > 0 && moved_wall_part < 0 ) {
 
-				const hitspeed = - wall_part;	// magnitude of velocity into wall
+				const hitspeed = - moved_wall_part / movedTime;
 				const damage = hitspeed / DAMAGE_SCALE;
 
 				if ( damage >= DAMAGE_THRESHOLD ) {
 
 					const volume = Math.min( ( hitspeed - DAMAGE_SCALE * DAMAGE_THRESHOLD ) / WALL_LOUDNESS_SCALE, 1.0 );
-					_onPlayerWallHit( damage, volume, hit.hit_pnt_x, hit.hit_pnt_y, hit.hit_pnt_z,
-						hit.hit_side_seg, hit.hit_side );
+					_onPlayerWallHit( damage, volume, hitPnt_x, hitPnt_y, hitPnt_z,
+						hitSideSeg, hitSide );
 
 				}
 
@@ -530,21 +816,120 @@ export function do_physics_move( p0_x, p0_y, p0_z, frame_x, frame_y, frame_z, pl
 
 			}
 
-			// Compute remaining movement with slid velocity
-			const remaining_dt = dt * ( 1.0 - ( iter + 1 ) / MAX_FVI_ITERS );
+			// Retry from the accepted hit point with the slid velocity and the
+			// exact time left in this frame.
+			if ( simTime > 0 ) {
 
-			if ( remaining_dt > 0.0001 ) {
-
-				p1_x = p0_x + playerVelocity.x * remaining_dt;
-				p1_y = p0_y + playerVelocity.y * remaining_dt;
-				p1_z = p0_z + playerVelocity.z * remaining_dt;
+				p1_x = p0_x + playerVelocity.x * simTime;
+				p1_y = p0_y + playerVelocity.y * simTime;
+				p1_z = p0_z + playerVelocity.z * simTime;
 				continue; // Try again with remaining movement
 
 			}
 
 			break;
 
-		} else if ( hit.hit_type === HIT_BAD_P0 ) {
+		} else if ( hitType === HIT_OBJECT ) {
+
+			// Move to the player-center position at first object contact.
+			p0_x = hitPnt_x;
+			p0_y = hitPnt_y;
+			p0_z = hitPnt_z;
+
+			// Consume the portion of this attempt used to reach the object, exactly as
+			// for a wall hit. Object contacts at the attempt start consume no time.
+			const moved_x = p0_x - attemptStart_x;
+			const moved_y = p0_y - attemptStart_y;
+			const moved_z = p0_z - attemptStart_z;
+			const actualDist = Math.sqrt( moved_x * moved_x + moved_y * moved_y + moved_z * moved_z );
+			const oldSimTime = simTime;
+			const newSimTime = oldSimTime * ( attemptedDist - actualDist ) / attemptedDist;
+
+			if ( Number.isFinite( newSimTime ) && newSimTime >= 0 && newSimTime <= oldSimTime ) {
+
+				simTime = newSimTime;
+
+			}
+
+			if ( hitSeg !== - 1 ) {
+
+				curSeg = hitSeg;
+
+			}
+
+			// Make the accepted contact pose visible to collision callbacks and any
+			// nested FVI they issue, just as the canonical C object is at this point.
+			if ( playerObject !== null ) {
+
+				playerObject.pos_x = p0_x;
+				playerObject.pos_y = p0_y;
+				playerObject.pos_z = p0_z;
+				if ( curSeg !== playerObject.segnum ) obj_relink( playerObjnum, curSeg );
+
+			}
+
+			const oldVel_x = playerVelocity.x;
+			const oldVel_y = playerVelocity.y;
+			const oldVel_z = playerVelocity.z;
+
+			let collisionAllowsRetry = true;
+			if ( _onPlayerObjectHit !== null && hitObject !== - 1 ) {
+
+				// collide_two_objects receives the surface point between the two sphere
+				// centers, weighted by their radii—not the moving sphere's center.
+				const target = Objects[ hitObject ];
+				let collision_x = hitPnt_x;
+				let collision_y = hitPnt_y;
+				let collision_z = hitPnt_z;
+
+				if ( target !== undefined && target !== null ) {
+
+					const radiusSum = target.size + playerRadius;
+					if ( radiusSum > 0 ) {
+
+						const scale = target.size / radiusSum;
+						collision_x = target.pos_x + ( hitPnt_x - target.pos_x ) * scale;
+						collision_y = target.pos_y + ( hitPnt_y - target.pos_y ) * scale;
+						collision_z = target.pos_z + ( hitPnt_z - target.pos_z ) * scale;
+
+					}
+
+				}
+
+				collisionAllowsRetry = _onPlayerObjectHit(
+					hitObject, collision_x, collision_y, collision_z,
+					p0_x, p0_y, p0_z, curSeg
+				) !== false;
+
+			}
+
+			// Pickups/hostages and ignored contacts leave velocity unchanged. Mark the
+			// object for this move and continue through the remaining simulation time.
+			const persistent = playerObject !== null && playerObject.mtype !== null &&
+				( playerObject.mtype.flags & PF_PERSISTENT ) !== 0;
+			const moverDead = playerObject !== null && ( playerObject.flags & OF_SHOULD_BE_DEAD ) !== 0;
+			const velocityUnchanged = oldVel_x === playerVelocity.x && oldVel_y === playerVelocity.y &&
+				oldVel_z === playerVelocity.z;
+			if ( collisionAllowsRetry === true && moverDead !== true &&
+				( persistent === true || velocityUnchanged === true ) &&
+				hitObject >= 0 && _n_phys_ignore_objs < MAX_IGNORE_OBJS ) {
+
+				_phys_ignore_obj_list[ _n_phys_ignore_objs ++ ] = hitObject;
+				if ( simTime > 0 ) {
+
+					p1_x = p0_x + playerVelocity.x * simTime;
+					p1_y = p0_y + playerVelocity.y * simTime;
+					p1_z = p0_z + playerVelocity.z * simTime;
+					continue;
+
+				}
+
+			}
+
+			// A physical bump changed velocity, so finish this move at contact.
+			break;
+
+		} else if ( hitType === HIT_BAD_P0 ) {
 
 			// Start point not in segment — try to recover
 			const newSeg = find_point_seg( p0_x, p0_y, p0_z, curSeg );
@@ -565,6 +950,8 @@ export function do_physics_move( p0_x, p0_y, p0_z, frame_x, frame_y, frame_z, pl
 		}
 
 	}
+
+	fvi_set_ignore_obj_list( null, 0 );
 
 	// Check triggers on segment transitions
 	// Ported from: OBJECT.C lines 2007-2023 — check_trigger for each segment traversed

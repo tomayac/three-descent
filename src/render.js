@@ -5,16 +5,19 @@ import * as THREE from 'three';
 
 import {
 	SIDE_IS_QUAD, SIDE_IS_TRI_02, SIDE_IS_TRI_13,
-	MAX_SIDES_PER_SEGMENT, IS_CHILD
+	MAX_SIDES_PER_SEGMENT
 } from './segment.js';
 import {
 	Vertices, Segments, Num_segments, Textures,
 	NumTextures, Side_to_verts
 } from './mglobal.js';
-import { BM_FLAG_TRANSPARENT, BM_FLAG_SUPER_TRANSPARENT, BM_FLAG_RLE } from './piggy.js';
+import {
+	BM_FLAG_TRANSPARENT, BM_FLAG_SUPER_TRANSPARENT,
+	BM_FLAG_NO_LIGHTING, BM_FLAG_RLE
+} from './piggy.js';
 import { decode_tmap_num2, texmerge_get_cached_bitmap } from './texmerge.js';
 import { Effects, Num_effects } from './bm.js';
-import { wall_is_doorway, WID_RENDPAST_FLAG } from './wall.js';
+import { wall_is_doorway, WID_RENDER_FLAG, WID_RENDPAST_FLAG } from './wall.js';
 import { config_get_texture_filtering, config_on_texture_filtering_changed } from './config.js';
 
 // Convert Descent coordinate system to Three.js
@@ -217,8 +220,15 @@ const _visibleSegments = new Set();
 const _bfsQueue = new Array( MAX_RENDER_SEGS );
 let _bfsQueueLength = 0;
 
-// Map: segnum → array of { batchedMesh, instanceId } for per-side visibility control
+// Map: segnum → array of { batchedMesh, instanceId, sideKey } for per-side visibility control
 const segmentBatchedInstances = new Map();
+
+// Map: side key (segnum * 6 + sidenum) → { batchedMesh, instanceId }
+// Used to hide specific batched sides when an overlay replacement mesh is active.
+const sideBatchedInstances = new Map();
+
+// Side keys for batched sides that should stay hidden (replaced by overlay mesh).
+const hiddenBatchedSideKeys = new Set();
 
 // All BatchedMesh objects (for bulk visibility reset + disposal)
 const allBatchedMeshes = [];
@@ -237,6 +247,11 @@ const destroyedSideMeshes = new Map();
 
 // Per-segment side lighting records for dynamic per-vertex lighting
 const segmentLightingData = new Map();
+
+// Build-time index from base/overlay tmap numbers to lighting records.  Eclip
+// callbacks can then refresh only affected sides when the resolved bitmap (and
+// therefore its flags) changes.
+const tmapLightingRecords = new Map();
 
 // Corner-to-buffer-vertex mappings per triangle winding order
 const _cornerMapQuad = [ 0, 2, 1, 0, 3, 2 ];
@@ -267,6 +282,94 @@ const eclipOverlayTextures = new Map();
 // Stored references for texture rebuilding during door animation
 let _pigFile = null;
 let _palette = null;
+
+function getBitmapFlags( bitmapIndex, pigFile ) {
+
+	if ( bitmapIndex < 0 || bitmapIndex >= pigFile.bitmaps.length ) return 0;
+
+	// bitmapFlags[] survives paging; GameBitmap.flags is replaced from it by
+	// pageIn().  Synthetic render fixtures may only provide bitmaps[].flags.
+	if ( pigFile.bitmapFlags !== undefined && pigFile.bitmapFlags[ bitmapIndex ] !== undefined ) {
+
+		return pigFile.bitmapFlags[ bitmapIndex ];
+
+	}
+
+	const bm = pigFile.bitmaps[ bitmapIndex ];
+	return bm !== undefined ? bm.flags : 0;
+
+}
+
+// Return the no-lighting state of the bitmap that D1's software renderer would
+// hand to NTMAP.  A normal merged texture inherits the bottom bitmap's flags;
+// a super-transparent merge replaces them with BM_FLAG_TRANSPARENT only.
+function sideUsesNoLighting( side, pigFile ) {
+
+	let baseBmIndex = 0;
+	if ( side.tmap_num >= 0 && side.tmap_num < NumTextures ) {
+
+		baseBmIndex = Textures[ side.tmap_num ];
+
+	}
+
+	if ( ( getBitmapFlags( baseBmIndex, pigFile ) & BM_FLAG_NO_LIGHTING ) === 0 ) return false;
+
+	if ( side.tmap_num2 !== 0 ) {
+
+		let overlayBmIndex = 0;
+		const overlayTmap = side.tmap_num2 & 0x3FFF;
+		if ( overlayTmap >= 0 && overlayTmap < NumTextures ) {
+
+			overlayBmIndex = Textures[ overlayTmap ];
+
+		}
+
+		if ( overlayBmIndex > 0 &&
+			( getBitmapFlags( overlayBmIndex, pigFile ) & BM_FLAG_SUPER_TRANSPARENT ) !== 0 ) {
+
+			return false;
+
+		}
+
+	}
+
+	return true;
+
+}
+
+function registerTmapLightingRecord( tmapNum, record ) {
+
+	if ( tmapNum < 0 || tmapNum >= NumTextures ) return;
+
+	if ( tmapLightingRecords.has( tmapNum ) === false ) {
+
+		tmapLightingRecords.set( tmapNum, [] );
+
+	}
+
+	const records = tmapLightingRecords.get( tmapNum );
+	if ( records.includes( record ) === false ) records.push( record );
+
+}
+
+function registerSideTmapLightingRecords( side, record ) {
+
+	registerTmapLightingRecord( side.tmap_num, record );
+
+	if ( side.tmap_num2 !== 0 ) {
+
+		registerTmapLightingRecord( side.tmap_num2 & 0x3FFF, record );
+
+	}
+
+}
+
+function sideUsesTmap( side, tmapNum ) {
+
+	if ( side.tmap_num === tmapNum ) return true;
+	return side.tmap_num2 !== 0 && ( side.tmap_num2 & 0x3FFF ) === tmapNum;
+
+}
 
 // Get texture and transparency for a side based on its current tmap_num/tmap_num2
 function getSideTexture( side, pigFile, palette ) {
@@ -330,7 +433,7 @@ function getSideTexture( side, pigFile, palette ) {
 
 	}
 
-	return { texture, isTransparent };
+	return { texture, isTransparent, noLighting: sideUsesNoLighting( side, pigFile ) };
 
 }
 
@@ -365,7 +468,7 @@ function buildSideMesh( segnum, sidenum, pigFile, palette ) {
 	for ( let i = 0; i < 4; i ++ ) {
 
 		sideUvs.push( { u: side.uvls[ i ].u, v: side.uvls[ i ].v } );
-		lights.push( Math.min( side.uvls[ i ].l, 1.0 ) );
+		lights.push( result.noLighting === true ? 1.0 : Math.min( side.uvls[ i ].l, 1.0 ) );
 
 	}
 
@@ -425,6 +528,111 @@ function buildSideMesh( segnum, sidenum, pigFile, palette ) {
 
 }
 
+function addSideLightingRecord( segnum, sidenum, mesh, vertexStart, pigFile ) {
+
+	const seg = Segments[ segnum ];
+	const side = seg.sides[ sidenum ];
+	const sv = Side_to_verts[ sidenum ];
+	const cornerMap = getCornerMap( side.type );
+	const vertGlobalIdx = new Array( 6 );
+	const vertStaticLight = new Array( 6 );
+	const noLighting = sideUsesNoLighting( side, pigFile );
+
+	for ( let ci = 0; ci < 6; ci ++ ) {
+
+		const corner = cornerMap[ ci ];
+		vertGlobalIdx[ ci ] = seg.verts[ sv[ corner ] ];
+		vertStaticLight[ ci ] = noLighting === true ? 1.0 : Math.min( side.uvls[ corner ].l, 1.0 );
+
+	}
+
+	if ( segmentLightingData.has( segnum ) === false ) {
+
+		segmentLightingData.set( segnum, [] );
+
+	}
+
+	const record = {
+		segnum: segnum,
+		sidenum: sidenum,
+		mesh: mesh,
+		vertexStart: vertexStart,
+		vertGlobalIdx: vertGlobalIdx,
+		vertStaticLight: vertStaticLight,
+		noLighting: noLighting
+	};
+
+	segmentLightingData.get( segnum ).push( record );
+	registerSideTmapLightingRecords( side, record );
+
+}
+
+// Texture replacement is infrequent, but can change the effective bitmap
+// flags.  Keep both the current color buffer and its dynamic-light baseline in
+// sync without allocating in the frame lighting loop.
+function refreshLightingRecord( record, noLighting ) {
+
+	if ( record.noLighting === noLighting ) return;
+	record.noLighting = noLighting;
+
+	const seg = Segments[ record.segnum ];
+	const side = seg.sides[ record.sidenum ];
+	const cornerMap = getCornerMap( side.type );
+	const colorAttr = record.mesh.geometry.attributes.color;
+	if ( colorAttr === undefined ) return;
+
+	for ( let ci = 0; ci < 6; ci ++ ) {
+
+		const corner = cornerMap[ ci ];
+		const light = noLighting === true ? 1.0 : Math.min( side.uvls[ corner ].l, 1.0 );
+		record.vertStaticLight[ ci ] = light;
+
+		const colorIndex = ( record.vertexStart + ci ) * 3;
+		colorAttr.array[ colorIndex + 0 ] = light;
+		colorAttr.array[ colorIndex + 1 ] = light;
+		colorAttr.array[ colorIndex + 2 ] = light;
+
+	}
+
+	colorAttr.needsUpdate = true;
+
+}
+
+function refreshSideLightingRecord( segnum, sidenum, mesh, noLighting ) {
+
+	const records = segmentLightingData.get( segnum );
+	if ( records === undefined ) return;
+
+	for ( let r = 0; r < records.length; r ++ ) {
+
+		const rec = records[ r ];
+		if ( rec.mesh !== mesh || rec.sidenum !== sidenum ) continue;
+
+		refreshLightingRecord( rec, noLighting );
+		registerSideTmapLightingRecords( Segments[ segnum ].sides[ sidenum ], rec );
+		return;
+
+	}
+
+}
+
+function refreshTmapLightingRecords( tmapNum ) {
+
+	const records = tmapLightingRecords.get( tmapNum );
+	if ( records === undefined ) return;
+
+	for ( let i = 0; i < records.length; i ++ ) {
+
+		const rec = records[ i ];
+		const side = Segments[ rec.segnum ].sides[ rec.sidenum ];
+		if ( sideUsesTmap( side, tmapNum ) === false ) continue;
+
+		refreshLightingRecord( rec, sideUsesNoLighting( side, _pigFile ) );
+
+	}
+
+}
+
 // Build all the mine geometry as a single Three.js Group
 // Uses BatchedMesh per texture for per-side visibility control (portal culling)
 export function buildMineGeometry( pigFile, palette ) {
@@ -444,7 +652,10 @@ export function buildMineGeometry( pigFile, palette ) {
 	eclipTextures.clear();
 	eclipOverlayTextures.clear();
 	segmentBatchedInstances.clear();
+	sideBatchedInstances.clear();
+	hiddenBatchedSideKeys.clear();
 	segmentLightingData.clear();
+	tmapLightingRecords.clear();
 
 	// Dispose previous BatchedMesh objects
 	for ( let i = 0; i < allBatchedMeshes.length; i ++ ) {
@@ -488,51 +699,32 @@ export function buildMineGeometry( pigFile, palette ) {
 		for ( let sidenum = 0; sidenum < MAX_SIDES_PER_SEGMENT; sidenum ++ ) {
 
 			const side = seg.sides[ sidenum ];
+			const shouldRender = ( wall_is_doorway( segnum, sidenum ) & WID_RENDER_FLAG ) !== 0;
 
-			// Only render sides that are walls (no child) or have a wall/door
-			if ( IS_CHILD( seg.children[ sidenum ] ) && side.wall_num === - 1 ) continue;
-
-			// Door/wall sides get individual meshes for dynamic texture updates
+			// Door/wall sides get individual meshes for dynamic texture and visibility
+			// updates.  Keep non-rendering walls allocated so an illusion that starts
+			// disabled can be made visible later without rebuilding the mine geometry.
 			if ( side.wall_num !== - 1 ) {
 
 				const mesh = buildSideMesh( segnum, sidenum, pigFile, palette );
 				if ( mesh !== null ) {
 
 					const key = segnum * 6 + sidenum;
+					mesh.visible = shouldRender;
 					doorMeshes.set( key, mesh );
 					group.add( mesh );
 
-					const doorSv = Side_to_verts[ sidenum ];
-					const doorCornerMap = getCornerMap( side.type );
-					const doorVertGlobalIdx = new Array( 6 );
-					const doorVertStaticLight = new Array( 6 );
-
-					for ( let ci = 0; ci < 6; ci ++ ) {
-
-						const corner = doorCornerMap[ ci ];
-						doorVertGlobalIdx[ ci ] = seg.verts[ doorSv[ corner ] ];
-						doorVertStaticLight[ ci ] = Math.min( side.uvls[ corner ].l, 1.0 );
-
-					}
-
-					if ( segmentLightingData.has( segnum ) === false ) {
-
-						segmentLightingData.set( segnum, [] );
-
-					}
-
-					segmentLightingData.get( segnum ).push( {
-						mesh: mesh,
-						vertexStart: 0,
-						vertGlobalIdx: doorVertGlobalIdx,
-						vertStaticLight: doorVertStaticLight
-					} );
+					addSideLightingRecord( segnum, sidenum, mesh, 0, pigFile );
 
 				}
 
 				continue;
 
 			}
+
+			// Open portals and external boundaries have no dynamic wall state and no
+			// render bit, so they need no batched geometry.
+			if ( shouldRender !== true ) continue;
 
 			// Regular sides collected per texture for BatchedMesh
 			const result = getSideTexture( side, pigFile, palette );
@@ -569,7 +761,7 @@ export function buildMineGeometry( pigFile, palette ) {
 			for ( let i = 0; i < 4; i ++ ) {
 
 				sideUvs.push( { u: side.uvls[ i ].u, v: side.uvls[ i ].v } );
-				lights.push( Math.min( side.uvls[ i ].l, 1.0 ) );
+				lights.push( result.noLighting === true ? 1.0 : Math.min( side.uvls[ i ].l, 1.0 ) );
 
 			}
 
@@ -634,14 +826,16 @@ export function buildMineGeometry( pigFile, palette ) {
 
 			}
 
-			textureSides.get( texKey ).sides.push( {
-				segnum: segnum,
-				positions: positions,
-				uvs: uvArr,
-				colors: colors,
-				vertGlobalIdx: vertGlobalIdx,
-				vertStaticLight: vertStaticLight
-			} );
+				textureSides.get( texKey ).sides.push( {
+					segnum: segnum,
+					sidenum: sidenum,
+					positions: positions,
+					uvs: uvArr,
+					colors: colors,
+					vertGlobalIdx: vertGlobalIdx,
+					vertStaticLight: vertStaticLight,
+					noLighting: result.noLighting
+				} );
 
 		}
 
@@ -690,10 +884,16 @@ export function buildMineGeometry( pigFile, palette ) {
 
 			}
 
-			segmentBatchedInstances.get( segnum ).push( {
-				batchedMesh: batchedMesh,
-				instanceId: instId
-			} );
+				segmentBatchedInstances.get( segnum ).push( {
+					batchedMesh: batchedMesh,
+					instanceId: instId,
+					sideKey: segnum * 6 + sideData.sidenum
+				} );
+
+				sideBatchedInstances.set( segnum * 6 + sideData.sidenum, {
+					batchedMesh: batchedMesh,
+					instanceId: instId
+				} );
 
 			if ( segmentLightingData.has( segnum ) === false ) {
 
@@ -701,12 +901,18 @@ export function buildMineGeometry( pigFile, palette ) {
 
 			}
 
-			segmentLightingData.get( segnum ).push( {
+			const record = {
+				segnum: segnum,
+				sidenum: sideData.sidenum,
 				mesh: batchedMesh,
 				vertexStart: batchVertexOffset,
 				vertGlobalIdx: sideData.vertGlobalIdx,
-				vertStaticLight: sideData.vertStaticLight
-			} );
+				vertStaticLight: sideData.vertStaticLight,
+				noLighting: sideData.noLighting
+			};
+
+			segmentLightingData.get( segnum ).push( record );
+			registerSideTmapLightingRecords( Segments[ segnum ].sides[ sideData.sidenum ], record );
 
 			batchVertexOffset += 6;
 			totalBatchedSides ++;
@@ -886,12 +1092,19 @@ export function updateMineVisibility( playerSegnum, camera ) {
 		const instances = segmentBatchedInstances.get( segnum );
 		if ( instances !== undefined ) {
 
-			for ( let i = 0; i < instances.length; i ++ ) {
+				for ( let i = 0; i < instances.length; i ++ ) {
 
-				const entry = instances[ i ];
-				entry.batchedMesh.setVisibleAt( entry.instanceId, true );
+					const entry = instances[ i ];
+					if ( hiddenBatchedSideKeys.has( entry.sideKey ) ) {
 
-			}
+						entry.batchedMesh.setVisibleAt( entry.instanceId, false );
+						continue;
+
+					}
+
+					entry.batchedMesh.setVisibleAt( entry.instanceId, true );
+
+				}
 
 		}
 
@@ -901,7 +1114,9 @@ export function updateMineVisibility( playerSegnum, camera ) {
 	for ( const [ key, mesh ] of doorMeshes ) {
 
 		const segnum = ( key / 6 ) | 0;
-		mesh.visible = _visibleSegments.has( segnum );
+		const sidenum = key % 6;
+		mesh.visible = _visibleSegments.has( segnum ) &&
+			( wall_is_doorway( segnum, sidenum ) & WID_RENDER_FLAG ) !== 0;
 
 	}
 
@@ -935,6 +1150,7 @@ export function updateDoorMesh( segnum, sidenum ) {
 	mesh.material.map = result.texture;
 	mesh.material.alphaTest = result.isTransparent ? 0.5 : 0;
 	mesh.material.needsUpdate = true;
+	refreshSideLightingRecord( segnum, sidenum, mesh, result.noLighting );
 
 }
 
@@ -945,7 +1161,23 @@ export function setWallMeshVisible( segnum, sidenum, visible ) {
 	const mesh = doorMeshes.get( key );
 	if ( mesh !== undefined ) {
 
-		mesh.visible = visible;
+		// Illusion callbacks run before the authoritative per-frame visibility
+		// pass.  Preserve segment culling in the meantime, especially when an
+		// illusion is turned on in a currently hidden segment.
+		mesh.visible = visible && _visibleSegments.has( segnum );
+
+	}
+
+}
+
+function hideBatchedSideInstance( sideKey ) {
+
+	hiddenBatchedSideKeys.add( sideKey );
+
+	const entry = sideBatchedInstances.get( sideKey );
+	if ( entry !== undefined ) {
+
+		entry.batchedMesh.setVisibleAt( entry.instanceId, false );
 
 	}
 
@@ -969,6 +1201,9 @@ export function rebuildSideOverlay( segnum, sidenum ) {
 
 	}
 
+	// Hide the original batched side to avoid coplanar z-fighting with overlay mesh.
+	hideBatchedSideInstance( key );
+
 	// If we already created an overlay mesh for this side, update its texture
 	const existing = destroyedSideMeshes.get( key );
 	if ( existing !== undefined ) {
@@ -981,6 +1216,7 @@ export function rebuildSideOverlay( segnum, sidenum ) {
 			existing.material.map = result.texture;
 			existing.material.alphaTest = result.isTransparent ? 0.5 : 0;
 			existing.material.needsUpdate = true;
+			refreshSideLightingRecord( segnum, sidenum, existing, result.noLighting );
 
 		}
 
@@ -994,6 +1230,7 @@ export function rebuildSideOverlay( segnum, sidenum ) {
 
 	destroyedSideMeshes.set( key, mesh );
 	_mineGroup.add( mesh );
+	addSideLightingRecord( segnum, sidenum, mesh, 0, _pigFile );
 
 }
 
@@ -1014,6 +1251,10 @@ export function registerEclipTexture( tmapNum, dataTexture ) {
 export function updateEclipTexture( tmapNum, newBitmapIndex ) {
 
 	if ( _pigFile === null || _palette === null ) return;
+
+	// Textures[tmapNum] has already been changed by effects.js.  Refresh the
+	// exact affected side records before dynamic lighting next consumes them.
+	refreshTmapLightingRecords( tmapNum );
 
 	// Update base texture (eclip used as tmap_num)
 	const dataTexture = eclipTextures.get( tmapNum );
@@ -1281,6 +1522,7 @@ export function clearRenderCaches() {
 	allBatchedMeshes.length = 0;
 	segmentBatchedInstances.clear();
 	segmentLightingData.clear();
+	tmapLightingRecords.clear();
 	_visibleSegments.clear();
 
 	// Clear destroyed side overlay meshes

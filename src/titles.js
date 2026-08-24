@@ -1,12 +1,19 @@
 // Ported from: descent-master/MAIN/TITLES.C
 // Logo sequence, briefing screens with typewriter text
 
+import * as THREE from 'three';
 import { pcx_read, pcx_to_canvas } from './pcx.js';
-import { songs_play_song, SONG_BRIEFING } from './songs.js';
+import { songs_play_song, SONG_BRIEFING, SONG_ENDGAME } from './songs.js';
+import { GAME_FONT } from './gamefont.js';
+import { gr_get_string_size, gr_string } from './font.js';
+import { Robot_info, N_robot_types } from './bm.js';
+import { Polygon_models, buildModelMesh, buildAnimatedModelMesh,
+	polyobj_clone_model_mesh, polyobj_set_morphing } from './polyobj.js';
 
 // Briefing screen table — mirrors Briefing_screens[] in TITLES.C lines 309-370
 // { bs_name, level_num, message_num, text_ulx, text_uly, text_width, text_height }
 const SHAREWARE_ENDING_LEVEL_NUM = 0x7F;
+const REGISTERED_ENDING_LEVEL_NUM = 0x7E;
 
 const Briefing_screens = [
 	{ bs_name: 'brief01.pcx', level_num: 0, message_num: 1, text_ulx: 13, text_uly: 140, text_width: 290, text_height: 59 },
@@ -26,6 +33,9 @@ const Briefing_screens = [
 	{ bs_name: 'merc01.pcx', level_num: 7, message_num: 12, text_ulx: 10, text_uly: 15, text_width: 300, text_height: 200 },
 
 	{ bs_name: 'end01.pcx', level_num: SHAREWARE_ENDING_LEVEL_NUM, message_num: 1, text_ulx: 23, text_uly: 40, text_width: 320, text_height: 200 },
+	{ bs_name: 'end02.pcx', level_num: REGISTERED_ENDING_LEVEL_NUM, message_num: 1, text_ulx: 5, text_uly: 5, text_width: 300, text_height: 200 },
+	{ bs_name: 'end01.pcx', level_num: REGISTERED_ENDING_LEVEL_NUM, message_num: 2, text_ulx: 23, text_uly: 40, text_width: 320, text_height: 200 },
+	{ bs_name: 'end03.pcx', level_num: REGISTERED_ENDING_LEVEL_NUM, message_num: 3, text_ulx: 5, text_uly: 5, text_width: 300, text_height: 200 },
 ];
 
 // Briefing text colors (ported from TITLES.C lines 1013-1018)
@@ -39,14 +49,433 @@ const BRIEFING_COLORS = [
 // Font size — original uses 8px tall GAME_FONT at 320x200
 // Scale factor applied when rendering to screen-sized canvas
 const CHAR_HEIGHT = 8;
-const CHAR_WIDTH = 6; // approximate monospace width at 320x200
+const CHAR_WIDTH_FALLBACK = 6;
 
 // Typewriter delay: 28ms per character (KEY_DELAY_DEFAULT in TITLES.C)
 const KEY_DELAY_DEFAULT = 28;
 
+// Briefing render space is fixed 320x200
+const BRIEFING_RENDER_W = 320;
+const BRIEFING_RENDER_H = 200;
+
+// Robot/bitmap viewport for briefing special visuals (TITLES.C init_spinning_robot/init_briefing_bitmap)
+const BRIEFING_VIS_X = 138;
+const BRIEFING_VIS_Y = 55;
+const BRIEFING_VIS_W = 166;
+const BRIEFING_VIS_H = 138;
+
+// show_spinning_robot_frame() advances heading by 150 fixang after each
+// 50 ms briefing draw.  Descent's reflected Z axis reverses that heading when
+// applied as a Three.js Y rotation.
+const BRIEFING_ROBOT_YAW_RATE = 150 * ( 2 * Math.PI / 65536 ) / 0.05;
+
+// Game palette proxy for briefing font colors (indexes used by gr_string).
+const BRIEFING_PALETTE = new Uint8Array( 256 * 3 );
+const BRIEFING_FG_INDEX = [ 250, 251 ];
+const BRIEFING_BG_INDEX = [ 252, 253 ];
+const BRIEFING_SKIP_DIM_FG_INDEX = 244;
+const BRIEFING_SKIP_DIM_BG_INDEX = 245;
+const BRIEFING_SKIP_BRIGHT_FG_INDEX = 246;
+const BRIEFING_SKIP_BRIGHT_BG_INDEX = 247;
+
+function set_palette_rgb63( palette, index, r63, g63, b63 ) {
+
+	// Original palette values are 0..63; convert to 0..252 like the main palette tables.
+	palette[ index * 3 + 0 ] = r63 * 4;
+	palette[ index * 3 + 1 ] = g63 * 4;
+	palette[ index * 3 + 2 ] = b63 * 4;
+
+}
+
+// Ported from TITLES.C briefing color init (lines 1013-1019)
+set_palette_rgb63( BRIEFING_PALETTE, BRIEFING_FG_INDEX[ 0 ], 0, 54, 0 );
+set_palette_rgb63( BRIEFING_PALETTE, BRIEFING_BG_INDEX[ 0 ], 0, 19, 0 );
+set_palette_rgb63( BRIEFING_PALETTE, BRIEFING_FG_INDEX[ 1 ], 42, 38, 32 );
+set_palette_rgb63( BRIEFING_PALETTE, BRIEFING_BG_INDEX[ 1 ], 14, 14, 14 );
+set_palette_rgb63( BRIEFING_PALETTE, BRIEFING_SKIP_DIM_FG_INDEX, 40, 40, 40 );
+set_palette_rgb63( BRIEFING_PALETTE, BRIEFING_SKIP_DIM_BG_INDEX, 8, 8, 8 );
+set_palette_rgb63( BRIEFING_PALETTE, BRIEFING_SKIP_BRIGHT_FG_INDEX, 63, 63, 63 );
+set_palette_rgb63( BRIEFING_PALETTE, BRIEFING_SKIP_BRIGHT_BG_INDEX, 16, 16, 16 );
+
 // Cached briefing text (decrypted once)
 let _briefingText = null;
 let _endingText = null;
+let _briefingTextFilename = 'briefing.tex';
+let _endingTextFilename = 'ending.tex';
+
+function to_txb_filename( filename ) {
+
+	const dot = filename.lastIndexOf( '.' );
+	if ( dot < 0 ) return filename + '.txb';
+	return filename.substring( 0, dot ) + '.txb';
+
+}
+
+// Ported from mission-driven text filename behavior in MISSION.C + TITLES.C.
+export function titles_set_text_filenames( briefingFilename, endingFilename ) {
+
+	if ( typeof briefingFilename === 'string' && briefingFilename.length > 0 ) {
+
+		_briefingTextFilename = briefingFilename.toLowerCase();
+
+	}
+
+	if ( typeof endingFilename === 'string' && endingFilename.length > 0 ) {
+
+		_endingTextFilename = endingFilename.toLowerCase();
+
+	}
+
+	// Mission or text file changes require cache invalidation.
+	_briefingText = null;
+	_endingText = null;
+
+}
+
+// Cached per-character advances from GAME_FONT (show_char_delay/gr_get_string_size parity)
+let _briefingFont = null;
+const _briefingCharAdvance = new Int16Array( 256 );
+for ( let i = 0; i < _briefingCharAdvance.length; i ++ ) _briefingCharAdvance[ i ] = - 1;
+
+function get_briefing_font() {
+
+	if ( _briefingFont === null ) {
+
+		_briefingFont = GAME_FONT();
+
+	}
+
+	return _briefingFont;
+
+}
+
+function get_briefing_char_width( ch ) {
+
+	const code = ch.charCodeAt( 0 );
+
+	if ( code >= 0 && code < _briefingCharAdvance.length ) {
+
+		if ( _briefingCharAdvance[ code ] >= 0 ) {
+
+			return _briefingCharAdvance[ code ];
+
+		}
+
+	}
+
+	const font = get_briefing_font();
+	let width = CHAR_WIDTH_FALLBACK;
+
+	if ( font !== null ) {
+
+		const size = gr_get_string_size( font, ch );
+		width = size.width;
+
+		if ( width <= 0 ) {
+
+			width = font.ft_w;
+
+		}
+
+	}
+
+	if ( code >= 0 && code < _briefingCharAdvance.length ) {
+
+		_briefingCharAdvance[ code ] = width;
+
+	}
+
+	return width;
+
+}
+
+let _briefingPigFile = null;
+let _briefingPalette = null;
+
+function clear_image_data( imageData ) {
+
+	imageData.data.fill( 0 );
+
+}
+
+function draw_briefing_char( textCtx, imageData, ch, x, y, colorIndex ) {
+
+	const font = get_briefing_font();
+	if ( font === null ) return;
+
+	let color = colorIndex;
+	if ( color < 0 || color >= BRIEFING_FG_INDEX.length ) color = 0;
+
+	// Draw shadow then foreground, matching show_char_delay() in TITLES.C.
+	gr_string( imageData, font, x, y, ch, BRIEFING_PALETTE, BRIEFING_BG_INDEX[ color ] );
+	gr_string( imageData, font, x + 1, y, ch, BRIEFING_PALETTE, BRIEFING_FG_INDEX[ color ] );
+	textCtx.putImageData( imageData, 0, 0 );
+
+}
+
+function create_briefing_label_canvas( text, fgIndex, bgIndex ) {
+
+	const font = get_briefing_font();
+	if ( font === null ) return null;
+
+	const size = gr_get_string_size( font, text );
+	const width = Math.max( size.width + 1, 1 );
+	const height = Math.max( font.ft_h + 1, 1 );
+
+	const canvas = document.createElement( 'canvas' );
+	canvas.width = width;
+	canvas.height = height;
+	canvas.style.imageRendering = 'pixelated';
+	canvas.style.pointerEvents = 'none';
+
+	const ctx = canvas.getContext( '2d', { willReadFrequently: true } );
+	if ( ctx === null ) return null;
+
+	const imageData = ctx.createImageData( width, height );
+	clear_image_data( imageData );
+	gr_string( imageData, font, 0, 0, text, BRIEFING_PALETTE, bgIndex );
+	gr_string( imageData, font, 1, 0, text, BRIEFING_PALETTE, fgIndex );
+	ctx.putImageData( imageData, 0, 0 );
+
+	return canvas;
+
+}
+
+function create_briefing_visual_state( parentElement ) {
+
+	const container = document.createElement( 'div' );
+	container.style.position = 'absolute';
+	container.style.left = ( BRIEFING_VIS_X / BRIEFING_RENDER_W * 100 ).toFixed( 2 ) + '%';
+	container.style.top = ( BRIEFING_VIS_Y / BRIEFING_RENDER_H * 100 ).toFixed( 2 ) + '%';
+	container.style.width = ( BRIEFING_VIS_W / BRIEFING_RENDER_W * 100 ).toFixed( 2 ) + '%';
+	container.style.height = ( BRIEFING_VIS_H / BRIEFING_RENDER_H * 100 ).toFixed( 2 ) + '%';
+	container.style.pointerEvents = 'none';
+	parentElement.appendChild( container );
+
+	const glCanvas = document.createElement( 'canvas' );
+	glCanvas.width = BRIEFING_VIS_W;
+	glCanvas.height = BRIEFING_VIS_H;
+	glCanvas.style.width = '100%';
+	glCanvas.style.height = '100%';
+	glCanvas.style.imageRendering = 'pixelated';
+	glCanvas.style.display = 'none';
+	container.appendChild( glCanvas );
+
+	const renderer = new THREE.WebGLRenderer( {
+		canvas: glCanvas,
+		alpha: true,
+		antialias: false,
+		powerPreference: 'low-power'
+	} );
+	renderer.setSize( BRIEFING_VIS_W, BRIEFING_VIS_H, false );
+	renderer.setPixelRatio( 1 );
+	renderer.setClearColor( 0x000000, 0 );
+
+	const scene = new THREE.Scene();
+	const camera = new THREE.PerspectiveCamera( 38, BRIEFING_VIS_W / BRIEFING_VIS_H, 0.1, 1000 );
+	camera.position.set( 0, 0, 35 );
+	camera.lookAt( 0, 0, 0 );
+
+	const ambient = new THREE.AmbientLight( 0xffffff, 0.9 );
+	scene.add( ambient );
+
+	const key = new THREE.DirectionalLight( 0xffffff, 0.5 );
+	key.position.set( 0.6, 1.0, 0.7 );
+	scene.add( key );
+
+	return {
+		container: container,
+		renderer: renderer,
+		scene: scene,
+		camera: camera,
+		robotMesh: null,
+		robotYaw: 0,
+		active: true,
+		rafId: 0,
+		lastTimeMs: 0,
+		box: new THREE.Box3(),
+		center: new THREE.Vector3(),
+		size: new THREE.Vector3()
+	};
+
+}
+
+function destroy_briefing_visual_state( state ) {
+
+	if ( state === null ) return;
+
+	state.active = false;
+	if ( state.rafId !== 0 ) cancelAnimationFrame( state.rafId );
+
+	if ( state.robotMesh !== null ) {
+
+		state.scene.remove( state.robotMesh );
+		state.robotMesh = null;
+
+	}
+
+	state.renderer.dispose();
+
+	if ( state.container.parentElement !== null ) {
+
+		state.container.parentElement.removeChild( state.container );
+
+	}
+
+}
+
+function build_briefing_robot_mesh( robotNum ) {
+
+	let modelNum = - 1;
+
+	if ( robotNum >= 0 && robotNum < N_robot_types ) {
+
+		const ri = Robot_info[ robotNum ];
+		if ( ri !== undefined && ri.model_num >= 0 ) {
+
+			modelNum = ri.model_num;
+
+		}
+
+	}
+
+	// Fallback: allow direct model index command values.
+	if ( modelNum < 0 && robotNum >= 0 && robotNum < Polygon_models.length ) {
+
+		if ( Polygon_models[ robotNum ] !== null && Polygon_models[ robotNum ] !== undefined ) {
+
+			modelNum = robotNum;
+
+		}
+
+	}
+
+	if ( modelNum < 0 || modelNum >= Polygon_models.length ) return null;
+	if ( _briefingPigFile === null || _briefingPalette === null ) return null;
+
+	const model = Polygon_models[ modelNum ];
+	if ( model === null || model === undefined ) return null;
+
+	let mesh = null;
+
+	if ( model.anim_angs !== null ) {
+
+		if ( model.animatedMesh === null ) {
+
+			model.animatedMesh = buildAnimatedModelMesh( model, _briefingPigFile, _briefingPalette );
+
+		}
+
+		if ( model.animatedMesh !== null ) {
+
+			mesh = polyobj_clone_model_mesh( model.animatedMesh );
+
+		}
+
+	}
+
+	if ( mesh === null ) {
+
+		if ( model.mesh === null ) {
+
+			model.mesh = buildModelMesh( model, _briefingPigFile, _briefingPalette );
+
+		}
+
+		if ( model.mesh === null ) return null;
+
+		mesh = polyobj_clone_model_mesh( model.mesh );
+
+	}
+
+	// draw_model_picture() supplies no glow array, so OP_GLOW is interpreted as
+	// an ordinary texture-mapped face at model light 1 in briefing renders.
+	polyobj_set_morphing( mesh, true );
+	return mesh;
+
+}
+
+function set_briefing_robot( state, robotNum ) {
+
+	if ( state === null ) return;
+
+	if ( state.robotMesh !== null ) {
+
+		state.scene.remove( state.robotMesh );
+		state.robotMesh = null;
+
+	}
+
+	if ( robotNum < 0 ) {
+
+		state.renderer.domElement.style.display = 'none';
+		state.renderer.clear();
+		return;
+
+	}
+
+	const mesh = build_briefing_robot_mesh( robotNum );
+	if ( mesh === null ) {
+
+		state.renderer.domElement.style.display = 'none';
+		state.renderer.clear();
+		return;
+
+	}
+
+	state.renderer.domElement.style.display = 'block';
+	state.robotYaw = 0;
+
+	// Center model and fit camera to bounds.
+	state.box.setFromObject( mesh );
+	state.box.getCenter( state.center );
+	mesh.position.sub( state.center );
+
+	state.box.setFromObject( mesh );
+	state.box.getSize( state.size );
+	const radius = Math.max( state.size.length() * 0.5, 1.0 );
+	const dist = radius * 2.4;
+
+	state.camera.position.set( 0, 0, dist );
+	state.camera.near = Math.max( dist * 0.05, 0.1 );
+	state.camera.far = dist * 12;
+	state.camera.updateProjectionMatrix();
+	state.camera.lookAt( 0, 0, 0 );
+
+	state.robotMesh = mesh;
+	state.scene.add( mesh );
+	state.renderer.render( state.scene, state.camera );
+
+}
+
+function start_briefing_visual_loop( state ) {
+
+	if ( state === null ) return;
+
+	state.lastTimeMs = performance.now();
+
+	function tick( nowMs ) {
+
+		if ( state.active !== true ) return;
+
+		const dt = Math.max( 0, ( nowMs - state.lastTimeMs ) / 1000.0 );
+		state.lastTimeMs = nowMs;
+
+		if ( state.robotMesh !== null ) {
+
+			state.robotYaw -= dt * BRIEFING_ROBOT_YAW_RATE;
+			state.robotMesh.rotation.y = state.robotYaw;
+			state.renderer.render( state.scene, state.camera );
+
+		}
+
+		state.rafId = requestAnimationFrame( tick );
+
+	}
+
+	state.rafId = requestAnimationFrame( tick );
+
+}
 
 // ---- Text decryption ----
 // Same cipher as bitmaps.bin: rotate-left + XOR 0xD3 + rotate-left
@@ -99,19 +528,19 @@ function load_briefing_text( hogFile ) {
 	if ( _briefingText !== null ) return _briefingText;
 
 	// Try .tex first, fall back to .txb
-	let cfile = hogFile.findFile( 'briefing.tex' );
+	let cfile = hogFile.findFile( _briefingTextFilename );
 	let isBinary = false;
 
 	if ( cfile === null ) {
 
-		cfile = hogFile.findFile( 'briefing.txb' );
+		cfile = hogFile.findFile( to_txb_filename( _briefingTextFilename ) );
 		isBinary = true;
 
 	}
 
 	if ( cfile === null ) {
 
-		console.warn( 'TITLES: briefing.tex/txb not found in HOG' );
+		console.warn( 'TITLES: ' + _briefingTextFilename + ' not found in HOG' );
 		return '';
 
 	}
@@ -144,19 +573,19 @@ function load_ending_text( hogFile ) {
 
 	if ( _endingText !== null ) return _endingText;
 
-	let cfile = hogFile.findFile( 'ending.tex' );
+	let cfile = hogFile.findFile( _endingTextFilename );
 	let isBinary = false;
 
 	if ( cfile === null ) {
 
-		cfile = hogFile.findFile( 'ending.txb' );
+		cfile = hogFile.findFile( to_txb_filename( _endingTextFilename ) );
 		isBinary = true;
 
 	}
 
 	if ( cfile === null ) {
 
-		console.warn( 'TITLES: ending.tex/txb not found in HOG' );
+		console.warn( 'TITLES: ' + _endingTextFilename + ' not found in HOG' );
 		return '';
 
 	}
@@ -435,21 +864,63 @@ function addSkipBriefingButton() {
 	if ( _skipBriefingBtn !== null ) return;
 
 	const btn = document.createElement( 'button' );
-	btn.textContent = 'Skip';
 	btn.style.cssText = 'position:absolute;bottom:20px;right:20px;z-index:202;' +
-		'background:transparent;color:rgba(255,255,255,0.5);border:none;outline:none;' +
-		'padding:8px 16px;font-family:"Courier New",monospace;font-size:14px;cursor:pointer;' +
-		'transition:color 0.2s;';
-	btn.addEventListener( 'mouseenter', () => {
+		'background:transparent;border:none;outline:none;padding:8px 16px;cursor:pointer;';
 
-		btn.style.color = 'rgba(255,255,255,0.9)';
+	const dimLabel = create_briefing_label_canvas( 'Skip', BRIEFING_SKIP_DIM_FG_INDEX, BRIEFING_SKIP_DIM_BG_INDEX );
+	const brightLabel = create_briefing_label_canvas( 'Skip', BRIEFING_SKIP_BRIGHT_FG_INDEX, BRIEFING_SKIP_BRIGHT_BG_INDEX );
 
-	} );
-	btn.addEventListener( 'mouseleave', () => {
+	if ( dimLabel !== null && brightLabel !== null ) {
 
-		btn.style.color = 'rgba(255,255,255,0.5)';
+		const scale = 2;
+		const width = dimLabel.width * scale;
+		const height = dimLabel.height * scale;
 
-	} );
+		btn.style.width = width + 'px';
+		btn.style.height = height + 'px';
+		btn.style.padding = '0';
+
+		dimLabel.style.width = width + 'px';
+		dimLabel.style.height = height + 'px';
+		brightLabel.style.width = width + 'px';
+		brightLabel.style.height = height + 'px';
+		brightLabel.style.display = 'none';
+
+		btn.appendChild( dimLabel );
+		btn.appendChild( brightLabel );
+
+		btn.addEventListener( 'mouseenter', () => {
+
+			dimLabel.style.display = 'none';
+			brightLabel.style.display = 'block';
+
+		} );
+		btn.addEventListener( 'mouseleave', () => {
+
+			dimLabel.style.display = 'block';
+			brightLabel.style.display = 'none';
+
+		} );
+
+	} else {
+
+		btn.textContent = 'Skip';
+		btn.style.color = 'rgba(255,255,255,0.6)';
+		btn.style.fontFamily = '"Courier New", monospace';
+		btn.style.fontSize = '14px';
+
+		btn.addEventListener( 'mouseenter', () => {
+
+			btn.style.color = 'rgba(255,255,255,0.95)';
+
+		} );
+		btn.addEventListener( 'mouseleave', () => {
+
+			btn.style.color = 'rgba(255,255,255,0.6)';
+
+		} );
+
+	}
 	btn.addEventListener( 'click', ( e ) => {
 
 		e.stopPropagation();
@@ -478,7 +949,10 @@ function removeSkipBriefingButton() {
 // Show briefing screens for a given level
 // level_num: 1-based level number, or 0 for intro
 // For shareware ending: pass SHAREWARE_ENDING_LEVEL_NUM
-export async function do_briefing_screens( hogFile, levelNum ) {
+export async function do_briefing_screens( hogFile, levelNum, pigFile, palette ) {
+
+	if ( pigFile !== undefined ) _briefingPigFile = pigFile;
+	if ( palette !== undefined ) _briefingPalette = palette;
 
 	const text = load_briefing_text( hogFile );
 	if ( text.length === 0 ) return;
@@ -545,25 +1019,30 @@ export async function do_briefing_screens( hogFile, levelNum ) {
 
 }
 
-// Show shareware ending screens
-export async function do_shareware_end_game( hogFile ) {
+async function do_ending_screens( hogFile, pigFile, palette, endingLevelNum ) {
+
+	if ( pigFile !== undefined ) _briefingPigFile = pigFile;
+	if ( palette !== undefined ) _briefingPalette = palette;
 
 	// Load ending text
 	const text = load_ending_text( hogFile );
 
-	songs_play_song( SONG_BRIEFING, true );
+	// The shareware archive has no endgame.hmp, so use its briefing track as
+	// DXX-Rebirth does. Registered data supplies the original endgame track.
+	const isSharewareEnding = endingLevelNum === SHAREWARE_ENDING_LEVEL_NUM;
+	songs_play_song( isSharewareEnding === true ? SONG_BRIEFING : SONG_ENDGAME, isSharewareEnding );
 
-	ensureTitleCanvas();
+	show_title_canvas();
 	_titleInner.style.transition = 'opacity 0.3s ease';
 
 	addSkipBriefingButton();
 
-	// Show screens with SHAREWARE_ENDING_LEVEL_NUM
+	// Show the edition-specific ending rows from the original Briefing_screens table.
 	for ( let i = 0; i < Briefing_screens.length; i ++ ) {
 
 		if ( _skipBriefing === true ) break;
 
-		if ( Briefing_screens[ i ].level_num === SHAREWARE_ENDING_LEVEL_NUM ) {
+		if ( Briefing_screens[ i ].level_num === endingLevelNum ) {
 
 			// For ending, use ending text instead of briefing text
 			const aborted = await show_briefing_screen( hogFile, i, text );
@@ -579,6 +1058,51 @@ export async function do_shareware_end_game( hogFile ) {
 
 		_titleOverlay.parentElement.removeChild( _titleOverlay );
 		_titleOverlay = null;
+
+	}
+
+	// The shareware build follows its narrative with the original order form.
+	if ( isSharewareEnding === true ) {
+
+		const orderPcx = pcx_read( hogFile, 'order01.pcx' );
+		if ( orderPcx !== null ) {
+
+			const orderCanvas = pcx_to_canvas( orderPcx );
+			if ( orderCanvas !== null ) {
+
+				drawPcxToCanvas( orderCanvas );
+				_titleInner.style.opacity = '1';
+				await wait_for_input_or_timeout( 5 * 60 * 1000 );
+
+			}
+
+		}
+
+	}
+
+}
+
+export async function do_shareware_end_game( hogFile, pigFile, palette ) {
+
+	await do_ending_screens( hogFile, pigFile, palette, SHAREWARE_ENDING_LEVEL_NUM );
+
+}
+
+export async function do_registered_end_game( hogFile, pigFile, palette ) {
+
+	await do_ending_screens( hogFile, pigFile, palette, REGISTERED_ENDING_LEVEL_NUM );
+
+}
+
+export async function do_end_game( hogFile, pigFile, palette ) {
+
+	if ( pigFile !== undefined && pigFile !== null && pigFile.isShareware !== true ) {
+
+		await do_registered_end_game( hogFile, pigFile, palette );
+
+	} else {
+
+		await do_shareware_end_game( hogFile, pigFile, palette );
 
 	}
 
@@ -633,40 +1157,35 @@ async function display_briefing_text( bsp, message ) {
 	textContainer.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;';
 	overlay.appendChild( textContainer );
 
+	// Pixel-exact 320x200 text layer (matches GAME_FONT raster metrics).
+	const textCanvas = document.createElement( 'canvas' );
+	textCanvas.width = BRIEFING_RENDER_W;
+	textCanvas.height = BRIEFING_RENDER_H;
+	textCanvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;image-rendering:pixelated;pointer-events:none;';
+	textContainer.appendChild( textCanvas );
+	const textCtx = textCanvas.getContext( '2d', { willReadFrequently: true } );
+	const textImageData = textCtx.createImageData( BRIEFING_RENDER_W, BRIEFING_RENDER_H );
+	clear_image_data( textImageData );
+	textCtx.putImageData( textImageData, 0, 0 );
+
+	const visualState = create_briefing_visual_state( textContainer );
+	start_briefing_visual_loop( visualState );
+
 	let currentColor = 0;
 	let tabStop = 0;
 	let textX = bsp.text_ulx;
 	let textY = bsp.text_uly;
+	const textXMax = bsp.text_ulx + bsp.text_width;
+	const textYMax = bsp.text_uly + bsp.text_height;
 	let prevCh = 10; // start as if previous was newline
 	let pos = 0;
 	let aborted = false;
 	let delayMs = KEY_DELAY_DEFAULT;
 	let skipAnimation = false;
 	let endedWithStop = false; // Track if $S command already handled the final wait
-
-	// Pre-create a text element for efficient rendering
-	// We'll use a monospace pre element that we append characters to
-	const textEl = document.createElement( 'pre' );
-	textEl.style.cssText = 'position:absolute;margin:0;padding:0;font-family:"Courier New",monospace;' +
-		'white-space:pre-wrap;word-break:break-all;line-height:1.15;pointer-events:none;' +
-		'text-shadow:none;';
-
-	// Position the text using % coordinates relative to the 320x200 space
-	// The overlay and text container are children of _titleInner, which is aspect-correct
-	const leftPct = ( bsp.text_ulx / 320 * 100 ).toFixed( 2 );
-	const topPct = ( bsp.text_uly / 200 * 100 ).toFixed( 2 );
-	const widthPct = ( bsp.text_width / 320 * 100 ).toFixed( 2 );
-	// Original uses 8px tall font at 200px height = 4% of container height
-	textEl.style.left = leftPct + '%';
-	textEl.style.top = topPct + '%';
-	textEl.style.width = widthPct + '%';
-	textEl.style.fontSize = '1em';
-	textEl.style.color = BRIEFING_COLORS[ 0 ].fg;
-	textContainer.appendChild( textEl );
-
-	// Build an array of styled spans for the text
-	let currentSpan = createColorSpan( currentColor );
-	textEl.appendChild( currentSpan );
+	const spaceWidth = get_briefing_char_width( ' ' );
+	let newPage = false;
+	let robotNum = - 1;
 
 	// Handle ESC or click to skip/advance
 	let keyPressed = null;
@@ -741,8 +1260,6 @@ async function display_briefing_text( bsp, message ) {
 					currentColor = parseInt( numStr.trim(), 10 ) - 1;
 					if ( currentColor < 0 ) currentColor = 0;
 					if ( currentColor >= BRIEFING_COLORS.length ) currentColor = BRIEFING_COLORS.length - 1;
-					currentSpan = createColorSpan( currentColor );
-					textEl.appendChild( currentSpan );
 					prevCh = 10;
 
 				} else if ( cmd === 'F' ) {
@@ -769,13 +1286,53 @@ async function display_briefing_text( bsp, message ) {
 					}
 
 					if ( pos < message.length ) pos ++;
-					tabStop = parseInt( numStr.trim(), 10 ) || 0;
+
+					const parsedTabStop = parseInt( numStr.trim(), 10 );
+					if ( Number.isNaN( parsedTabStop ) ) {
+
+						tabStop = 0;
+
+					} else {
+
+						tabStop = parsedTabStop;
+
+					}
+
 					prevCh = 10;
 
-				} else if ( cmd === 'R' || cmd === 'N' || cmd === 'O' || cmd === 'B' ) {
+				} else if ( cmd === 'R' ) {
 
-					// Robot display / animated bitmap / static bitmap — skip to end of line
-					// (We don't render these in the JS port)
+					// Spinning robot model (TITLES.C init_spinning_robot + show_spinning_robot_frame)
+					let numStr = '';
+					while ( pos < message.length && message.charAt( pos ) !== '\n' ) {
+
+						numStr += message.charAt( pos );
+						pos ++;
+
+					}
+
+					if ( pos < message.length ) pos ++;
+
+					const parsedRobotNum = parseInt( numStr.trim(), 10 );
+					if ( Number.isNaN( parsedRobotNum ) ) {
+
+						robotNum = - 1;
+
+					} else {
+
+						robotNum = parsedRobotNum;
+
+					}
+
+					set_briefing_robot( visualState, robotNum );
+					prevCh = 10;
+
+				} else if ( cmd === 'N' || cmd === 'O' || cmd === 'B' ) {
+
+					// Animated/static bitmap commands; clear robot viewport for parity with Robot_canv reset.
+					robotNum = - 1;
+					set_briefing_robot( visualState, - 1 );
+
 					while ( pos < message.length && message.charAt( pos ) !== '\n' ) {
 
 						pos ++;
@@ -806,8 +1363,7 @@ async function display_briefing_text( bsp, message ) {
 
 				} else if ( cmd === 'P' ) {
 
-					// New page — wait for key, then clear text
-					// Skip to end of line
+					// New page marker, handled by the common page-break path below.
 					while ( pos < message.length && message.charAt( pos ) !== '\n' ) {
 
 						pos ++;
@@ -815,43 +1371,25 @@ async function display_briefing_text( bsp, message ) {
 					}
 
 					if ( pos < message.length ) pos ++;
-
-					if ( _skipBriefing === true ) {
-
-						aborted = true;
-						break;
-
-					}
-
-					skipAnimation = false;
-					keyPressed = null;
-
-					const pageResult = await wait_for_key_or_click( overlay );
-
-					if ( pageResult === 'escape' || _skipBriefing === true ) {
-
-						aborted = true;
-						break;
-
-					}
-
-					keyPressed = null;
-
-					// Reload background and clear text
-					textEl.innerHTML = '';
-					currentSpan = createColorSpan( currentColor );
-					textEl.appendChild( currentSpan );
-					textX = bsp.text_ulx;
-					textY = bsp.text_uly;
+					newPage = true;
 					prevCh = 10;
 
 				}
 
 			} else if ( ch === '\t' ) {
 
-				// Tab — insert spaces
-				const spacesNeeded = tabStop > 0 ? Math.max( 1, Math.floor( tabStop / CHAR_WIDTH ) ) : 4;
-				currentSpan.textContent += ' '.repeat( spacesNeeded );
+				// Ported from: TITLES.C line 845-846
+				if ( tabStop > 0 && textX - bsp.text_ulx < tabStop ) {
+
+					const targetX = bsp.text_ulx + tabStop;
+
+					while ( textX < targetX ) {
+
+						textX += spaceWidth;
+
+					}
+
+				}
 
 			} else if ( ch === ';' && prevCh === 10 ) {
 
@@ -874,14 +1412,13 @@ async function display_briefing_text( bsp, message ) {
 
 				if ( prevCh !== 92 ) { // 92 = backslash
 
-					currentSpan.textContent += '\n';
 					textX = bsp.text_ulx;
 					textY += CHAR_HEIGHT;
 					prevCh = 10;
 
 				} else {
 
-					prevCh = 10;
+					prevCh = ch.charCodeAt( 0 );
 
 				}
 
@@ -889,8 +1426,8 @@ async function display_briefing_text( bsp, message ) {
 
 				// Regular character — typewriter delay
 				prevCh = ch.charCodeAt( 0 );
-				currentSpan.textContent += ch;
-				textX += CHAR_WIDTH;
+				draw_briefing_char( textCtx, textImageData, ch, textX, textY, currentColor );
+				textX += get_briefing_char_width( ch );
 
 				if ( skipAnimation !== true && delayMs > 0 ) {
 
@@ -915,6 +1452,38 @@ async function display_briefing_text( bsp, message ) {
 
 			}
 
+			if ( textX > textXMax ) {
+
+				textX = bsp.text_ulx;
+				textY += CHAR_HEIGHT;
+
+			}
+
+			if ( newPage === true || textY > textYMax ) {
+
+				newPage = false;
+				skipAnimation = false;
+				keyPressed = null;
+
+				const pageResult = await wait_for_key_or_click( overlay );
+
+				if ( pageResult === 'escape' || _skipBriefing === true ) {
+
+					aborted = true;
+					break;
+
+				}
+
+				robotNum = - 1;
+				set_briefing_robot( visualState, - 1 );
+				clear_image_data( textImageData );
+				textCtx.putImageData( textImageData, 0, 0 );
+				textX = bsp.text_ulx;
+				textY = bsp.text_uly;
+				delayMs = KEY_DELAY_DEFAULT;
+
+			}
+
 		}
 
 		// If not aborted and message ended without $S, wait for key
@@ -934,6 +1503,7 @@ async function display_briefing_text( bsp, message ) {
 
 	} finally {
 
+		destroy_briefing_visual_state( visualState );
 		document.removeEventListener( 'keydown', onKeyDown );
 		overlay.removeEventListener( 'click', onClick );
 		overlay.innerHTML = '';
@@ -941,17 +1511,6 @@ async function display_briefing_text( bsp, message ) {
 	}
 
 	return aborted;
-
-}
-
-// Create a colored span element for briefing text
-function createColorSpan( colorIndex ) {
-
-	const span = document.createElement( 'span' );
-	const color = BRIEFING_COLORS[ colorIndex ] || BRIEFING_COLORS[ 0 ];
-	span.style.color = color.fg;
-	span.style.textShadow = '1px 1px 0 ' + color.bg;
-	return span;
 
 }
 

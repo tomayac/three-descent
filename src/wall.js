@@ -4,7 +4,7 @@
 import {
 	MAX_SIDES_PER_SEGMENT, IS_CHILD
 } from './segment.js';
-import { digi_play_sample_3d } from './digi.js';
+import { digi_play_sample_world } from './digi.js';
 import { laser_kill_stuck_on_wall } from './laser.js';
 
 // Wall types
@@ -59,6 +59,12 @@ export const WID_ILLUSORY_WALL = 3;		// 1/1/0 — illusory wall (fly + render)
 export const WID_TRANSILLUSORY_WALL = 7;	// 1/1/1 — transparent illusory (fly + render + see through)
 export const WID_NO_WALL = 5;			// 1/0/1 — no wall (fly + see through)
 export const WID_EXTERNAL = 8;			// external wall
+
+// wall_hit_process() results (WALL.H)
+export const WHP_NOT_SPECIAL = 0;
+export const WHP_NO_KEY = 1;
+export const WHP_BLASTABLE = 2;
+export const WHP_DOOR = 3;
 
 // Door timing (in seconds, converted from fixed-point)
 const DOOR_WAIT_TIME = 5.0;
@@ -139,6 +145,121 @@ export function wall_reset() {
 
 }
 
+// Return value copies suitable for save data.  ActiveDoors is a fixed-size
+// runtime pool, so callers must not retain its mutable array fields directly.
+export function wall_get_active_door_state() {
+
+	const state = [];
+	for ( let i = 0; i < Num_open_doors; i ++ ) {
+
+		const door = ActiveDoors[ i ];
+		state.push( {
+			n_parts: door.n_parts,
+			front_wallnum: [ door.front_wallnum[ 0 ], door.front_wallnum[ 1 ] ],
+			back_wallnum: [ door.back_wallnum[ 0 ], door.back_wallnum[ 1 ] ],
+			time: door.time
+		} );
+
+	}
+	return state;
+
+}
+
+// Restore active records without replaying wall_open_door(), which would alter
+// states, emit sounds, and reverse closing doors.  Malformed records are skipped
+// so legacy or damaged localStorage data cannot corrupt the fixed door pool.
+export function wall_restore_active_door_state( state ) {
+
+	wall_reset();
+	if ( Array.isArray( state ) !== true || _Walls === null || _Segments === null ) return;
+
+	const claimedWalls = new Set();
+	const count = Math.min( state.length, MAX_DOORS );
+	for ( let i = 0; i < count; i ++ ) {
+
+		const saved = state[ i ];
+		if ( saved === null || saved === undefined ) continue;
+		if ( saved.n_parts !== 1 && saved.n_parts !== 2 ) continue;
+		if ( Array.isArray( saved.front_wallnum ) !== true ||
+			Array.isArray( saved.back_wallnum ) !== true ) continue;
+		if ( Number.isFinite( saved.time ) !== true || saved.time < 0 ) continue;
+
+		let valid = true;
+		const recordWalls = [];
+		for ( let p = 0; p < saved.n_parts; p ++ ) {
+
+			const front = saved.front_wallnum[ p ];
+			const back = saved.back_wallnum[ p ];
+			if ( Number.isInteger( front ) !== true || front < 0 || front >= _Num_walls ||
+				Number.isInteger( back ) !== true || back < 0 || back >= _Num_walls ) {
+
+				valid = false;
+				break;
+
+			}
+
+			const frontWall = _Walls[ front ];
+			const backWall = _Walls[ back ];
+			if ( frontWall.type !== WALL_DOOR || backWall.type !== WALL_DOOR ||
+				Number.isInteger( frontWall.segnum ) !== true ||
+				frontWall.segnum < 0 || frontWall.segnum >= _Segments.length ||
+				Number.isInteger( frontWall.sidenum ) !== true ||
+				frontWall.sidenum < 0 || frontWall.sidenum >= MAX_SIDES_PER_SEGMENT ||
+				frontWall.clip_num < 0 || frontWall.clip_num >= WallAnims.length ||
+				WallAnims[ frontWall.clip_num ].num_frames <= 0 ||
+				WallAnims[ frontWall.clip_num ].play_time <= 0 ) {
+
+				valid = false;
+				break;
+
+			}
+
+			const frontSegment = _Segments[ frontWall.segnum ];
+			const frontSide = frontSegment.sides[ frontWall.sidenum ];
+			const child = frontSegment.children[ frontWall.sidenum ];
+			if ( frontSide.wall_num !== front || child < 0 || child >= _Segments.length ) {
+
+				valid = false;
+				break;
+
+			}
+
+			const backSide = find_connect_side( frontWall.segnum, child );
+			if ( backSide < 0 || _Segments[ child ].sides[ backSide ].wall_num !== back ||
+				claimedWalls.has( front ) || claimedWalls.has( back ) ||
+				recordWalls.includes( front ) || recordWalls.includes( back ) || front === back ) {
+
+				valid = false;
+				break;
+
+			}
+
+			recordWalls.push( front, back );
+
+		}
+		if ( valid !== true ) continue;
+		if ( saved.n_parts === 2 &&
+			_Walls[ saved.front_wallnum[ 0 ] ].linked_wall !== saved.front_wallnum[ 1 ] ) continue;
+
+		const phase = _Walls[ saved.front_wallnum[ 0 ] ].state;
+		if ( phase !== WALL_DOOR_OPENING && phase !== WALL_DOOR_WAITING &&
+			phase !== WALL_DOOR_CLOSING ) continue;
+
+		const door = ActiveDoors[ Num_open_doors ];
+		door.n_parts = saved.n_parts;
+		door.front_wallnum[ 0 ] = saved.front_wallnum[ 0 ];
+		door.front_wallnum[ 1 ] = saved.n_parts === 2 ? saved.front_wallnum[ 1 ] : - 1;
+		door.back_wallnum[ 0 ] = saved.back_wallnum[ 0 ];
+		door.back_wallnum[ 1 ] = saved.n_parts === 2 ? saved.back_wallnum[ 1 ] : - 1;
+		door.time = saved.time;
+		Num_open_doors ++;
+
+		for ( let p = 0; p < recordWalls.length; p ++ ) claimedWalls.add( recordWalls[ p ] );
+
+	}
+
+}
+
 // Callback for updating door mesh textures in the renderer
 // Set by main.js during init: fn(segnum, sidenum)
 let _doorRenderCallback = null;
@@ -168,6 +289,7 @@ export function wall_set_externals( externals ) {
 	_FrameTime = externals.getFrameTime;
 	_Vertices = externals.Vertices;
 	_Side_to_verts = externals.Side_to_verts;
+	if ( externals.Num_walls !== undefined ) _Num_walls = externals.Num_walls;
 	if ( externals.checkObjectsInDoorway !== undefined ) _checkObjectsInDoorway = externals.checkObjectsInDoorway;
 	if ( externals.pigFile !== undefined ) _pigFile = externals.pigFile;
 	if ( externals.Textures !== undefined ) _Textures = externals.Textures;
@@ -402,7 +524,9 @@ export function wall_open_door( segnum, sidenum ) {
 	if ( w.clip_num >= 0 && WallAnims[ w.clip_num ].open_sound > - 1 ) {
 
 		const cp = compute_side_center( segnum, sidenum );
-		digi_play_sample_3d( WallAnims[ w.clip_num ].open_sound, 1.0, cp.x, cp.y, cp.z );
+		digi_play_sample_world(
+			WallAnims[ w.clip_num ].open_sound, 1.0, segnum, cp.x, cp.y, cp.z
+		);
 
 	}
 
@@ -416,6 +540,7 @@ function do_door_open( door_num ) {
 	const frameTime = _FrameTime();
 
 	d.time += frameTime;
+	let completedParts = 0;
 
 	for ( let p = 0; p < d.n_parts; p ++ ) {
 
@@ -468,25 +593,35 @@ function do_door_open( door_num ) {
 		if ( i >= n - 1 ) {
 
 			wall_set_tmap_num( w.segnum, side, child_segnum, connect_side, w.clip_num, n - 1 );
+			completedParts ++;
 
-			const front_wn = seg.sides[ side ].wall_num;
+		}
 
-			if ( ( _Walls[ front_wn ].flags & WALL_DOOR_AUTO ) === 0 ) {
+	}
 
-				// Not auto-door: remove from active list
-				remove_active_door( door_num );
+	if ( completedParts === d.n_parts ) {
 
-			} else {
+		const firstWall = _Walls[ d.front_wallnum[ 0 ] ];
 
-				// Auto-door: go to waiting state
-				const cseg = _Segments[ child_segnum ];
-				const back_wn = cseg.sides[ connect_side ].wall_num;
+		if ( ( firstWall.flags & WALL_DOOR_AUTO ) === 0 ) {
 
-				_Walls[ front_wn ].state = WALL_DOOR_WAITING;
-				if ( back_wn !== - 1 ) _Walls[ back_wn ].state = WALL_DOOR_WAITING;
-				d.time = 0;	// Reset for waiting phase
+			// Not auto-door: remove from active list once all parts have finished.
+			remove_active_door( door_num );
+
+		} else {
+
+			// Auto-door: move every part to waiting once the whole linked door is open.
+			for ( let p = 0; p < d.n_parts; p ++ ) {
+
+				const frontWall = _Walls[ d.front_wallnum[ p ] ];
+				const backWall = _Walls[ d.back_wallnum[ p ] ];
+
+				if ( frontWall !== undefined ) frontWall.state = WALL_DOOR_WAITING;
+				if ( backWall !== undefined ) backWall.state = WALL_DOOR_WAITING;
 
 			}
+
+			d.time = 0;	// Reset for waiting phase
 
 		}
 
@@ -525,6 +660,20 @@ function do_door_close( door_num ) {
 			}
 
 		}
+
+	}
+
+	// D1 starts the close cue only after the doorway obstruction test succeeds,
+	// on the first frame that the door actually moves.  This also ensures a
+	// linked door emits one cue from its first part.
+	if ( d.time === 0 && w0.clip_num >= 0 &&
+		WallAnims[ w0.clip_num ].close_sound > - 1 ) {
+
+		const cp = compute_side_center( w0.segnum, w0.sidenum );
+		digi_play_sample_world(
+			WallAnims[ w0.clip_num ].close_sound, 1.0,
+			w0.segnum, cp.x, cp.y, cp.z
+		);
 
 	}
 
@@ -571,6 +720,10 @@ function do_door_close( door_num ) {
 		if ( i > 0 ) {
 
 			wall_set_tmap_num( w.segnum, side, child_segnum, connect_side, w.clip_num, i );
+			w.state = WALL_DOOR_CLOSING;
+
+			const backWall = _Walls[ d.back_wallnum[ p ] ];
+			if ( backWall !== undefined ) backWall.state = WALL_DOOR_CLOSING;
 
 		} else {
 
@@ -684,14 +837,6 @@ export function wall_frame_process() {
 				w.state = WALL_DOOR_CLOSING;
 				d.time = 0;
 
-				// Play door close sound at side center position
-				if ( w.clip_num >= 0 && WallAnims[ w.clip_num ].close_sound > - 1 ) {
-
-					const cp = compute_side_center( w.segnum, w.sidenum );
-					digi_play_sample_3d( WallAnims[ w.clip_num ].close_sound, 1.0, cp.x, cp.y, cp.z );
-
-				}
-
 			}
 
 		}
@@ -718,7 +863,7 @@ export function wall_init_door_textures() {
 
 	let count = 0;
 
-	for ( let i = 0; i < _Walls.length; i ++ ) {
+	for ( let i = 0; i < _Num_walls; i ++ ) {
 
 		const w = _Walls[ i ];
 		if ( w.type !== WALL_DOOR ) continue;
@@ -1004,9 +1149,9 @@ export function wall_illusion_on( segnum, sidenum ) {
 
 }
 
-// Wall hit processing — checks keys before opening doors
+// Wall hit processing — damages blastable walls and checks access before
+// opening doors. playerCanOpen is false for robot-fired weapons.
 // Ported from: wall_hit_process() in WALL.C
-// Returns: 0 = no key (blocked), 1 = opened
 // _playerKeys callback: () => { blue, red, gold }
 // _showMessage callback: (msg) => void
 let _playerKeys = null;
@@ -1039,15 +1184,29 @@ export function wall_set_explode_wall_callback( fn ) {
 
 }
 
-export function wall_hit_process( segnum, sidenum ) {
+export function wall_hit_process( segnum, sidenum, damage = 20.0, playerCanOpen = true ) {
 
-	if ( _Segments === null || _Walls === null ) return 1;
+	if ( _Segments === null || _Walls === null ) return WHP_NOT_SPECIAL;
 
 	const seg = _Segments[ segnum ];
+	if ( seg === undefined || sidenum < 0 || sidenum >= MAX_SIDES_PER_SEGMENT ) return WHP_NOT_SPECIAL;
 	const wall_num = seg.sides[ sidenum ].wall_num;
-	if ( wall_num === - 1 ) return 1;
+	if ( wall_num === - 1 ) return WHP_NOT_SPECIAL;
 
 	const w = _Walls[ wall_num ];
+	if ( w === undefined ) return WHP_NOT_SPECIAL;
+
+	// Blastable walls take damage from both player and robot weapons.
+	if ( w.type === WALL_BLASTABLE ) {
+
+		wall_damage( segnum, sidenum, damage );
+		return WHP_BLASTABLE;
+
+	}
+
+	// Only the local player can operate doors. In the original this is the
+	// playernum != Player_num early return used for robot-fired weapons.
+	if ( playerCanOpen !== true ) return WHP_NOT_SPECIAL;
 
 	// Check key requirements
 	if ( w.keys === KEY_BLUE ) {
@@ -1055,7 +1214,7 @@ export function wall_hit_process( segnum, sidenum ) {
 		if ( _playerKeys === null || _playerKeys().blue !== true ) {
 
 			if ( _showMessage !== null ) _showMessage( 'You need the BLUE key!' );
-			return 0;
+			return WHP_NO_KEY;
 
 		}
 
@@ -1066,7 +1225,7 @@ export function wall_hit_process( segnum, sidenum ) {
 		if ( _playerKeys === null || _playerKeys().red !== true ) {
 
 			if ( _showMessage !== null ) _showMessage( 'You need the RED key!' );
-			return 0;
+			return WHP_NO_KEY;
 
 		}
 
@@ -1077,7 +1236,7 @@ export function wall_hit_process( segnum, sidenum ) {
 		if ( _playerKeys === null || _playerKeys().gold !== true ) {
 
 			if ( _showMessage !== null ) _showMessage( 'You need the YELLOW key!' );
-			return 0;
+			return WHP_NO_KEY;
 
 		}
 
@@ -1089,7 +1248,7 @@ export function wall_hit_process( segnum, sidenum ) {
 		if ( ( w.flags & WALL_DOOR_LOCKED ) !== 0 ) {
 
 			if ( _showMessage !== null ) _showMessage( 'This door is locked!' );
-			return 0;
+			return WHP_NO_KEY;
 
 		}
 
@@ -1099,18 +1258,11 @@ export function wall_hit_process( segnum, sidenum ) {
 	if ( w.type === WALL_DOOR ) {
 
 		wall_open_door( segnum, sidenum );
-		return 1;
+		return WHP_DOOR;
 
 	}
 
-	// Blastable walls are handled by wall_damage() from weapon hits
-	if ( w.type === WALL_BLASTABLE ) {
-
-		return 0;	// Block passage until blasted
-
-	}
-
-	return 1;
+	return WHP_NOT_SPECIAL;
 
 }
 

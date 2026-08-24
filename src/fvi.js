@@ -175,6 +175,7 @@ function laser_are_related( o1, o2 ) {
 // Returns 0 if no intersection, or distance to intersection point
 // Sets _obj_int_result with intersection point
 const _obj_int_result = { x: 0, y: 0, z: 0 };
+const FVI_MIN_HIT_DIST = 1.0 / 65536.0;
 
 function check_vector_to_sphere_1( p0_x, p0_y, p0_z, p1_x, p1_y, p1_z,
 	sphere_x, sphere_y, sphere_z, sphere_rad ) {
@@ -199,7 +200,7 @@ function check_vector_to_sphere_1( p0_x, p0_y, p0_z, p1_x, p1_y, p1_z,
 			_obj_int_result.x = p0_x;
 			_obj_int_result.y = p0_y;
 			_obj_int_result.z = p0_z;
-			return 1;
+			return FVI_MIN_HIT_DIST;
 
 		}
 
@@ -244,7 +245,7 @@ function check_vector_to_sphere_1( p0_x, p0_y, p0_z, p1_x, p1_y, p1_z,
 			_obj_int_result.x = p0_x;
 			_obj_int_result.y = p0_y;
 			_obj_int_result.z = p0_z;
-			return 1;
+			return FVI_MIN_HIT_DIST;
 
 		}
 
@@ -285,10 +286,12 @@ function check_vector_to_object( p0_x, p0_y, p0_z, p1_x, p1_y, p1_z,
 
 // FVI query state: ignore_obj_list (set before calling find_vector_intersection)
 let _fvi_ignore_obj_list = null;
+let _fvi_ignore_obj_count = 0;
 
-export function fvi_set_ignore_obj_list( list ) {
+export function fvi_set_ignore_obj_list( list, count = 0 ) {
 
 	_fvi_ignore_obj_list = list;
+	_fvi_ignore_obj_count = list === null ? 0 : count;
 
 }
 
@@ -320,9 +323,6 @@ const _hit_data = {
 	n_segs: 0,
 	seglist: new Int16Array( MAX_FVI_SEGS )
 };
-
-// Pre-allocated temp vectors for internal computation
-const _temp_seglist = new Int16Array( MAX_FVI_SEGS );
 
 // ---- Helper: get vertex component by index (0=x, 1=y, 2=z) ----
 function vert_xyz( vertnum, comp ) {
@@ -750,42 +750,59 @@ function special_check_line_to_face( p0_x, p0_y, p0_z, p1_x, p1_y, p1_z, seg, se
 // The recursive core of FVI: for each segment, check all 6 sides
 // Open passage → recurse. Wall → record hit with normal.
 // Writes result into _fvi_sub_result (pre-allocated, Golden Rule #5)
-const _fvi_sub_result = { type: HIT_NONE, pnt_x: 0, pnt_y: 0, pnt_z: 0, seg: - 1 };
+const _fvi_sub_result = { type: HIT_NONE, pnt_x: 0, pnt_y: 0, pnt_z: 0, seg: - 1, n_segs: 0 };
 
-// Pre-allocated sub_result for recursive calls (one per nesting level, max depth ~20)
-const MAX_FVI_DEPTH = 20;
+// Every recursive level owns its scratch paths. Sharing one temp list lets a
+// deeper/alternate branch overwrite the path before its parent can copy it.
+// MAX_SEGS_VISITED already bounds recursion, so pre-allocate to that limit.
 const _sub_results = [];
+const _temp_seglists = [];
+const _hit_none_seglists = [];
+const _fallback_seglist = new Int16Array( MAX_FVI_SEGS );
 
-for ( let i = 0; i < MAX_FVI_DEPTH; i ++ ) {
+for ( let i = 0; i < MAX_SEGS_VISITED; i ++ ) {
 
 	_sub_results.push( { hit_x: 0, hit_y: 0, hit_z: 0, hit_seg: - 1 } );
+	_temp_seglists.push( new Int16Array( MAX_FVI_SEGS ) );
+	_hit_none_seglists.push( new Int16Array( MAX_FVI_SEGS ) );
 
 }
 
-function fvi_sub( p0_x, p0_y, p0_z, startseg, p1_x, p1_y, p1_z, rad, thisobjnum, flags, seglist, n_segs_ptr, entry_seg ) {
+function fvi_sub( p0_x, p0_y, p0_z, startseg, p1_x, p1_y, p1_z, rad, thisobjnum, flags, seglist, entry_seg ) {
 
 	const seg = Segments[ startseg ];
 	let hit_type = HIT_NONE;
 	let hit_seg = - 1;
 	let hit_none_seg = - 1;
+	let hit_none_n_segs = 0;
 	let closest_d = Infinity;
 	let closest_hit_x = p1_x;
 	let closest_hit_y = p1_y;
 	let closest_hit_z = p1_z;
 
 	const cur_nest = _fvi_nest_count;
-	_fvi_nest_count ++;
-
-	if ( _fvi_nest_count >= MAX_FVI_DEPTH ) {
+	if ( cur_nest >= MAX_SEGS_VISITED ) {
 
 		_fvi_sub_result.type = HIT_NONE;
 		_fvi_sub_result.pnt_x = p1_x;
 		_fvi_sub_result.pnt_y = p1_y;
 		_fvi_sub_result.pnt_z = p1_z;
-		_fvi_sub_result.seg = startseg;
+		_fvi_sub_result.seg = - 1;
+		_fvi_sub_result.n_segs = 0;
 		return;
 
 	}
+	_fvi_nest_count ++;
+	const temp_seglist = _temp_seglists[ cur_nest ];
+	const hit_none_seglist = _hit_none_seglists[ cur_nest ];
+	let n_segs = 0;
+
+	if ( ( flags & FQ_GET_SEGLIST ) !== 0 ) {
+
+		seglist[ n_segs ++ ] = startseg;
+
+	}
+	const base_n_segs = n_segs;
 
 	// ---- Object collision check ----
 	// Ported from: FVI.C lines 1056-1092
@@ -807,12 +824,16 @@ function fvi_sub( p0_x, p0_y, p0_z, startseg, p1_x, p1_y, p1_z, rad, thisobjnum,
 			// Skip self
 			if ( thisobjnum === objnum ) { objnum = nextObj; continue; }
 
+			// Player movement queries pass thisobjnum = -1; ignore the player object
+			// so enabling FQ_CHECK_OBJS doesn't immediately block all movement.
+			if ( thisobjnum === - 1 && obj.type === OBJ_PLAYER ) { objnum = nextObj; continue; }
+
 			// Skip ignored objects
 			if ( _fvi_ignore_obj_list !== null ) {
 
 				let ignored = false;
 
-				for ( let ig = 0; ig < _fvi_ignore_obj_list.length; ig ++ ) {
+				for ( let ig = 0; ig < _fvi_ignore_obj_count; ig ++ ) {
 
 					if ( _fvi_ignore_obj_list[ ig ] === objnum ) { ignored = true; break; }
 
@@ -914,6 +935,7 @@ function fvi_sub( p0_x, p0_y, p0_z, startseg, p1_x, p1_y, p1_z, rad, thisobjnum,
 		// On the back of at least one face
 		let bit = 1;
 
+		side_loop:
 		for ( let side = 0; side < 6 && endmask >= bit; side ++ ) {
 
 			const num_faces = get_num_faces( seg.sides[ side ] );
@@ -975,15 +997,20 @@ function fvi_sub( p0_x, p0_y, p0_z, startseg, p1_x, p1_y, p1_z, rad, thisobjnum,
 
 						if ( already_visited !== true ) {
 
+							if ( _n_segs_visited >= MAX_SEGS_VISITED ) break side_loop;
 							_segs_visited[ _n_segs_visited ++ ] = newsegnum;
 
-							if ( _n_segs_visited >= MAX_SEGS_VISITED ) break; // Give up
+							if ( _n_segs_visited >= MAX_SEGS_VISITED ) break side_loop;
 
 							// Save wall_norm globals (recursive call may trash them)
 							const save_norm_x = _wall_norm_x;
 							const save_norm_y = _wall_norm_y;
 							const save_norm_z = _wall_norm_z;
 							const save_hit_object = _fvi_hit_object;
+							const save_hit_seg = _fvi_hit_seg;
+							const save_hit_seg2 = _fvi_hit_seg2;
+							const save_hit_side = _fvi_hit_side;
+							const save_hit_side_seg = _fvi_hit_side_seg;
 
 							const sub_result = _sub_results[ cur_nest ];
 
@@ -992,10 +1019,11 @@ function fvi_sub( p0_x, p0_y, p0_z, startseg, p1_x, p1_y, p1_z, rad, thisobjnum,
 								newsegnum,
 								p1_x, p1_y, p1_z,
 								rad, thisobjnum, flags,
-								_temp_seglist, 0, startseg
+								temp_seglist, startseg
 							);
 
 							const sub_hit_type = _fvi_sub_result.type;
+							const temp_n_segs = _fvi_sub_result.n_segs;
 							sub_result.hit_x = _fvi_sub_result.pnt_x;
 							sub_result.hit_y = _fvi_sub_result.pnt_y;
 							sub_result.hit_z = _fvi_sub_result.pnt_z;
@@ -1016,7 +1044,18 @@ function fvi_sub( p0_x, p0_y, p0_z, startseg, p1_x, p1_y, p1_z, rad, thisobjnum,
 									closest_hit_z = sub_result.hit_z;
 									hit_type = sub_hit_type;
 
-									if ( sub_result.hit_seg !== - 1 ) hit_seg = sub_result.hit_seg;
+									hit_seg = sub_result.hit_seg;
+
+									if ( ( flags & FQ_GET_SEGLIST ) !== 0 ) {
+
+										n_segs = base_n_segs;
+										for ( let i = 0; i < temp_n_segs && n_segs < MAX_FVI_SEGS - 1; i ++ ) {
+
+											seglist[ n_segs ++ ] = temp_seglist[ i ];
+
+										}
+
+									}
 
 								} else {
 
@@ -1025,6 +1064,10 @@ function fvi_sub( p0_x, p0_y, p0_z, startseg, p1_x, p1_y, p1_z, rad, thisobjnum,
 									_wall_norm_y = save_norm_y;
 									_wall_norm_z = save_norm_z;
 									_fvi_hit_object = save_hit_object;
+									_fvi_hit_seg = save_hit_seg;
+									_fvi_hit_seg2 = save_hit_seg2;
+									_fvi_hit_side = save_hit_side;
+									_fvi_hit_side_seg = save_hit_side_seg;
 
 								}
 
@@ -1034,8 +1077,27 @@ function fvi_sub( p0_x, p0_y, p0_z, startseg, p1_x, p1_y, p1_z, rad, thisobjnum,
 								_wall_norm_x = save_norm_x;
 								_wall_norm_y = save_norm_y;
 								_wall_norm_z = save_norm_z;
+								_fvi_hit_object = save_hit_object;
+								_fvi_hit_seg = save_hit_seg;
+								_fvi_hit_seg2 = save_hit_seg2;
+								_fvi_hit_side = save_hit_side;
+								_fvi_hit_side_seg = save_hit_side_seg;
 
-								if ( sub_result.hit_seg !== - 1 ) hit_none_seg = sub_result.hit_seg;
+								if ( sub_result.hit_seg !== - 1 ) {
+
+									hit_none_seg = sub_result.hit_seg;
+									if ( ( flags & FQ_GET_SEGLIST ) !== 0 ) {
+
+										hit_none_n_segs = Math.min( temp_n_segs, MAX_FVI_SEGS - 1 );
+										for ( let i = 0; i < hit_none_n_segs; i ++ ) {
+
+											hit_none_seglist[ i ] = temp_seglist[ i ];
+
+										}
+
+									}
+
+								}
 
 							}
 
@@ -1055,6 +1117,9 @@ function fvi_sub( p0_x, p0_y, p0_z, startseg, p1_x, p1_y, p1_z, rad, thisobjnum,
 
 						if ( d < closest_d ) {
 
+							if ( ( flags & FQ_GET_SEGLIST ) !== 0 ) n_segs = base_n_segs;
+							hit_seg = - 1;
+							_fvi_hit_seg2 = - 1;
 							closest_d = d;
 							closest_hit_x = int_x;
 							closest_hit_y = int_y;
@@ -1068,7 +1133,7 @@ function fvi_sub( p0_x, p0_y, p0_z, startseg, p1_x, p1_y, p1_z, rad, thisobjnum,
 							_wall_norm_z = norm.z;
 
 							// Try to find hit_seg
-							const hm = get_seg_masks( int_x, int_y, int_z, startseg, 0 );
+							const hm = get_seg_masks( int_x, int_y, int_z, startseg, rad );
 
 							if ( hm.centermask === 0 ) {
 
@@ -1105,6 +1170,24 @@ function fvi_sub( p0_x, p0_y, p0_z, startseg, p1_x, p1_y, p1_z, rad, thisobjnum,
 		_fvi_sub_result.pnt_z = p1_z;
 		_fvi_sub_result.seg = hit_none_seg;
 
+		if ( hit_none_seg !== - 1 ) {
+
+			if ( ( flags & FQ_GET_SEGLIST ) !== 0 ) {
+
+				for ( let i = 0; i < hit_none_n_segs && n_segs < MAX_FVI_SEGS - 1; i ++ ) {
+
+					seglist[ n_segs ++ ] = hit_none_seglist[ i ];
+
+				}
+
+			}
+
+		} else if ( cur_nest !== 0 ) {
+
+			n_segs = 0;
+
+		}
+
 	} else {
 
 		_fvi_sub_result.type = hit_type;
@@ -1114,6 +1197,9 @@ function fvi_sub( p0_x, p0_y, p0_z, startseg, p1_x, p1_y, p1_z, rad, thisobjnum,
 		_fvi_sub_result.seg = ( hit_seg === - 1 ) ? ( ( _fvi_hit_seg2 !== - 1 ) ? _fvi_hit_seg2 : hit_none_seg ) : hit_seg;
 
 	}
+
+	_fvi_sub_result.n_segs = n_segs;
+	_fvi_nest_count --;
 
 }
 
@@ -1185,9 +1271,10 @@ export function find_vector_intersection( p0_x, p0_y, p0_z, p1_x, p1_y, p1_z, st
 		p0_x, p0_y, p0_z, startseg,
 		p1_x, p1_y, p1_z,
 		rad, thisobjnum, flags,
-		_hit_data.seglist, _hit_data.n_segs,
+		_hit_data.seglist,
 		- 2 // entry_seg = -2 means no entry
 	);
+	_hit_data.n_segs = _fvi_sub_result.n_segs;
 
 	let hit_type = _fvi_sub_result.type;
 	let hit_pnt_x = _fvi_sub_result.pnt_x;
@@ -1223,7 +1310,7 @@ export function find_vector_intersection( p0_x, p0_y, p0_z, p1_x, p1_y, p1_z, st
 			p0_x, p0_y, p0_z, startseg,
 			p1_x, p1_y, p1_z,
 			0, thisobjnum, flags,
-			_hit_data.seglist, _hit_data.n_segs,
+			_fallback_seglist,
 			- 2
 		);
 
@@ -1233,6 +1320,41 @@ export function find_vector_intersection( p0_x, p0_y, p0_z, p1_x, p1_y, p1_z, st
 			hit_pnt_x = _fvi_sub_result.pnt_x;
 			hit_pnt_y = _fvi_sub_result.pnt_y;
 			hit_pnt_z = _fvi_sub_result.pnt_z;
+			_hit_data.n_segs = _fvi_sub_result.n_segs;
+			for ( let i = 0; i < _hit_data.n_segs; i ++ ) {
+
+				_hit_data.seglist[ i ] = _fallback_seglist[ i ];
+
+			}
+
+		}
+
+	}
+
+	// Ensure the path ends at the final hit segment. If the segment already
+	// occurs, discard any alternate/dead-end suffix; otherwise append it when
+	// there is room. Ported from FVI.C public seglist postprocessing.
+	if ( hit_seg !== - 1 && ( flags & FQ_GET_SEGLIST ) !== 0 ) {
+
+		let hitSegIndex = - 1;
+		for ( let i = 0; i < _hit_data.n_segs; i ++ ) {
+
+			if ( _hit_data.seglist[ i ] === hit_seg ) {
+
+				hitSegIndex = i;
+				break;
+
+			}
+
+		}
+
+		if ( hitSegIndex !== - 1 ) {
+
+			_hit_data.n_segs = hitSegIndex + 1;
+
+		} else if ( _hit_data.n_segs < MAX_FVI_SEGS ) {
+
+			_hit_data.seglist[ _hit_data.n_segs ++ ] = hit_seg;
 
 		}
 

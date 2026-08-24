@@ -7,8 +7,15 @@ import { gr_get_string_size, gr_string } from './font.js';
 import { NORMAL_FONT, CURRENT_FONT, SUBTITLE_FONT, TITLE_FONT, GAME_FONT } from './gamefont.js';
 import { credits_show } from './credits.js';
 import { scores_view } from './scores.js';
+import { digi_play_sample_once, SOUND_DROP_BOMB } from './digi.js';
+import { songs_stop_if_silent } from './songs.js';
 import { config_get_invert_mouse_y, config_set_invert_mouse_y,
-	config_get_texture_filtering, config_set_texture_filtering } from './config.js';
+	config_get_texture_filtering, config_set_texture_filtering,
+	config_get_digi_volume, config_set_digi_volume,
+	config_get_music_volume, config_set_music_volume,
+	config_get_reverse_stereo, config_set_reverse_stereo,
+	config_get_sound_channels, config_set_sound_channels,
+	CONFIG_VOLUME_MAX, CONFIG_SOUND_CHANNEL_COUNTS } from './config.js';
 
 // Difficulty level names (from GAME.H NDL=5)
 const DIFFICULTY_NAMES = [ 'TRAINEE', 'ROOKIE', 'HOTSHOT', 'ACE', 'INSANE' ];
@@ -180,6 +187,10 @@ export async function do_main_menu( hogFile, defaultDifficulty, gamePalette ) {
 		async function showSettings() {
 
 			const SETTINGS_ITEMS = [
+				{ label: 'SOUND VOLUME', id: 'digi_volume' },
+				{ label: 'MUSIC VOLUME', id: 'music_volume' },
+				{ label: 'REVERSE STEREO', id: 'reverse_stereo' },
+				{ label: 'SOUND CHANNELS', id: 'sound_channels' },
 				{ label: 'INVERT MOUSE', id: 'invert_mouse' },
 				{ label: 'TEXTURE FILTERING', id: 'texture_filtering' },
 			];
@@ -187,11 +198,47 @@ export async function do_main_menu( hogFile, defaultDifficulty, gamePalette ) {
 			let settingsIndex = 0;
 			let settingsItemYPositions = [];
 
+			function setDigiVolumeWithPreview( value ) {
+
+				const previous = config_get_digi_volume();
+				if ( config_set_digi_volume( value ) !== true ||
+					config_get_digi_volume() === previous ) return;
+
+				// MENU.C joydef_menuset(): preview the new effects volume with
+				// the drop-bomb cue, replacing any prior preview instance.
+				digi_play_sample_once( SOUND_DROP_BOMB, 1.0 );
+
+			}
+
 			function getSettingValue( id ) {
+
+				if ( id === 'digi_volume' ) {
+
+					return config_get_digi_volume() + '/' + CONFIG_VOLUME_MAX;
+
+				}
+
+				if ( id === 'music_volume' ) {
+
+					return config_get_music_volume() + '/' + CONFIG_VOLUME_MAX;
+
+				}
 
 				if ( id === 'invert_mouse' ) {
 
 					return config_get_invert_mouse_y() === true ? 'YES' : 'NO';
+
+				}
+
+				if ( id === 'reverse_stereo' ) {
+
+					return config_get_reverse_stereo() === true ? 'YES' : 'NO';
+
+				}
+
+				if ( id === 'sound_channels' ) {
+
+					return String( config_get_sound_channels() );
 
 				}
 
@@ -207,9 +254,42 @@ export async function do_main_menu( hogFile, defaultDifficulty, gamePalette ) {
 
 			function toggleSetting( id ) {
 
+				if ( id === 'digi_volume' ) {
+
+					setDigiVolumeWithPreview(
+						( config_get_digi_volume() + 1 ) % ( CONFIG_VOLUME_MAX + 1 )
+					);
+				}
+
+				if ( id === 'music_volume' ) {
+
+					config_set_music_volume(
+						( config_get_music_volume() + 1 ) % ( CONFIG_VOLUME_MAX + 1 )
+					);
+				}
+
 				if ( id === 'invert_mouse' ) {
 
 					config_set_invert_mouse_y( config_get_invert_mouse_y() !== true );
+
+				}
+
+				if ( id === 'reverse_stereo' ) {
+
+					config_set_reverse_stereo( config_get_reverse_stereo() !== true );
+
+				}
+
+				if ( id === 'sound_channels' ) {
+
+					const currentIndex = CONFIG_SOUND_CHANNEL_COUNTS.indexOf(
+						config_get_sound_channels()
+					);
+					config_set_sound_channels(
+						CONFIG_SOUND_CHANNEL_COUNTS[
+							( currentIndex + 1 ) % CONFIG_SOUND_CHANNEL_COUNTS.length
+						]
+					);
 
 				}
 
@@ -218,6 +298,35 @@ export async function do_main_menu( hogFile, defaultDifficulty, gamePalette ) {
 					config_set_texture_filtering(
 						config_get_texture_filtering() === 'linear' ? 'nearest' : 'linear'
 					);
+
+				}
+
+			}
+
+			function adjustSetting( id, delta ) {
+
+				if ( id === 'digi_volume' ) {
+
+					setDigiVolumeWithPreview( config_get_digi_volume() + delta );
+
+				}
+
+				if ( id === 'music_volume' ) {
+
+					config_set_music_volume( config_get_music_volume() + delta );
+
+				}
+
+				if ( id === 'sound_channels' ) {
+
+					const currentIndex = CONFIG_SOUND_CHANNEL_COUNTS.indexOf(
+						config_get_sound_channels()
+					);
+					const nextIndex = Math.max( 0, Math.min(
+						CONFIG_SOUND_CHANNEL_COUNTS.length - 1,
+						currentIndex + delta
+					) );
+					config_set_sound_channels( CONFIG_SOUND_CHANNEL_COUNTS[ nextIndex ] );
 
 				}
 
@@ -270,7 +379,7 @@ export async function do_main_menu( hogFile, defaultDifficulty, gamePalette ) {
 				if ( smallFont !== null ) {
 
 					const hintY = itemsStartY + SETTINGS_ITEMS.length * itemHeight + 10;
-					gr_string( imageData, smallFont, 0x8000, hintY, 'ENTER TO TOGGLE  ESC TO BACK', gamePalette );
+					gr_string( imageData, smallFont, 0x8000, hintY, 'LEFT/RIGHT ADJUST  ENTER CHANGE  ESC BACK', gamePalette );
 
 				}
 
@@ -322,6 +431,16 @@ export async function do_main_menu( hogFile, defaultDifficulty, gamePalette ) {
 
 						if ( settingsIndex >= SETTINGS_ITEMS.length ) settingsIndex = 0;
 
+						renderSettings();
+
+					} else if ( e.key === 'ArrowLeft' ) {
+
+						adjustSetting( SETTINGS_ITEMS[ settingsIndex ].id, - 1 );
+						renderSettings();
+
+					} else if ( e.key === 'ArrowRight' ) {
+
+						adjustSetting( SETTINGS_ITEMS[ settingsIndex ].id, 1 );
 						renderSettings();
 
 					} else if ( e.key === 'Enter' ) {
@@ -453,7 +572,8 @@ export async function do_main_menu( hogFile, defaultDifficulty, gamePalette ) {
 
 			if ( id === 'new_game' ) {
 
-				selectedIndex = defaultDifficulty || 1;
+				// Difficulty 0 (Trainee) is valid data — don't treat it as missing.
+				selectedIndex = ( defaultDifficulty != null ) ? defaultDifficulty : 1;
 				renderDifficultyMenu();
 				return;
 
@@ -461,7 +581,7 @@ export async function do_main_menu( hogFile, defaultDifficulty, gamePalette ) {
 
 			if ( id === 'quit' ) {
 
-				window.location.href = 'https://x.com/mrdoob/status/2019639702438179153';
+				window.location.href = 'https://x.com/mrdoob/status/2022705222402085218';
 				return;
 
 			}
@@ -484,6 +604,7 @@ export async function do_main_menu( hogFile, defaultDifficulty, gamePalette ) {
 			} else if ( id === 'settings' ) {
 
 				await showSettings();
+				songs_stop_if_silent();
 
 			} else if ( id === 'load_game' ) {
 

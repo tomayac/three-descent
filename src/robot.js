@@ -1,10 +1,14 @@
 // Ported from: descent-master/MAIN/ROBOT.C and ROBOT.H
 // Robot type definitions and parsing
 
+import { OBJ_ROBOT, OBJ_POWERUP } from './object.js';
+
 // Number of difficulty levels (Trainee, Rookie, Hotshot, Ace, Insane)
 const NDL = 5;
 
 export const MAX_ROBOT_TYPES = 30;
+export const MAX_ROBOT_JOINTS = 600;
+export const MAX_GUNS = 8;
 
 // Animation state constants (from ROBOT.H lines 111-117)
 export const N_ANIM_STATES = 5;
@@ -49,6 +53,14 @@ export class RobotInfo {
 		this.model_num = - 1;		// which polygon model
 		this.n_guns = 0;			// how many gun positions
 		this.weapon_type = 0;		// which weapon type this robot fires
+		this.gun_points = [];		// gun positions relative to their submodels
+		this.gun_submodels = new Uint8Array( MAX_GUNS );
+
+		for ( let i = 0; i < MAX_GUNS; i ++ ) {
+
+			this.gun_points.push( { x: 0, y: 0, z: 0 } );
+
+		}
 
 		// Explosion effects
 		this.exp1_vclip_num = - 1;
@@ -60,7 +72,7 @@ export class RobotInfo {
 		this.contains_id = 0;		// ID of powerup/robot this can contain
 		this.contains_count = 0;	// max number of things contained
 		this.contains_prob = 0;		// probability N/16
-		this.contains_type = 0;		// 0=powerup, 1=robot
+		this.contains_type = OBJ_POWERUP;	// canonical object type (OBJ_POWERUP or OBJ_ROBOT)
 
 		this.score_value = 1000;	// score from destroying this robot
 		this.lighting = 0.5;		// lighting value (0..1)
@@ -87,6 +99,25 @@ export class RobotInfo {
 		this.see_sound = - 1;		// sound when robot first sees player
 		this.attack_sound = - 1;	// sound when robot attacks
 		this.claw_sound = - 1;		// sound when robot claws (melee)
+
+		// Compiled HAM animation lists. The extra entry after the guns is
+		// the non-gun body animation group.
+		this.anim_states = [];
+		for ( let gun = 0; gun <= MAX_GUNS; gun ++ ) {
+
+			const states = [];
+			for ( let state = 0; state < N_ANIM_STATES; state ++ ) {
+
+				states.push( { n_joints: 0, offset: 0 } );
+
+			}
+			this.anim_states.push( states );
+
+		}
+
+		this.always_0xabcd = 0;
+		this.compiled = false;
+		this.anim_angs = null;
 
 		this.name = '';
 
@@ -123,11 +154,25 @@ export function set_N_robot_types( n ) {
 
 }
 
+// Compiled robot animation joint table from the registered PIG HAM block.
+export const Robot_joints = [];
+for ( let i = 0; i < MAX_ROBOT_JOINTS; i ++ ) {
+
+	Robot_joints.push( {
+		jointnum: 0,
+		angles: { p: 0, b: 0, h: 0 }
+	} );
+
+}
+
+export let N_robot_joints = 0;
+export function set_N_robot_joints( n ) { N_robot_joints = n; }
+
 // Parse $ROBOT entries from decoded bitmaps.bin text
 // Each entry: $ROBOT modelname.pof [key=value pairs and texture .bbm files]
 // Robot types are numbered sequentially (0, 1, 2, ...)
 // Ported from: bm_read_robot() in BMREAD.C
-export function bm_parse_shareware_robots( text ) {
+export function bm_parse_shareware_robots( text, robotModelNums ) {
 
 	let robotNum = 0;
 	let pos = 0;
@@ -155,6 +200,17 @@ export function bm_parse_shareware_robots( text ) {
 		if ( robotNum >= MAX_ROBOT_TYPES ) break;
 
 		const ri = Robot_info[ robotNum ];
+		ri.model_num = robotModelNums[ robotNum ] !== undefined ? robotModelNums[ robotNum ] : - 1;
+
+		// BMREAD.C reserves the robot ID for an @ line in shareware, but does
+		// not parse any of its properties.
+		if ( ri.model_num < 0 ) {
+
+			robotNum ++;
+			pos = entryEnd;
+			continue;
+
+		}
 
 		// Parse key=value pairs
 		// name="quoted string"
@@ -205,7 +261,13 @@ export function bm_parse_shareware_robots( text ) {
 		if ( containsProbMatch !== null ) ri.contains_prob = parseInt( containsProbMatch[ 1 ] );
 
 		const containsTypeMatch = entry.match( /contains_type=(\d+)/ );
-		if ( containsTypeMatch !== null ) ri.contains_type = parseInt( containsTypeMatch[ 1 ] ) !== 0 ? 1 : 0;
+		if ( containsTypeMatch !== null ) {
+
+			// BITMAPS.TBL stores this as a boolean (0=powerup, nonzero=robot),
+			// while compiled robot_info and level objects store OBJ_* constants.
+			ri.contains_type = parseInt( containsTypeMatch[ 1 ] ) !== 0 ? OBJ_ROBOT : OBJ_POWERUP;
+
+		}
 
 		// Behavior flags
 		const cloakMatch = entry.match( /cloak_type=(\d+)/ );
@@ -250,6 +312,7 @@ export function bm_parse_shareware_robot_ai( text ) {
 
 		const idx = text.indexOf( '$ROBOT_AI', pos );
 		if ( idx === - 1 ) break;
+		const registeredOnly = idx > 0 && text.charAt( idx - 1 ) === '@';
 
 		pos = idx + 9;
 
@@ -264,6 +327,13 @@ export function bm_parse_shareware_robot_ai( text ) {
 
 		const robotNum = parseInt( nums[ 0 ] );
 		if ( robotNum >= MAX_ROBOT_TYPES ) continue;
+		if ( registeredOnly === true ) {
+
+			count ++;
+			pos = entryEnd;
+			continue;
+
+		}
 
 		const ri = Robot_info[ robotNum ];
 		let n = 1; // skip index
