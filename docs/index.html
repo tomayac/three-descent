@@ -1,147 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<script id="cos-loader">(async function () {
-  const isCOSAvailable = 'crossOriginStorage' in navigator;
-  console.log('COS Loader: isCOSAvailable =', isCOSAvailable);
-
-  // Manifest is injected by the Vite plugin
-  // @ts-ignore
-  const manifest = {
-  "base": "/three-descent/",
-  "entry": "assets/index-Ooplq2to.js",
-  "chunks": {
-    "assets/three-dd550cb7.js": "65123686cde6db51ddb5d8758c5db3137853cbd0e8b3121258e2473108f72451"
-  },
-  "unmanaged": [
-    "assets/index-Ooplq2to.js"
-  ]
-};
-
-  const { base, entry, chunks } = manifest;
-  const mainEntry = entry;
-
-  if (!mainEntry) {
-    console.warn('COS Loader: Missing entry in manifest.');
-    return;
-  }
-
-  // Identify managed chunks
-  const chunksToLoad = Object.entries(chunks || {}).map(([fileName, hash]) => ({
-    fileName,
-    hash,
-    file: `${base}${fileName}`,
-  }));
-
-  async function getBlobFromCOS(hash) {
-    if (!isCOSAvailable) return null;
-    try {
-      const handle = await navigator.crossOriginStorage.requestFileHandle(
-        { algorithm: 'SHA-256', value: hash }
-      );
-      if (handle) {
-        return await handle.getFile();
-      }
-    } catch (err) {
-      if (err.name !== 'NotFoundError')
-        console.error('COS Loader: Error checking COS', err);
-    }
-    return null;
-  }
-
-  async function storeBlobInCOS(blob, hash) {
-    if (!isCOSAvailable) return;
-    try {
-      const handle = await navigator.crossOriginStorage.requestFileHandle(
-        { algorithm: 'SHA-256', value: hash },
-        { create: true }
-      );
-      const writable = await handle.createWritable();
-      await writable.write(blob);
-      await writable.close();
-      console.log('COS Loader: Stored chunk in COS', hash);
-    } catch (err) {
-      console.error('COS Loader: Failed to store in COS', err);
-    }
-  }
-
-  async function getChunkBlobUrl(chunk) {
-    let blob = await getBlobFromCOS(chunk.hash);
-    if (blob) {
-      console.log(`COS Loader: ${chunk.fileName} found in COS`);
-      blob = new Blob([blob], { type: 'text/javascript' });
-    }
-    if (!blob) {
-      console.log(`COS Loader: ${chunk.file} not in COS, fetching...`);
-      try {
-        const resp = await fetch(chunk.file);
-        if (!resp.ok) throw new Error(`Status ${resp.status}`);
-        const rawBlob = await resp.blob();
-        blob = new Blob([rawBlob], { type: 'text/javascript' });
-        await storeBlobInCOS(blob, chunk.hash);
-      } catch (e) {
-        console.error(`COS Loader: Failed to fetch ${chunk.file}`, e);
-        return null;
-      }
-    }
-
-    // Convert blob to Blob URL
-    // Blob URLs are synchronous and share the page origin,
-    // which helps with module resolution in complex graphs.
-    return URL.createObjectURL(blob);
-  }
-
-  // Initialize
-  try {
-    console.log('COS Loader: Starting app...');
-
-    // Resolve all chunks to Blob URLs
-    const importMap = { imports: {} };
-
-    // Set up unmanaged dependencies correctly so Blob URLs can resolve them.
-    for (const fileName of manifest.unmanaged || []) {
-      const bareSpecifier = `coschunk-${fileName.replace(/\//g, '-')}`;
-      importMap.imports[bareSpecifier] =
-        window.location.origin + base + fileName;
-    }
-
-    console.log(`COS Loader: Loading ${chunksToLoad.length} chunks...`);
-    const loadPromises = chunksToLoad.map(async (chunk) => {
-      const blobUrl = await getChunkBlobUrl(chunk);
-      if (blobUrl) {
-        // Use a hyphenated prefix and replace all slashes to ensure it's treated
-        // as a truly bare specifier, bypassing hierarchical/protocol checks.
-        const bareSpecifier = `coschunk-${chunk.fileName.replace(/\//g, '-')}`;
-        importMap.imports[bareSpecifier] = blobUrl;
-      }
-    });
-
-    await Promise.all(loadPromises);
-
-    // Inject Import Map
-    const script = document.createElement('script');
-    script.type = 'importmap';
-    script.textContent = JSON.stringify(importMap, null, 2);
-    document.head.appendChild(script);
-
-    console.log('COS Loader: Import Map injected');
-
-    // Import the main entry via its bare specifier to ensure it resolves
-    // through the import map and can find other managed chunks.
-    const entrySpecifier = `coschunk-${mainEntry.replace(/\//g, '-')}`;
-
-    // Small delay to ensure the browser has fully registered the
-    // import map before resolving the first module.
-    setTimeout(() => {
-      import(entrySpecifier).catch((err) => {
-        console.error('COS Loader: Failed to start app', err);
-      });
-    }, 0);
-  } catch (err) {
-    console.error('COS Loader: Initialization failed', err);
-  }
-})();
-</script>
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>Three.js Descent</title>
@@ -166,9 +25,9 @@
 			50% { opacity: 0.3; }
 		}
 	</style>
-  <!-- Entry script disabled by COS Plugin -->
-</head>
+  
+<script id="cos-loader">(function(){async function e(e){window.__cosManifest=e;let t=navigator.crossOriginStorage,n={},r=Promise.resolve(),i=e=>{let t=r.then(e,e);return r=t.catch(()=>{}),t};async function a(e,n){if(t)try{let n=await(await i(()=>t.requestFileHandle({algorithm:`SHA-256`,value:e}))).getFile();return URL.createObjectURL(new Blob([n],{type:`text/javascript`}))}catch(e){e?.name!==`NotFoundError`&&console.error(`[cos] lookup failed`,e)}let r=await fetch(n);if(!r.ok)throw Error(`[cos] failed to fetch chunk ${n}: ${r.status} ${r.statusText}`);let a=r.headers.get(`content-type`)??``;if(a&&!/javascript|ecmascript/i.test(a))throw Error(`[cos] chunk ${n} served as ${a}, expected JavaScript`);let o=new Blob([await r.blob()],{type:`text/javascript`});if(t)try{await i(async()=>{let n=await(await t.requestFileHandle({algorithm:`SHA-256`,value:e},{create:!0,origins:`*`})).createWritable();await n.write(o),await n.close()})}catch(e){console.error(`[cos] store failed`,e)}return URL.createObjectURL(o)}await Promise.all(Object.entries(e.chunks).map(async([t,{file:r,hash:i}])=>{n[t]=await a(i,e.base+r)})),n[e.entry.specifier]=new URL(e.base+e.entry.file,location.origin).href;let o=document.createElement(`script`);o.type=`importmap`,o.textContent=JSON.stringify({imports:n}),document.head.appendChild(o),await new Promise(e=>setTimeout(e,0)),await import(e.entry.specifier)}e({"base":"/three-descent/assets/","entry":{"specifier":"cos1:entry","file":"index-DE1J5UZr.js"},"chunks":{"cos1:fd3c9c6ee5958253605d09b5f3aab7396f75650f78e198c1b4951e803e8bff35":{"file":"fd3c9c6ee5958253605d09b5f3aab7396f75650f78e198c1b4951e803e8bff35.js","hash":"fd3c9c6ee5958253605d09b5f3aab7396f75650f78e198c1b4951e803e8bff35","name":"three"},"cos1:ae02083a2d610b7ab567f090faedc7040e38cb245830682b261e0cbeb158fe38":{"file":"ae02083a2d610b7ab567f090faedc7040e38cb245830682b261e0cbeb158fe38.js","hash":"ae02083a2d610b7ab567f090faedc7040e38cb245830682b261e0cbeb158fe38","name":"three"}}})})();</script></head>
 <body>
-	<div id="status"></div>
+	<div id="status"></div>
 </body>
 </html>

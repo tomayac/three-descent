@@ -1,26 +1,17 @@
 import { defineConfig } from 'vite';
-import crossOriginStorage from 'vite-plugin-cross-origin-storage';
+import { cosPlugin } from 'vite-plugin-cross-origin-storage';
 
 export default defineConfig({
   assetsInclude: ['**/*.hog', '**/*.pig'],
   base: '/three-descent/',
   plugins: [
-    crossOriginStorage({
-      include: [/vendor-three-.*.js/],
+    cosPlugin({
+      packages: [/^three(\/|$)/],
     }),
   ],
   build: {
-    outDir: 'docs',    
+    outDir: 'docs',
     target: 'esnext',
-    rollupOptions: {
-      output: {
-        manualChunks(id) {
-          if (id.includes("/node_modules/three/")) {
-            return "vendor-three";
-          }
-        }
-      }
-    },
   },
   server: {
     open: true,
