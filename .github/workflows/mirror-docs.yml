@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: 2026 Thomas Steiner
+# SPDX-License-Identifier: Apache-2.0
+
+# Mirrors the built game in docs/ to web-ai-community/<this repo's name>,
+# whose GitHub Pages serve it from its own origin, so the Cross-Origin
+# Storage sharing between the games shows. Authenticates with a deploy key
+# that can write to that one repository, stored here as the
+# WEB_AI_COMMUNITY_DEPLOY_KEY secret.
+name: Mirror docs to web-ai-community
+
+on:
+  push:
+    branches: [main]
+    paths: ['docs/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-docs
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Push docs/ to web-ai-community
+        env:
+          DEPLOY_KEY: ${{ secrets.WEB_AI_COMMUNITY_DEPLOY_KEY }}
+          TARGET: web-ai-community/${{ github.event.repository.name }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND='ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes'
+
+          git clone --depth 1 "git@github.com:$TARGET.git" target
+          rsync -a --delete --exclude .git docs/ target/
+
+          cd target
+          git add -A
+          if git diff --cached --quiet; then
+            echo "$TARGET is already up to date."
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "Deploy $GITHUB_REPOSITORY@${GITHUB_SHA::7}"
+          git push origin HEAD:main
